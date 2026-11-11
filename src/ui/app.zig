@@ -42,6 +42,12 @@ const runtime_mod = @import("runtime.zig");
 
 pub const Focus = enum { filter, packets, protocol, hex };
 
+const FilterVerdictBox = struct {
+    text: []u8,
+    ok: bool,
+    detail: []u8,
+};
+
 pub const OverlayKind = enum {
     none,
     help,
@@ -53,6 +59,7 @@ pub const OverlayKind = enum {
     menu,
     field_filter,
     conv_filter,
+    saved_filters,
 };
 
 fn hexNeedleLength(value: []const u8) usize {
@@ -129,6 +136,17 @@ pub const AppModel = struct {
     tail_ticks: u8 = 0,
     hide_through_frame: u32 = 0,
     filter_recall: ?usize = null,
+    filter_seen: []u8 = &.{},
+    filter_checked: []u8 = &.{},
+    filter_seen_ticks: u8 = 0,
+    filter_check_inflight: std.atomic.Value(bool) = .init(false),
+    filter_check_worker: ?std.Thread = null,
+    filter_check_mutex: std.Io.Mutex = .init,
+    filter_check_box: ?FilterVerdictBox = null,
+    filter_error_text: []u8 = &.{},
+    macro_preview: []u8 = &.{},
+    /// Tests run the display-filter check on the caller thread.
+    filter_check_sync: bool = false,
     history_note: [256]u8 = @splat(0),
     history_note_len: usize = 0,
     menu_analysis: bool = false,
@@ -211,6 +229,16 @@ pub const AppModel = struct {
         self.tail_ticks = 0;
         self.hide_through_frame = 0;
         self.filter_recall = null;
+        self.filter_seen = &.{};
+        self.filter_checked = &.{};
+        self.filter_seen_ticks = 0;
+        self.filter_check_inflight = .init(false);
+        self.filter_check_worker = null;
+        self.filter_check_mutex = .init;
+        self.filter_check_box = null;
+        self.filter_error_text = &.{};
+        self.macro_preview = &.{};
+        self.filter_check_sync = false;
         self.history_note = @splat(0);
         self.history_note_len = 0;
         self.menu_analysis = false;
@@ -286,6 +314,15 @@ pub const AppModel = struct {
         if (self.empty_pcap.len != 0) self.allocator.free(self.empty_pcap);
         self.fields_cancelled.store(true, .release);
         if (self.fields_worker) |worker| worker.join();
+        if (self.filter_check_worker) |worker| worker.join();
+        if (self.filter_check_box) |*box| {
+            self.allocator.free(box.text);
+            self.allocator.free(box.detail);
+        }
+        if (self.filter_seen.len != 0) self.allocator.free(self.filter_seen);
+        if (self.filter_checked.len != 0) self.allocator.free(self.filter_checked);
+        if (self.filter_error_text.len != 0) self.allocator.free(self.filter_error_text);
+        if (self.macro_preview.len != 0) self.allocator.free(self.macro_preview);
         for (self.fields) |field| self.allocator.free(field);
         if (self.fields.len != 0) self.allocator.free(self.fields);
         if (self.fields_tshark_path.len != 0) self.allocator.free(self.fields_tshark_path);
@@ -578,9 +615,77 @@ pub const AppModel = struct {
         try self.commitFilter(text, index < ops.len);
     }
 
+    fn runFiltersCommand(self: *AppModel, args: []const u8) !void {
+        const trimmed = std.mem.trim(u8, args, " \t");
+        if (trimmed.len == 0) {
+            try self.showSavedFilters();
+            return;
+        }
+        if (std.mem.startsWith(u8, trimmed, "save ")) {
+            const name = std.mem.trim(u8, trimmed["save ".len..], " \t");
+            if (name.len == 0) {
+                try self.showMessage("Usage: :filters save <name>");
+                return;
+            }
+            const typed = try self.filter.copyText(self.allocator);
+            defer self.allocator.free(typed);
+            const value = if (typed.len != 0) typed else self.session.display_filter;
+            if (value.len == 0) {
+                try self.showMessage("There is no filter to save");
+                return;
+            }
+            try self.config.upsertNamedFilter(name, value);
+            self.persistConfig();
+            try self.showMessage("Filter saved");
+            return;
+        }
+        if (std.mem.startsWith(u8, trimmed, "delete ")) {
+            const name = std.mem.trim(u8, trimmed["delete ".len..], " \t");
+            if (!self.config.deleteNamedFilter(name)) {
+                try self.showMessage("No saved filter with that name");
+                return;
+            }
+            self.persistConfig();
+            try self.showMessage("Filter deleted");
+            return;
+        }
+        const value = self.config.findNamedFilter(trimmed) orelse {
+            try self.showMessage("No saved filter with that name");
+            return;
+        };
+        const owned = try self.allocator.dupe(u8, value);
+        defer self.allocator.free(owned);
+        try self.commitFilter(owned, true);
+    }
+
+    fn showSavedFilters(self: *AppModel) !void {
+        if (self.config.named_filters.items.len == 0) {
+            try self.showMessage("No saved filters. :filters save <name> stores the current one.");
+            return;
+        }
+        var text: std.Io.Writer.Allocating = .init(self.allocator);
+        defer text.deinit();
+        for (self.config.named_filters.items, 0..) |filter, index| {
+            if (index != 0) try text.writer.writeByte('\n');
+            try text.writer.print("{s}  {s}", .{ filter.name, filter.value });
+        }
+        const owned = try text.toOwnedSlice();
+        defer self.allocator.free(owned);
+        try self.showPick("Saved filters  Enter applies", owned, .saved_filters);
+    }
+
     fn runProcess(self: *AppModel, argv: []const []const u8) !process_mod.RunOutput {
         if (self.process_runner) |run| return run(self.allocator, self.io, argv);
         return process_mod.runCapture(self.allocator, self.io, argv);
+    }
+
+    fn runProcessLimited(self: *AppModel, argv: []const []const u8, limit: usize) !process_mod.RunOutput {
+        if (self.process_runner) |run| {
+            var out = try run(self.allocator, self.io, argv);
+            if (try process_mod.clipStdout(self.allocator, &out.stdout, limit)) out.truncated = true;
+            return out;
+        }
+        return process_mod.runCaptureLimited(self.allocator, self.io, argv, limit);
     }
 
     fn onHeaderMenu(userdata: ?*anyopaque, menu: header_bar.HeaderBar.Menu) void {
@@ -637,6 +742,13 @@ pub const AppModel = struct {
         const self: *AppModel = @ptrCast(@alignCast(userdata.?));
         const expanded = try macros_feature.expand(self.allocator, self.config, text);
         defer self.allocator.free(expanded);
+        if (std.mem.eql(u8, expanded, self.session.display_filter) and
+            self.session.loading != .error_state and
+            self.loader.list_generation.load(.acquire) != 0)
+        {
+            self.filter.state = .ok;
+            return;
+        }
         self.filter.state = .neutral;
         const ok = try filter_mod.validateDisplayFilterRun(
             self.allocator,
@@ -859,9 +971,12 @@ pub const AppModel = struct {
         for (events) |*ev| {
             switch (ev.*) {
                 .packets_loaded => |*table| {
-                    const selected_frame = self.session.selectedFrame();
-                    self.session.setListHeaders(table.headers);
-                    table.headers = &.{};
+                    const follow_live = self.live_capture and self.config.auto_scroll;
+                    const previous = if (follow_live) null else self.session.selectedFrame();
+                    if (table.headers.len != 0) {
+                        self.session.setListHeaders(table.headers);
+                        table.headers = &.{};
+                    }
                     if (self.hide_through_frame != 0) {
                         table.packets = try packet.retainFramesAfter(
                             self.allocator,
@@ -869,23 +984,28 @@ pub const AppModel = struct {
                             self.hide_through_frame,
                         );
                     }
-                    self.session.setPackets(table.packets);
+                    const appending = table.append and self.session.packets.len != 0;
+                    if (appending) {
+                        try self.session.appendPackets(table.packets);
+                    } else {
+                        self.session.setPackets(table.packets);
+                    }
                     table.packets = &.{};
-                    if (selected_frame) |frame| {
+                    if (follow_live and self.session.packets.len > 0) {
+                        _ = self.session.select(self.session.packets.len - 1);
+                    } else if (previous) |frame| {
                         for (self.session.packets, 0..) |summary, index| {
                             if (summary.frame == frame) {
                                 _ = self.session.select(index);
                                 break;
                             }
                         }
-                    } else if (self.live_capture and self.config.auto_scroll and self.session.packets.len > 0) {
-                        _ = self.session.select(self.session.packets.len - 1);
                     }
                     if (self.pending_global_frame) |frame| {
                         _ = self.selectFrame(frame);
                         self.pending_global_frame = null;
                     }
-                    self.session.loading = if (self.live_capture) .capturing else .idle;
+                    self.session.loading = if (self.live_capture) .capturing else .loading_list;
                     self.syncFromSession();
                     ev.* = .done;
                 },
@@ -911,7 +1031,10 @@ pub const AppModel = struct {
                     try self.showMessage(msg);
                 },
                 .capture_progress => {},
-                .done => {},
+                .done => if (self.session.loading == .loading_list and !self.live_capture) {
+                    self.session.loading = .idle;
+                    self.syncFromSession();
+                },
             }
             ev.deinit(self.allocator);
         }
@@ -1124,7 +1247,7 @@ pub const AppModel = struct {
                     index = found.index;
                 }
             }
-            const body = try streams_view.loadFollow(
+            const loaded = try streams_view.loadFollow(
                 self.allocator,
                 self.io,
                 self.tools.tshark,
@@ -1134,8 +1257,8 @@ pub const AppModel = struct {
                 mode,
                 self.process_runner,
             );
-            defer self.allocator.free(body);
-            try self.showStream(proto, index, body);
+            defer self.allocator.free(loaded.body);
+            try self.showStream(proto, index, loaded.body, loaded.capped);
         } else if (std.mem.eql(u8, cmd, "convs")) {
             const path = self.capturePath() orelse {
                 try self.showMessage("No capture file loaded");
@@ -1233,6 +1356,8 @@ pub const AppModel = struct {
             const path = try self.allocator.dupe(u8, self.config.recent_files.items[number - 1]);
             defer self.allocator.free(path);
             try self.openCapture(path);
+        } else if (std.mem.eql(u8, cmd, "filters")) {
+            try self.runFiltersCommand(args);
         } else if (std.mem.eql(u8, cmd, "recent-filter")) {
             const number = std.fmt.parseInt(usize, args, 10) catch {
                 try self.showMessage("Usage: :recent-filter <number>");
@@ -1432,7 +1557,7 @@ pub const AppModel = struct {
         } else if (std.mem.eql(u8, name, "pcap-bundle-size")) {
             self.loader.config.bundle_size = self.config.pcap_bundle_size;
         } else if (std.mem.eql(u8, name, "pcap-cache-size")) {
-            self.loader.config.cache_size = self.config.pcap_cache_size;
+            self.loader.setCacheSize(self.config.pcap_cache_size);
         } else if (std.mem.eql(u8, name, "search-case-sensitive")) {
             self.search.case_sensitive = self.config.search_case_sensitive;
         }
@@ -1488,6 +1613,134 @@ pub const AppModel = struct {
         if (stat.size == self.tail_size) return;
         self.tail_size = stat.size;
         try self.loader.requestPsml(self.session);
+    }
+
+    pub fn pollFilterFeedback(self: *AppModel) void {
+        if (self.filter_check_worker) |worker| {
+            if (self.filter_check_inflight.load(.acquire)) return;
+            worker.join();
+            self.filter_check_worker = null;
+        }
+        self.applyFilterVerdict();
+        if (self.filter_check_inflight.load(.acquire)) return;
+
+        const text_const = self.filter.copyText(self.allocator) catch return;
+        const text: []u8 = @constCast(text_const);
+        self.updateMacroPreview(text);
+        if (!std.mem.eql(u8, text, self.filter_seen)) {
+            if (self.filter_seen.len != 0) self.allocator.free(self.filter_seen);
+            self.filter_seen = text;
+            self.filter_seen_ticks = 0;
+            return;
+        }
+        self.allocator.free(text);
+        if (std.mem.eql(u8, self.filter_seen, self.filter_checked)) return;
+        self.filter_seen_ticks += 1;
+        if (self.filter_seen_ticks < 3) return;
+
+        if (self.filter_seen.len == 0) {
+            self.filter.state = .neutral;
+            self.setFilterError("");
+            if (self.filter_checked.len != 0) self.allocator.free(self.filter_checked);
+            self.filter_checked = &.{};
+            return;
+        }
+
+        const owned = self.allocator.dupe(u8, self.filter_seen) catch return;
+        self.filter_check_inflight.store(true, .release);
+        if (self.filter_check_sync) {
+            self.runFilterCheck(owned);
+            self.applyFilterVerdict();
+            return;
+        }
+        self.filter_check_worker = std.Thread.spawn(.{}, filterCheckWorker, .{ self, owned }) catch {
+            self.filter_check_inflight.store(false, .release);
+            self.allocator.free(owned);
+            return;
+        };
+    }
+
+    fn filterCheckWorker(self: *AppModel, text: []u8) void {
+        self.runFilterCheck(text);
+    }
+
+    fn runFilterCheck(self: *AppModel, text: []u8) void {
+        defer self.filter_check_inflight.store(false, .release);
+        const started = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
+        const verdict = filter_mod.explainDisplayFilter(
+            self.allocator,
+            self.io,
+            self.tools.tshark,
+            self.empty_pcap,
+            text,
+            self.process_runner,
+        ) catch {
+            self.allocator.free(text);
+            return;
+        };
+        const elapsed_ms = @divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds -| started, std.time.ns_per_ms);
+        log_mod.info("filter", "checked in {d} ms", .{elapsed_ms});
+        self.filter_check_mutex.lockUncancelable(self.io);
+        defer self.filter_check_mutex.unlock(self.io);
+        if (self.filter_check_box) |*box| {
+            self.allocator.free(box.text);
+            self.allocator.free(box.detail);
+        }
+        self.filter_check_box = .{
+            .text = text,
+            .ok = verdict.ok,
+            .detail = verdict.detail,
+        };
+    }
+
+    fn applyFilterVerdict(self: *AppModel) void {
+        self.filter_check_mutex.lockUncancelable(self.io);
+        const box = self.filter_check_box orelse {
+            self.filter_check_mutex.unlock(self.io);
+            return;
+        };
+        self.filter_check_box = null;
+        self.filter_check_mutex.unlock(self.io);
+
+        if (!std.mem.eql(u8, box.text, self.filter_seen)) {
+            self.allocator.free(box.text);
+            self.allocator.free(box.detail);
+            return;
+        }
+        self.filter.state = if (box.ok) .ok else .bad;
+        self.setFilterError(if (box.ok) "" else box.detail);
+        if (self.filter_checked.len != 0) self.allocator.free(self.filter_checked);
+        self.filter_checked = box.text;
+        self.allocator.free(box.detail);
+    }
+
+    fn updateMacroPreview(self: *AppModel, text: []const u8) void {
+        const expanded = macros_feature.expand(self.allocator, self.config, text) catch return;
+        defer self.allocator.free(expanded);
+        if (std.mem.eql(u8, expanded, text)) {
+            if (self.macro_preview.len != 0) self.allocator.free(self.macro_preview);
+            self.macro_preview = &.{};
+            self.status.expansion = "";
+            return;
+        }
+        if (std.mem.eql(u8, expanded, self.macro_preview)) return;
+        const copy = self.allocator.dupe(u8, expanded) catch return;
+        if (self.macro_preview.len != 0) self.allocator.free(self.macro_preview);
+        self.macro_preview = copy;
+        self.status.expansion = self.macro_preview;
+    }
+
+    fn setFilterError(self: *AppModel, detail: []const u8) void {
+        if (detail.len == 0) {
+            if (self.filter_error_text.len != 0) self.allocator.free(self.filter_error_text);
+            self.filter_error_text = &.{};
+            self.status.filter_error = "";
+            return;
+        }
+        const copy = self.allocator.dupe(u8, detail) catch return;
+        if (self.filter_error_text.len != 0) self.allocator.free(self.filter_error_text);
+        self.filter_error_text = copy;
+        self.status.filter_error = self.filter_error_text;
     }
 
     fn pollTransfer(self: *AppModel) void {
@@ -1547,11 +1800,13 @@ pub const AppModel = struct {
         self.overlay = kind;
     }
 
-    fn showStream(self: *AppModel, proto: []const u8, index: u32, body: []const u8) !void {
+    fn showStream(self: *AppModel, proto: []const u8, index: u32, body: []const u8, capped: bool) !void {
         if (self.stream_filter.len != 0) self.allocator.free(self.stream_filter);
         self.stream_filter = try std.fmt.allocPrint(self.allocator, "{s}.stream == {d}", .{ proto, index });
         var parsed = streams_shark.parse(self.allocator, body) catch {
-            try self.showPick("Stream", body, .streams);
+            const shown = try capText(self.allocator, body, capped, false);
+            defer self.allocator.free(shown);
+            try self.showPick("Stream", shown, .streams);
             return;
         };
         self.clearStreamChunks();
@@ -1562,12 +1817,13 @@ pub const AppModel = struct {
             self.allocator.free(self.stream_filter);
             self.stream_filter = try self.allocator.dupe(u8, parsed.filter);
         }
+        const row_capped = try self.trimStreamChunks();
         var text: std.Io.Writer.Allocating = .init(self.allocator);
         defer text.deinit();
-        if (parsed.chunks.len == 0) {
+        if (self.stream_chunks.len == 0) {
             try text.writer.writeAll(body);
         } else {
-            for (parsed.chunks, 0..) |chunk, i| {
+            for (self.stream_chunks, 0..) |chunk, i| {
                 if (i != 0) try text.writer.writeByte('\n');
                 const preview = std.mem.sliceTo(chunk.data, 0);
                 const shown = if (preview.len > 48) preview[0..48] else preview;
@@ -1579,23 +1835,37 @@ pub const AppModel = struct {
                 });
             }
         }
+        try writeCapNote(&text.writer, capped, row_capped);
         const owned = try text.toOwnedSlice();
         defer self.allocator.free(owned);
         try self.showPick("Stream  Enter jumps to that chunk", owned, .streams);
     }
 
+    fn trimStreamChunks(self: *AppModel) !bool {
+        if (self.stream_chunks.len <= process_mod.view_row_cap) return false;
+        for (self.stream_chunks[process_mod.view_row_cap..]) |*chunk| chunk.deinit(self.allocator);
+        const kept = try self.allocator.alloc(streams_shark.Chunk, process_mod.view_row_cap);
+        @memcpy(kept, self.stream_chunks[0..process_mod.view_row_cap]);
+        self.allocator.free(self.stream_chunks);
+        self.stream_chunks = kept;
+        return true;
+    }
+
     fn showConversations(self: *AppModel, path: []const u8, proto: []const u8) !void {
         var argv = try process_mod.argvConversations(self.allocator, self.tools.tshark, path, proto);
         defer argv.deinit(self.allocator);
-        var out = try self.runProcess(argv.slice());
+        var out = try self.runProcessLimited(argv.slice(), process_mod.view_stdout_cap);
         defer out.deinit(self.allocator);
         self.clearConversations();
         if (self.conversation_proto.len != 0) self.allocator.free(self.conversation_proto);
         self.conversation_proto = try self.allocator.dupe(u8, proto);
         self.conversations = convs_shark.parse(self.allocator, out.stdout) catch {
-            try self.showPick("Conversations", if (out.stdout.len != 0) out.stdout else out.stderr, .convs);
+            const shown = try capText(self.allocator, if (out.stdout.len != 0) out.stdout else out.stderr, out.truncated, false);
+            defer self.allocator.free(shown);
+            try self.showPick("Conversations", shown, .convs);
             return;
         };
+        const row_capped = try self.trimConversations();
         var text: std.Io.Writer.Allocating = .init(self.allocator);
         defer text.deinit();
         if (self.conversations.len == 0) {
@@ -1609,9 +1879,37 @@ pub const AppModel = struct {
             if (conversation.port_b) |port| try text.writer.print(":{d}", .{port});
             try text.writer.print("   {d} frames  {d} bytes", .{ conversation.frames_total, conversation.bytes_total });
         }
+        try writeCapNote(&text.writer, out.truncated, row_capped);
         const owned = try text.toOwnedSlice();
         defer self.allocator.free(owned);
         try self.showPick("Conversations  Enter filters the list", owned, .convs);
+    }
+
+    fn trimConversations(self: *AppModel) !bool {
+        if (self.conversations.len <= process_mod.view_row_cap) return false;
+        for (self.conversations[process_mod.view_row_cap..]) |*conversation| conversation.deinit(self.allocator);
+        const kept = try self.allocator.alloc(convs_shark.Conversation, process_mod.view_row_cap);
+        @memcpy(kept, self.conversations[0..process_mod.view_row_cap]);
+        self.allocator.free(self.conversations);
+        self.conversations = kept;
+        return true;
+    }
+
+    fn writeCapNote(writer: *std.Io.Writer, bytes: bool, rows: bool) !void {
+        if (!bytes and !rows) return;
+        try writer.writeByte('\n');
+        if (rows) try writer.print("Stopped after {d} rows. ", .{process_mod.view_row_cap});
+        if (bytes) try writer.writeAll("Stopped at the 1 MiB output cap. ");
+        try writer.writeAll("The rest was not loaded.");
+    }
+
+    fn capText(allocator: std.mem.Allocator, body: []const u8, bytes: bool, rows: bool) ![]u8 {
+        if (!bytes and !rows) return allocator.dupe(u8, body);
+        var text: std.Io.Writer.Allocating = .init(allocator);
+        errdefer text.deinit();
+        try text.writer.writeAll(body);
+        try writeCapNote(&text.writer, bytes, rows);
+        return text.toOwnedSlice();
     }
 
     pub fn activatePick(self: *AppModel) !void {
@@ -1655,6 +1953,14 @@ pub const AppModel = struct {
                 const apply = self.help_overlay.selected == 0;
                 self.dismissOverlays();
                 try self.commitFilter(text, apply);
+            },
+            .saved_filters => {
+                const index = self.help_overlay.selected;
+                if (index >= self.config.named_filters.items.len) return;
+                const value = try self.allocator.dupe(u8, self.config.named_filters.items[index].value);
+                defer self.allocator.free(value);
+                self.dismissOverlays();
+                try self.commitFilter(value, true);
             },
             .menu => try self.runMenuChoice(self.help_overlay.selected),
             else => {},
@@ -1900,10 +2206,15 @@ pub const AppModel = struct {
                 );
             },
             .protocol => {
-                const text = if (self.copy_mode)
+                const subtree = if (self.copy_mode)
                     try self.protocol_tree.formatSubtree(self.allocator)
                 else
                     try self.allocator.dupe(u8, self.protocol_tree.selectedText());
+                defer self.allocator.free(subtree);
+                const text = if (self.protocol_tree.selectedField()) |field|
+                    try field_filter.formatFieldCopy(self.allocator, field.name, field.show, subtree)
+                else
+                    try self.allocator.dupe(u8, subtree);
                 defer self.allocator.free(text);
                 try copy_feature.copyText(
                     self.allocator,
@@ -1981,6 +2292,7 @@ pub const AppModel = struct {
                     }
                 }
                 self.pollTransfer();
+                self.pollFilterFeedback();
                 try ctx.tick(100, self.widget());
                 ctx.redraw = true;
             },
@@ -2253,6 +2565,9 @@ pub const AppModel = struct {
         self.status.selected_index = self.session.selected_index;
         self.status.tailing = self.tailing;
         self.status.live = self.live_capture;
+        self.status.filter_error = self.filter_error_text;
+        self.status.expansion = self.macro_preview;
+        self.packet_table.color_rules = self.config.color_rules.items;
         const header_h: u16 = 1;
         const filter_h: u16 = 1;
         const status_h: u16 = 1;

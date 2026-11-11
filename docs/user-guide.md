@@ -32,39 +32,67 @@ zigshark capture -i eth0
 zigshark capture -i eth0 -f 'port 53' -w /tmp/out.pcap
 ```
 
-## Filters
+## Keys
 
-- Display filter: `/` then enter a Wireshark display filter; Enter applies it.
-- Up/Down in the filter bar recalls recent filters. An empty bar lists them.
-- `=` on a protocol field opens equals, not-equals, and, or, not, and contains. Apply reloads. Prepare only fills the bar. And/or appends to the current expression.
-- `=` on the packet list builds a conversation filter from the address pair, including tcp/udp ports when the columns have them.
-- `g` or `:goto 1234` selects that frame. A missing frame is a message.
-- Capture filter: `-f` on the CLI for live capture.
-- Validation uses `tshark -Y … -r empty.pcap`.
+| Key | Action |
+|-----|--------|
+| `hjkl` / arrows | Move in the focused pane |
+| `Tab` / `Ctrl-W` | Cycle list, tree, hex, and filter |
+| `/` | Focus the display filter. `Tab` / `Shift-Tab` complete field names |
+| Up / Down | In the filter bar, recall recent filters. An empty bar lists them |
+| Enter | Apply the display filter |
+| `=` | On a field: equals, not-equals, and, or, not, contains. On a row: conversation filter. Apply reloads; Prepare only fills the bar |
+| `g` / `:goto 1234` | Select that frame. A missing frame is a message |
+| `:` | Command palette. The selected row shows the command's arguments |
+| `?` | Help |
+| `\|` | Toggle stacked and side-by-side layout |
+| `\` | Zoom the focused pane |
+| `+` / `-` | Resize the packet list. In the tree, expand or collapse |
+| `<` / `>` | Resize the tree and hex panes |
+| `m` / `'` | Set or jump a mark. Lower case is local, upper case is global |
+| `Ctrl-F`, `n` / `N` | Search the focused pane, then next or previous hit |
+| `c`, then `Ctrl-C` | Copy. A protocol field copy includes `tcp.port == 443`, the raw value, and the visible subtree |
+| `q` / `ZZ` | Quit, with or without confirmation |
+| `Ctrl-Z` | Suspend. `fg` resumes |
+| `Esc` | Dismiss an overlay |
+| Home / `G` | First or last packet. Hex has an offset ruler, a gap after 8 bytes, and the cursor stays distinct inside the selected field |
 
-## Analysis views
+The filter bar is neutral while empty, green when tshark accepts the expression, and red when it does not. The tshark error line is on the status line. The check runs after a short pause so typing does not wait on tshark. A `$name` macro shows its expansion on the status line before Enter applies it.
 
-| Command | Description |
-|---------|-------------|
-| `:streams [n]` | Follow TCP stream `n` (ascii) |
-| `:convs [tcp\|udp\|ip\|…]` | Conversation table |
-| `:capinfo` | `capinfos` summary |
-| `:recents` | Recent files |
-| `:theme` | Toggle dark/light |
+`:filters` lists saved filters and Enter applies one. `:filters save <name>` stores the current expression, separate from the recent list. `:filters <name>` applies that saved filter.
 
-Marks: `ma` set local mark a, `'a` jump.
+Rows painted by tshark `--color` use those colors. Profile coloring rules in `[coloring]` are checked in file order and the first match overrides that layer. A rule filter is a protocol name, `contains text` against any column, or empty to match every remaining row. It is not a tshark display filter. The protocol tint is only the fallback when neither tshark nor a profile rule painted the row. A compact stream sequence diagram waits until a followed chunk knows its frame number.
 
-Search: focus a pane and press `Ctrl-F`. Use `:search-hex de ad be ef`
-for byte patterns and `:search-filter <display filter>` for tshark-backed frame
-search. `n` / `N` repeat forward/backward.
+Header menus: Analysis (field filter, go to frame, streams, conversations, capture info) and Misc (columns, theme, profile, marks, tail). Expert, hierarchy, endpoints, and export are listed and not built yet.
 
-Copy: press `c` to copy the focused packet row, protocol field, highlighted
-bytes, or filter using OSC52 (or `copy-command`).
+## Commands
 
-Resize: `+`/`-` changes packet-list height, `</>` changes the protocol/hex
-split, and `|` toggles the alternate layout. Split dividers are mouse-draggable.
+| Command | Arguments |
+|---------|-----------|
+| `:goto <frame>` | Select a frame |
+| `:streams [tcp\|udp] [index] [ascii\|hex\|raw]` | Follow the selected stream |
+| `:convs [tcp\|udp\|ip\|ipv6\|eth]` | Conversations. Enter filters |
+| `:columns default\|delta\|absolute\|set <format>` | Packet-list columns |
+| `:decode-as layer==selector,protocol` | Add a decode-as rule |
+| `:search <text>` | Search the focused pane |
+| `:search-regex <pattern>` | `. * + ? [] ^ $`, not PCRE |
+| `:search-hex <hex bytes>` | Search packet bytes |
+| `:search-filter <display filter>` | Jump to the next matching frame |
+| `:load <path>` | Open a capture |
+| `:set [<key> <value>]` | List or change a setting. A bad value is not saved |
+| `:profile list\|create\|use\|delete <name>` | Profiles |
+| `:theme [list\|<name>]` | Theme. `:no-theme` restores the built-in theme |
+| `:recent <number>` / `:recent-filter <number>` | Open a recent file or filter |
+| `:filters [name\|save <name>\|delete <name>]` | Saved filters, separate from the recent list |
+| `:tail` | Follow a growing file. `:clear-packets` hides rows already shown |
+| `:capinfo`, `:marks`, `:recents`, `:config`, `:logs`, `:help`, `:quit` | As named |
+| `:wormhole [file]` | Send a file with the wormhole CLI |
 
-Click a packet-table heading to sort; click it again to reverse.
+`:convs` and `:streams` stop after 200 rows, or after 1 MiB of tshark output. The overlay says when that happens. `:expert` does not exist yet; it will use the same cap.
+
+Capture filters are `-f` on the command line. Display-filter checks use `tshark -Y` against an empty pcap.
+
+Click a packet-list heading to sort, and click it again to reverse. Split dividers are mouse-draggable.
 
 ## Configuration
 
@@ -79,9 +107,20 @@ pcap-bundle-size = 1000
 pcap-cache-size = 64
 layout = "stacked"
 theme = "default"
+
+[filters]
+"web" = "tcp.port == 443"
+
+[macros]
+"web" = "tcp.port == 443"
+
+[coloring]
+"dns" = "dns|#010203|#040506"
 ```
 
 Profiles live under `~/.config/zigshark/profiles/<name>/`. Cache under `~/.cache/zigshark/`.
+
+`pcap-bundle-size` is how many packet-list rows are appended while tshark is still reading. A later chunk leaves the selected row where it is. `pcap-cache-size` is how many dissected packets stay in memory; `:set pcap-cache-size` applies to the open cache. Detail for the previous and next frames is loaded with the selected frame, and selecting that frame again does not start tshark when the cache still has it.
 
 Use `:profile create NAME`, `:profile use NAME`, or `-C NAME`.
 

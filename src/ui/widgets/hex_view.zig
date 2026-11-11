@@ -86,8 +86,10 @@ pub const HexView = struct {
                 if (m.type == .press and m.button == .left and m.row >= 0 and m.col >= 0) {
                     if (self.onFocus) |cb| cb(self.userdata);
                     try ctx.requestFocus(self.widget());
-                    if (self.offsetAt(@intCast(m.col), @intCast(m.row))) |off| {
-                        self.setCursor(off, true);
+                    if (m.row > 0) {
+                        if (self.offsetAt(@intCast(m.col), @intCast(m.row - 1))) |off| {
+                            self.setCursor(off, true);
+                        }
                     }
                     return ctx.consumeAndRedraw();
                 }
@@ -143,7 +145,12 @@ pub const HexView = struct {
         const lay = layoutFor(if (self.last_width == 0) 80 else self.last_width);
         const line = self.scroll_top + row;
         if (col >= lay.hex_col and col + 2 < lay.ascii_col) {
-            const rel = col - lay.hex_col;
+            var rel: usize = col - lay.hex_col;
+            if (lay.bytes_per_line > 8) {
+                const gap_at: usize = 8 * 3;
+                if (rel == gap_at) return null;
+                if (rel > gap_at) rel -= 1;
+            }
             const byte = rel / 3;
             if (byte >= lay.bytes_per_line) return null;
             const off = line * lay.bytes_per_line + byte;
@@ -158,11 +165,6 @@ pub const HexView = struct {
             return off;
         }
         return null;
-    }
-
-    fn byteHighlighted(self: *const HexView, offset: usize) bool {
-        if (self.highlight_size == 0) return false;
-        return offset >= self.highlight_pos and offset < self.highlight_pos + self.highlight_size;
     }
 
     pub fn draw(self: *HexView, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
@@ -188,10 +190,11 @@ pub const HexView = struct {
             }
         }
         self.last_width = size.width;
-        self.viewport_rows = size.height;
+        self.viewport_rows = size.height -| 1;
         const lay = layoutFor(size.width);
         self.bytes_per_line = lay.bytes_per_line;
         self.ensureCursorVisible();
+        self.drawRuler(&surf, ctx, size.width, lay);
         const total_lines = if (self.bytes_per_line > 0)
             (self.raw.len + self.bytes_per_line - 1) / self.bytes_per_line
         else
@@ -202,7 +205,7 @@ pub const HexView = struct {
             self.scroll_top = total_lines - 1;
         }
 
-        var screen_row: u16 = 0;
+        var screen_row: u16 = 1;
         var line = self.scroll_top;
         while (screen_row < size.height and line < total_lines) : ({
             screen_row += 1;
@@ -213,6 +216,7 @@ pub const HexView = struct {
             var col: u16 = text_util.writeText(&surf, ctx, 0, screen_row, prefix, normal, size.width);
             var i: usize = 0;
             while (i < self.bytes_per_line) : (i += 1) {
+                if (i == 8 and self.bytes_per_line > 8 and col < size.width) col += 1;
                 const off = base + i;
                 if (off < self.raw.len) {
                     const style = self.byteStyle(off, normal, field, cursor_style);
@@ -235,6 +239,7 @@ pub const HexView = struct {
                 col += 2;
                 i = 0;
                 while (i < self.bytes_per_line) : (i += 1) {
+                    if (i == 8 and self.bytes_per_line > 8 and col < size.width) col += 1;
                     const off = base + i;
                     if (off >= self.raw.len or col >= size.width) break;
                     const b = self.raw[off];
@@ -248,15 +253,30 @@ pub const HexView = struct {
         return surf;
     }
 
-    fn byteStyle(self: *const HexView, offset: usize, normal: vaxis.Style, field: vaxis.Style, cursor_style: vaxis.Style) vaxis.Style {
-        if (offset == self.cursor and self.raw.len > 0) return cursor_style;
-        if (self.byteHighlighted(offset) and !self.highlightCoversAll()) return field;
-        return normal;
+    fn drawRuler(self: *HexView, surf: *vxfw.Surface, ctx: vxfw.DrawContext, width: u16, lay: HexLayout) void {
+        const style: vaxis.Style = .{ .fg = self.theme.accent, .bg = self.theme.bg };
+        var col: u16 = lay.hex_col;
+        var byte: usize = 0;
+        while (byte < lay.bytes_per_line) : (byte += 1) {
+            if (byte == 8 and lay.bytes_per_line > 8) col += 1;
+            if (col + 2 > width) break;
+            var pair: [2]u8 = undefined;
+            _ = std.fmt.bufPrint(&pair, "{x:0>2}", .{byte}) catch break;
+            text_util.writeAsciiChar(surf, col, 0, pair[0], style);
+            text_util.writeAsciiChar(surf, col + 1, 0, pair[1], style);
+            col += 3;
+        }
+        _ = ctx;
     }
 
-    fn highlightCoversAll(self: *const HexView) bool {
-        return self.raw.len > 0 and self.highlight_pos == 0 and self.highlight_size >= self.raw.len;
+    fn byteStyle(self: *const HexView, offset: usize, normal: vaxis.Style, field: vaxis.Style, cursor_style: vaxis.Style) vaxis.Style {
+        return switch (byteRole(self.cursor, self.highlight_pos, self.highlight_size, self.raw.len, offset)) {
+            .cursor => cursor_style,
+            .field => field,
+            .plain => normal,
+        };
     }
+
 };
 
 const HexLayout = struct {
@@ -265,15 +285,40 @@ const HexLayout = struct {
     ascii_col: u16,
 };
 
+pub const ByteRole = enum { cursor, field, plain };
+
+/// The cursor byte stays distinct while it sits inside the selected field.
+pub fn byteRole(
+    cursor: usize,
+    highlight_pos: usize,
+    highlight_size: usize,
+    raw_len: usize,
+    offset: usize,
+) ByteRole {
+    if (raw_len > 0 and offset == cursor) return .cursor;
+    const covers_all = raw_len > 0 and highlight_pos == 0 and highlight_size >= raw_len;
+    if (!covers_all and highlight_size > 0 and offset >= highlight_pos and offset < highlight_pos + highlight_size) {
+        return .field;
+    }
+    return .plain;
+}
+
 fn layoutFor(width: u16) HexLayout {
-    const bytes_per_line: usize = if (width >= 78) 16 else if (width >= 42) 8 else 4;
+    const bytes_per_line: usize = if (width >= 80) 16 else if (width >= 44) 8 else 4;
     const hex_col: u16 = 6;
-    const ascii_col: u16 = hex_col + @as(u16, @intCast(bytes_per_line * 3)) + 2;
+    const gap: u16 = if (bytes_per_line > 8) 1 else 0;
+    const ascii_col: u16 = hex_col + @as(u16, @intCast(bytes_per_line * 3)) + gap + 2;
     return .{
         .bytes_per_line = bytes_per_line,
         .hex_col = hex_col,
         .ascii_col = ascii_col,
     };
+}
+
+test "cursor stays distinct inside the selected field" {
+    try std.testing.expectEqual(ByteRole.cursor, byteRole(4, 2, 6, 20, 4));
+    try std.testing.expectEqual(ByteRole.field, byteRole(4, 2, 6, 20, 3));
+    try std.testing.expectEqual(ByteRole.plain, byteRole(4, 2, 6, 20, 9));
 }
 
 test "hex click maps to the byte under the cursor" {

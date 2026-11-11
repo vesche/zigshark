@@ -8,39 +8,48 @@ const text_util = @import("text_util.zig");
 pub const CommandDef = struct {
     name: []const u8,
     description: []const u8,
+    usage: []const u8,
 };
 
 pub const defaultCommands = [_]CommandDef{
-    .{ .name = "quit", .description = "Exit zigshark" },
-    .{ .name = "help", .description = "Show key bindings" },
-    .{ .name = "filter", .description = "Focus display filter" },
-    .{ .name = "goto", .description = "Select a frame by number" },
-    .{ .name = "decode-as", .description = "Add a tshark decode-as rule" },
-    .{ .name = "timestamp", .description = "Set tshark timestamp format" },
-    .{ .name = "search", .description = "Search packet list" },
-    .{ .name = "search-regex", .description = "Search with . * + ? [] ^ $" },
-    .{ .name = "search-hex", .description = "Search packet bytes as hexadecimal" },
-    .{ .name = "search-filter", .description = "Find packets with a display filter" },
-    .{ .name = "clear-filter", .description = "Clear display filter" },
-    .{ .name = "clear-packets", .description = "Clear the packet list" },
-    .{ .name = "load", .description = "Load a capture file" },
-    .{ .name = "streams", .description = "Follow the current TCP/UDP stream" },
-    .{ .name = "convs", .description = "List conversations; Enter filters" },
-    .{ .name = "capinfo", .description = "Capture file info" },
-    .{ .name = "columns", .description = "default, delta, absolute, or a tshark format" },
-    .{ .name = "tail", .description = "Follow a growing capture" },
-    .{ .name = "config", .description = "Show active configuration" },
-    .{ .name = "logs", .description = "Show log file location" },
-    .{ .name = "theme", .description = "Toggle theme" },
-    .{ .name = "recents", .description = "Recent files" },
-    .{ .name = "recent", .description = "Open a numbered recent file" },
-    .{ .name = "recent-filter", .description = "Apply a numbered recent filter" },
-    .{ .name = "marks", .description = "List marks" },
-    .{ .name = "set", .description = "List or change any config setting" },
-    .{ .name = "profile", .description = "Switch profile" },
-    .{ .name = "wormhole", .description = "Send file via wormhole" },
-    .{ .name = "no-theme", .description = "Disable packet colors" },
+    .{ .name = "quit", .description = "Exit zigshark", .usage = ":quit" },
+    .{ .name = "help", .description = "Show key bindings", .usage = ":help" },
+    .{ .name = "filter", .description = "Focus display filter", .usage = ":filter" },
+    .{ .name = "goto", .description = "Select a frame by number", .usage = ":goto <frame>" },
+    .{ .name = "decode-as", .description = "Add a tshark decode-as rule", .usage = ":decode-as layer==selector,protocol" },
+    .{ .name = "timestamp", .description = "Set tshark timestamp format", .usage = ":timestamp a|ad|adoy|d|dd|e|r|u|ud|udoy" },
+    .{ .name = "search", .description = "Search packet list", .usage = ":search <text>" },
+    .{ .name = "search-regex", .description = "Search with . * + ? [] ^ $", .usage = ":search-regex <pattern>" },
+    .{ .name = "search-hex", .description = "Search packet bytes as hexadecimal", .usage = ":search-hex <hex bytes>" },
+    .{ .name = "search-filter", .description = "Find packets with a display filter", .usage = ":search-filter <display filter>" },
+    .{ .name = "clear-filter", .description = "Clear display filter", .usage = ":clear-filter" },
+    .{ .name = "clear-packets", .description = "Clear the packet list", .usage = ":clear-packets" },
+    .{ .name = "load", .description = "Load a capture file", .usage = ":load <path>" },
+    .{ .name = "streams", .description = "Follow the current TCP/UDP stream", .usage = ":streams [tcp|udp] [index] [ascii|hex|raw]" },
+    .{ .name = "convs", .description = "List conversations; Enter filters", .usage = ":convs [tcp|udp|ip|ipv6|eth]" },
+    .{ .name = "capinfo", .description = "Capture file info", .usage = ":capinfo" },
+    .{ .name = "columns", .description = "Choose the packet-list columns", .usage = ":columns [default|delta|absolute|set <format>]" },
+    .{ .name = "tail", .description = "Follow a growing capture", .usage = ":tail" },
+    .{ .name = "config", .description = "Show active configuration", .usage = ":config" },
+    .{ .name = "logs", .description = "Show log file location", .usage = ":logs" },
+    .{ .name = "theme", .description = "Toggle or load a theme", .usage = ":theme [list|<name>]" },
+    .{ .name = "recents", .description = "Recent files", .usage = ":recents" },
+    .{ .name = "recent", .description = "Open a numbered recent file", .usage = ":recent <number>" },
+    .{ .name = "recent-filter", .description = "Apply a numbered recent filter", .usage = ":recent-filter <number>" },
+    .{ .name = "filters", .description = "Apply a saved filter", .usage = ":filters [name|save <name>|delete <name>]" },
+    .{ .name = "marks", .description = "List marks", .usage = ":marks" },
+    .{ .name = "set", .description = "List or change any config setting", .usage = ":set [<key> <value>]" },
+    .{ .name = "profile", .description = "Switch profile", .usage = ":profile [list|create|use|delete] <name>" },
+    .{ .name = "wormhole", .description = "Send file via wormhole", .usage = ":wormhole [file]" },
+    .{ .name = "no-theme", .description = "Use the built-in theme", .usage = ":no-theme" },
 };
+
+pub fn commandUsage(name: []const u8) []const u8 {
+    for (defaultCommands) |cmd| {
+        if (std.mem.eql(u8, cmd.name, name)) return cmd.usage;
+    }
+    return "";
+}
 
 pub fn fuzzyMatch(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;
@@ -176,6 +185,14 @@ pub const CommandPalette = struct {
             const line = try std.fmt.allocPrint(ctx.arena, "  {s} — {s}", .{ cmd.name, cmd.description });
             _ = text_util.writeText(&surf, ctx, 0, row, line, row_style, size.width);
             row += 1;
+            if (sel and cmd.usage.len != 0 and row < size.height) {
+                const usage_style: vaxis.Style = .{
+                    .fg = self.theme.accent,
+                    .bg = self.theme.selected_bg,
+                };
+                _ = text_util.writeText(&surf, ctx, 0, row, cmd.usage, usage_style, size.width);
+                row += 1;
+            }
         }
         const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
         children[0] = .{ .origin = .{ .row = 0, .col = 1 }, .surface = field_surf };
@@ -187,6 +204,12 @@ pub const CommandPalette = struct {
 test "fuzzy match" {
     try std.testing.expect(fuzzyMatch("clear-filter", "clf"));
     try std.testing.expect(!fuzzyMatch("quit", "zzz"));
+}
+
+test "selected commands show their arguments" {
+    try std.testing.expectEqualStrings(":streams [tcp|udp] [index] [ascii|hex|raw]", commandUsage("streams"));
+    try std.testing.expect(std.mem.indexOf(u8, commandUsage("columns"), "set <format>") != null);
+    try std.testing.expectEqualStrings(":decode-as layer==selector,protocol", commandUsage("decode-as"));
 }
 
 test "parse command line" {

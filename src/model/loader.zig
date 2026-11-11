@@ -4,6 +4,8 @@ const process = @import("../shark/process.zig");
 const packet = @import("packet.zig");
 const session_mod = @import("session.zig");
 const lru_mod = @import("../cache/lru.zig");
+const psml = @import("../shark/psml.zig");
+const log_mod = @import("../log.zig");
 
 pub const LoaderConfig = struct {
     bundle_size: u32 = 1000,
@@ -112,6 +114,11 @@ pub const CaptureLoader = struct {
         self.detail_cache.clear(io);
     }
 
+    pub fn setCacheSize(self: *CaptureLoader, size: u32) void {
+        self.config.cache_size = @max(size, 1);
+        self.detail_cache.setCapacity(self.io, self.config.cache_size);
+    }
+
     pub fn requestPsml(self: *CaptureLoader, session: *session_mod.Session) !void {
         session.loading = .loading_list;
         self.cancel_token.cancel(self.io);
@@ -165,14 +172,14 @@ pub const CaptureLoader = struct {
             return;
         }
 
-        const end = frame + self.config.bundle_size - 1;
+        const window = detailWindow(frame, self.config.bundle_size, self.config.cache_size);
         var pdml_argv = try process.argvPdmlBundle(
             self.allocator,
             self.tools.tshark,
             path,
             session.display_filter,
-            frame,
-            end,
+            window.start,
+            window.end,
         );
         errdefer pdml_argv.deinit(self.allocator);
         try appendDissectionOptions(self.allocator, &pdml_argv, session, self.config.tshark_args);
@@ -182,8 +189,8 @@ pub const CaptureLoader = struct {
             self.tools.tshark,
             path,
             session.display_filter,
-            frame,
-            end,
+            window.start,
+            window.end,
         );
         errdefer hex_argv.deinit(self.allocator);
         try appendDissectionOptions(self.allocator, &hex_argv, session, self.config.tshark_args);
@@ -253,12 +260,11 @@ pub const CaptureLoader = struct {
             return;
         }
 
-        const start = frame;
-        const end = frame + self.config.bundle_size - 1;
-        var pdml_argv = try process.argvPdmlBundle(self.allocator, self.tools.tshark, path, session.display_filter, start, end);
+        const window = detailWindow(frame, self.config.bundle_size, self.config.cache_size);
+        var pdml_argv = try process.argvPdmlBundle(self.allocator, self.tools.tshark, path, session.display_filter, window.start, window.end);
         defer pdml_argv.deinit(self.allocator);
         try appendDissectionOptions(self.allocator, &pdml_argv, session, self.config.tshark_args);
-        var hex_argv = try process.argvHexBundle(self.allocator, self.tools.tshark, path, session.display_filter, start, end);
+        var hex_argv = try process.argvHexBundle(self.allocator, self.tools.tshark, path, session.display_filter, window.start, window.end);
         defer hex_argv.deinit(self.allocator);
         try appendDissectionOptions(self.allocator, &hex_argv, session, self.config.tshark_args);
 
@@ -272,12 +278,10 @@ pub const CaptureLoader = struct {
             return;
         }
 
-        const detail = try packet.parsePdmlPacket(self.allocator, pdml_out.stdout, frame);
-        const bytes = try packet.parseHexdump(self.allocator, hex_out.stdout, frame);
-        const bundle = packet.DetailBundle{ .pdml = detail, .bytes = bytes };
-        const for_ui = try bundle.clone(self.allocator);
-        try self.detail_cache.put(io, frame, bundle);
-        try self.pushEvent(.{ .detail_loaded = for_ui });
+        const started = std.Io.Timestamp.now(io, .awake).nanoseconds;
+        try ingestDetail(self, pdml_out.stdout, hex_out.stdout, frame, null);
+        const elapsed_ms = @divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds -| started, std.time.ns_per_ms);
+        log_mod.info("detail", "frame {d} loaded in {d} ms", .{ frame, elapsed_ms });
         @constCast(session).loading = .idle;
     }
 
@@ -358,38 +362,142 @@ fn runPsmlWorker(task: *PsmlTask) void {
         loader.allocator.destroy(task);
     }
 
-    var output = process.runCaptureCancellable(
+    var feed = PsmlFeed.init(loader, task.generation);
+    defer feed.deinit();
+    var saw_stdout = false;
+    var output = process.runStdoutChunks(
         loader.allocator,
         loader.io,
         task.argv.slice(),
         &loader.cancel_token,
+        &feed,
+        PsmlFeed.onChunk,
+        &saw_stdout,
     ) catch |err| {
         if (err == error.Cancelled or task.generation != loader.list_generation.load(.acquire)) return;
         emitWorkerError(loader, @errorName(err));
         return;
     };
     defer output.deinit(loader.allocator);
-    if (task.generation != loader.list_generation.load(.acquire)) return;
+    if (task.generation != loader.list_generation.load(.acquire) or loader.cancel_token.isCancelled()) return;
+
+    feed.finish() catch |err| {
+        if (err == error.Cancelled or task.generation != loader.list_generation.load(.acquire)) return;
+        emitWorkerError(loader, @errorName(err));
+        return;
+    };
     if (!output.term.success()) {
         emitWorkerError(loader, output.stderr);
         return;
     }
-
-    var table = packet.parsePsml(loader.allocator, output.stdout) catch |err| {
-        emitWorkerError(loader, @errorName(err));
-        return;
-    };
-    if (loader.cancel_token.isCancelled() or
-        task.generation != loader.list_generation.load(.acquire))
-    {
-        table.deinit(loader.allocator);
-        return;
-    }
-    var event: Event = .{ .packets_loaded = table };
-    loader.pushEvent(event) catch {
-        event.deinit(loader.allocator);
-    };
+    loader.pushEvent(.done) catch {};
 }
+
+const PsmlFeed = struct {
+    loader: *CaptureLoader,
+    generation: u64,
+    started_ns: i96,
+    pending: std.ArrayList(u8) = .empty,
+    batch: std.ArrayList(packet.PacketSummary) = .empty,
+    headers: [][]u8 = &.{},
+    headers_sent: bool = false,
+    replace_next: bool = true,
+    emitted_rows: usize = 0,
+
+    fn init(loader: *CaptureLoader, generation: u64) PsmlFeed {
+        return .{
+            .loader = loader,
+            .generation = generation,
+            .started_ns = std.Io.Timestamp.now(loader.io, .awake).nanoseconds,
+        };
+    }
+
+    fn deinit(self: *PsmlFeed) void {
+        const allocator = self.loader.allocator;
+        self.pending.deinit(allocator);
+        for (self.batch.items) |*summary| summary.deinit(allocator);
+        self.batch.deinit(allocator);
+        for (self.headers) |header| allocator.free(header);
+        if (self.headers.len != 0) allocator.free(self.headers);
+    }
+
+    fn onChunk(ctx: *anyopaque, chunk: []const u8) anyerror!void {
+        const self: *PsmlFeed = @ptrCast(@alignCast(ctx));
+        if (self.generation != self.loader.list_generation.load(.acquire)) return error.Cancelled;
+        try self.pending.appendSlice(self.loader.allocator, chunk);
+        try self.drain(false);
+    }
+
+    fn finish(self: *PsmlFeed) !void {
+        try self.drain(true);
+        if (!self.headers_sent and self.headers.len != 0) try self.emit(0, true);
+    }
+
+    fn drain(self: *PsmlFeed, flush: bool) !void {
+        const allocator = self.loader.allocator;
+        var available = try psml.parseAvailable(allocator, self.pending.items);
+        defer available.deinit(allocator);
+        if (available.headers.len != 0 and self.headers.len == 0 and !self.headers_sent) {
+            self.headers = available.headers;
+            available.headers = &.{};
+        }
+        for (available.packets) |*source| {
+            const summary = try packet.summaryFromPsml(allocator, source);
+            try self.batch.append(allocator, summary);
+        }
+        self.dropPending(available.consumed);
+
+        const bundle = @max(self.loader.config.bundle_size, 1);
+        while (self.batch.items.len >= bundle) {
+            try self.emit(bundle, false);
+        }
+        if (flush and self.batch.items.len != 0) try self.emit(self.batch.items.len, false);
+    }
+
+    fn emit(self: *PsmlFeed, count: usize, headers_only: bool) !void {
+        if (self.generation != self.loader.list_generation.load(.acquire)) return error.Cancelled;
+        const allocator = self.loader.allocator;
+        const packets = if (headers_only)
+            try allocator.alloc(packet.PacketSummary, 0)
+        else blk: {
+            const n = @min(count, self.batch.items.len);
+            const slice = try allocator.alloc(packet.PacketSummary, n);
+            @memcpy(slice, self.batch.items[0..n]);
+            std.mem.copyForwards(packet.PacketSummary, self.batch.items[0 .. self.batch.items.len - n], self.batch.items[n..]);
+            self.batch.shrinkRetainingCapacity(self.batch.items.len - n);
+            break :blk slice;
+        };
+        var headers: [][]u8 = &.{};
+        if (!self.headers_sent) {
+            headers = self.headers;
+            self.headers = &.{};
+            self.headers_sent = true;
+        }
+        var table = packet.PsmlTable{
+            .headers = headers,
+            .packets = packets,
+            .append = !self.replace_next,
+        };
+        self.replace_next = false;
+        self.emitted_rows += table.packets.len;
+        const elapsed_ms = @divTrunc(std.Io.Timestamp.now(self.loader.io, .awake).nanoseconds -| self.started_ns, std.time.ns_per_ms);
+        log_mod.info("psml", "{d} rows after {d} ms", .{ self.emitted_rows, elapsed_ms });
+        self.loader.pushEvent(.{ .packets_loaded = table }) catch |err| {
+            table.deinit(allocator);
+            return err;
+        };
+    }
+
+    fn dropPending(self: *PsmlFeed, consumed: usize) void {
+        if (consumed == 0) return;
+        if (consumed >= self.pending.items.len) {
+            self.pending.clearRetainingCapacity();
+            return;
+        }
+        std.mem.copyForwards(u8, self.pending.items[0 .. self.pending.items.len - consumed], self.pending.items[consumed..]);
+        self.pending.shrinkRetainingCapacity(self.pending.items.len - consumed);
+    }
+};
 
 fn runDetailWorker(task: *DetailTask) void {
     const loader = task.loader;
@@ -430,50 +538,99 @@ fn runDetailWorker(task: *DetailTask) void {
         emitWorkerError(loader, hex_output.stderr);
         return;
     }
+    if (loader.cancel_token.isCancelled() or task.generation != loader.detail_generation.load(.acquire)) return;
 
-    const detail = packet.parsePdmlPacket(
-        loader.allocator,
-        pdml_output.stdout,
-        task.frame,
-    ) catch |err| {
+    const started = std.Io.Timestamp.now(loader.io, .awake).nanoseconds;
+    ingestDetail(loader, pdml_output.stdout, hex_output.stdout, task.frame, task.generation) catch |err| {
+        if (err == error.Cancelled or task.generation != loader.detail_generation.load(.acquire)) return;
         emitWorkerError(loader, @errorName(err));
         return;
     };
-    const bytes = packet.parseHexdump(
-        loader.allocator,
-        hex_output.stdout,
-        task.frame,
-    ) catch |err| {
-        var mutable_detail = detail;
-        mutable_detail.deinit(loader.allocator);
-        emitWorkerError(loader, @errorName(err));
-        return;
-    };
-    var bundle = packet.DetailBundle{ .pdml = detail, .bytes = bytes };
+    const elapsed_ms = @divTrunc(std.Io.Timestamp.now(loader.io, .awake).nanoseconds -| started, std.time.ns_per_ms);
+    log_mod.info("detail", "frame {d} loaded in {d} ms", .{ task.frame, elapsed_ms });
+}
 
-    if (loader.cancel_token.isCancelled() or
-        task.generation != loader.detail_generation.load(.acquire))
-    {
-        bundle.deinit(loader.allocator);
-        return;
+fn ingestDetail(
+    self: *CaptureLoader,
+    pdml_xml: []const u8,
+    hex_text: []const u8,
+    requested: u32,
+    generation: ?u64,
+) !void {
+    if (generation) |expected| {
+        if (expected != self.detail_generation.load(.acquire) or self.cancel_token.isCancelled()) return error.Cancelled;
+    }
+    const details = try packet.parsePdmlPackets(self.allocator, pdml_xml);
+    var detail_kept = try self.allocator.alloc(bool, details.len);
+    defer self.allocator.free(detail_kept);
+    @memset(detail_kept, false);
+    defer {
+        for (details, detail_kept) |*detail, kept| if (!kept) detail.deinit(self.allocator);
+        self.allocator.free(details);
     }
 
-    const ui_copy = bundle.clone(loader.allocator) catch |err| {
-        bundle.deinit(loader.allocator);
-        emitWorkerError(loader, @errorName(err));
-        return;
+    const dumps = try packet.parseHexdumpPackets(self.allocator, hex_text);
+    var dump_kept = try self.allocator.alloc(bool, dumps.len);
+    defer self.allocator.free(dump_kept);
+    @memset(dump_kept, false);
+    defer {
+        for (dumps, dump_kept) |*dump, kept| if (!kept) dump.deinit(self.allocator);
+        self.allocator.free(dumps);
+    }
+
+    var ui_copy: ?packet.DetailBundle = null;
+    errdefer if (ui_copy) |*copy| copy.deinit(self.allocator);
+
+    for (details, 0..) |*detail, index| {
+        if (generation) |expected| {
+            if (expected != self.detail_generation.load(.acquire) or self.cancel_token.isCancelled()) return error.Cancelled;
+        }
+        const bytes = if (index < dumps.len) dumps[index] else packet.PacketBytes{
+            .frame = detail.frame,
+            .raw = try self.allocator.alloc(u8, 0),
+            .hexdump_lines = try self.allocator.alloc([]const u8, 0),
+        };
+        if (index < dumps.len) dump_kept[index] = true;
+        detail_kept[index] = true;
+        var bundle = packet.DetailBundle{ .pdml = detail.*, .bytes = bytes };
+        bundle.bytes.frame = bundle.pdml.frame;
+
+        if (bundle.pdml.frame == requested and ui_copy == null) {
+            ui_copy = bundle.clone(self.allocator) catch |err| {
+                bundle.deinit(self.allocator);
+                return err;
+            };
+        }
+        if (self.detail_cache.get(self.io, bundle.pdml.frame) == null) {
+            self.detail_cache.put(self.io, bundle.pdml.frame, bundle) catch |err| {
+                bundle.deinit(self.allocator);
+                return err;
+            };
+        } else {
+            bundle.deinit(self.allocator);
+        }
+    }
+
+    const copy = ui_copy orelse return error.UnexpectedEnd;
+    ui_copy = null;
+    var event: Event = .{ .detail_loaded = copy };
+    self.pushEvent(event) catch |err| {
+        event.deinit(self.allocator);
+        return err;
     };
-    loader.detail_cache.put(loader.io, task.frame, bundle) catch |err| {
-        var mutable_copy = ui_copy;
-        mutable_copy.deinit(loader.allocator);
-        bundle.deinit(loader.allocator);
-        emitWorkerError(loader, @errorName(err));
-        return;
-    };
-    var event: Event = .{ .detail_loaded = ui_copy };
-    loader.pushEvent(event) catch {
-        event.deinit(loader.allocator);
-    };
+}
+
+const DetailWindow = struct { start: u32, end: u32 };
+
+fn detailWindow(frame: u32, bundle_size: u32, cache_size: u32) DetailWindow {
+    const cache = @max(cache_size, 1);
+    if (cache <= 1) return .{ .start = frame, .end = frame };
+    const bundle = @max(bundle_size, 1);
+    const back: u32 = if (frame > 1) 1 else 0;
+    var forward: u32 = if (bundle <= 1) 1 else bundle - 1;
+    const room = cache - 1;
+    if (back + forward > room) forward = if (room > back) room - back else 0;
+    return .{ .start = frame - back, .end = frame + forward };
 }
 
 fn emitWorkerError(loader: *CaptureLoader, message: []const u8) void {
@@ -575,7 +732,9 @@ test "detail cache releases owned bundles" {
     var session = session_mod.Session.init(allocator, .{ .file = "tests/fixtures/1.pcap" });
     defer session.deinit();
     try loader.loadDetailBundle(io, &session, 1);
-    try std.testing.expectEqual(@as(usize, 1), loader.detail_cache.len(io));
+    try std.testing.expectEqual(@as(usize, 2), loader.detail_cache.len(io));
+    try std.testing.expect(loader.detail_cache.get(io, 1) != null);
+    try std.testing.expect(loader.detail_cache.get(io, 2) != null);
 
     const events = try loader.drainEvents();
     defer allocator.free(events);
@@ -603,11 +762,17 @@ test "asynchronous summary request returns owned event" {
     worker.join();
     const events = try loader.drainEvents();
     defer allocator.free(events);
-    try std.testing.expectEqual(@as(usize, 1), events.len);
-    switch (events[0]) {
-        .packets_loaded => |table| try std.testing.expectEqual(@as(usize, 18), table.packets.len),
+    var packets: usize = 0;
+    for (events) |event| switch (event) {
+        .packets_loaded => |table| {
+            packets += 1;
+            try std.testing.expectEqual(@as(usize, 18), table.packets.len);
+            try std.testing.expect(!table.append);
+        },
+        .done => {},
         else => return error.UnexpectedEvent,
-    }
+    };
+    try std.testing.expectEqual(@as(usize, 1), packets);
     for (events) |*event| event.deinit(allocator);
 }
 
@@ -764,14 +929,16 @@ test "stale psml generation is dropped and a second request cancels the first ch
         for (events) |*event| event.deinit(allocator);
         allocator.free(events);
     }
-    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqual(@as(usize, 2), events.len);
     switch (events[0]) {
         .packets_loaded => |table| {
             try std.testing.expectEqual(@as(usize, 1), table.packets.len);
             try std.testing.expectEqual(@as(u32, 9), table.packets[0].frame);
+            try std.testing.expect(!table.append);
         },
         else => return error.UnexpectedEvent,
     }
+    try std.testing.expect(events[1] == .done);
 }
 
 test "detail cache eviction frees the bundle" {
@@ -788,4 +955,170 @@ test "detail cache eviction frees the bundle" {
     try std.testing.expect(loader.detail_cache.get(io, 1) == null);
     const kept = loader.detail_cache.get(io, 2) orelse return error.MissingBundle;
     try std.testing.expectEqual(@as(u32, 2), kept.pdml.frame);
+}
+
+test "detail window keeps the previous and next frame inside the cache" {
+    try std.testing.expectEqual(@as(u32, 9), detailWindow(10, 1000, 64).start);
+    try std.testing.expectEqual(@as(u32, 72), detailWindow(10, 1000, 64).end);
+    try std.testing.expectEqual(@as(u32, 9), detailWindow(10, 1, 64).start);
+    try std.testing.expectEqual(@as(u32, 11), detailWindow(10, 1, 64).end);
+    try std.testing.expectEqual(@as(u32, 4), detailWindow(4, 1, 1).start);
+    try std.testing.expectEqual(@as(u32, 4), detailWindow(4, 1, 1).end);
+}
+
+test "cached detail is returned without spawning tshark" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tools = try testingTools(allocator, "tshark");
+    defer tools.deinit();
+    var loader = CaptureLoader.init(allocator, io, &tools, .{});
+    defer loader.deinit(io);
+    var session = session_mod.Session.init(allocator, .{ .file = "missing.pcap" });
+    defer session.deinit();
+
+    try loader.detail_cache.put(io, 4, try ownedBundle(allocator, 4));
+    try loader.requestDetail(&session, 4);
+    try std.testing.expectEqual(@as(usize, 0), loader.workers.items.len);
+    const events = try loader.drainEvents();
+    defer allocator.free(events);
+    switch (events[0]) {
+        .detail_loaded => |bundle| try std.testing.expectEqual(@as(u32, 4), bundle.pdml.frame),
+        else => return error.UnexpectedEvent,
+    }
+    for (events) |*event| event.deinit(allocator);
+}
+
+test "a stale detail generation does not enter the cache" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tools = try testingTools(allocator, "tshark");
+    defer tools.deinit();
+    var loader = CaptureLoader.init(allocator, io, &tools, .{ .cache_size = 4 });
+    defer loader.deinit(io);
+    _ = loader.detail_generation.fetchAdd(1, .acq_rel);
+    const pdml_xml =
+        \\<pdml><packet><proto name="frame" showname="Frame 1" size="1" pos="0">
+        \\<field name="frame.number" show="1" showname="Frame Number: 1" size="0" pos="0"/>
+        \\</proto></packet><packet><proto name="frame" showname="Frame 2" size="1" pos="0">
+        \\<field name="frame.number" show="2" showname="Frame Number: 2" size="0" pos="0"/>
+        \\</proto></packet></pdml>
+    ;
+    const hex = "0000  aa\n\n0000  bb\n";
+    try std.testing.expectError(error.Cancelled, ingestDetail(&loader, pdml_xml, hex, 2, 0));
+    try std.testing.expectEqual(@as(usize, 0), loader.detail_cache.len(io));
+
+    try ingestDetail(&loader, pdml_xml, hex, 2, null);
+    try std.testing.expect(loader.detail_cache.get(io, 1) != null);
+    try std.testing.expect(loader.detail_cache.get(io, 2) != null);
+    const events = try loader.drainEvents();
+    defer allocator.free(events);
+    switch (events[0]) {
+        .detail_loaded => |bundle| try std.testing.expectEqual(@as(u32, 2), bundle.pdml.frame),
+        else => return error.UnexpectedEvent,
+    }
+    for (events) |*event| event.deinit(allocator);
+}
+
+test "shrinking the detail cache drops the oldest bundle" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tools = try testingTools(allocator, "tshark");
+    defer tools.deinit();
+    var loader = CaptureLoader.init(allocator, io, &tools, .{ .cache_size = 2 });
+    defer loader.deinit(io);
+    try loader.detail_cache.put(io, 1, try ownedBundle(allocator, 1));
+    try loader.detail_cache.put(io, 2, try ownedBundle(allocator, 2));
+    loader.setCacheSize(1);
+    try std.testing.expectEqual(@as(usize, 1), loader.detail_cache.len(io));
+    try std.testing.expect(loader.detail_cache.get(io, 1) == null);
+    try std.testing.expect(loader.detail_cache.get(io, 2) != null);
+}
+
+const stream_tshark =
+    \\#!/bin/bash
+    \\path=
+    \\prev=
+    \\for arg in "$@"; do
+    \\  if [ "$prev" = "-r" ]; then
+    \\    path=$arg
+    \\  fi
+    \\  prev=$arg
+    \\done
+    \\echo started > "$path.started"
+    \\printf '%s\n' '<psml><structure><section>No.</section></structure><packet><section>1</section></packet>'
+    \\while [ ! -f "$path.release" ]; do
+    \\  :
+    \\done
+    \\printf '%s\n' '<packet><section>2</section></packet></psml>'
+    \\exit 0
+;
+
+test "psml rows arrive before tshark exits and a later chunk appends" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const script_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/tshark", .{tmp.sub_path[0..]});
+    defer allocator.free(script_path);
+    const capture_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/stream.pcap", .{tmp.sub_path[0..]});
+    defer allocator.free(capture_path);
+    try writeExecutable(io, script_path, stream_tshark);
+
+    var tools = try testingTools(allocator, script_path);
+    defer tools.deinit();
+    var loader = CaptureLoader.init(allocator, io, &tools, .{ .bundle_size = 1 });
+    defer {
+        joinWorkers(&loader);
+        loader.deinit(io);
+    }
+    var session = session_mod.Session.init(allocator, .{ .file = capture_path });
+    defer session.deinit();
+    try loader.requestPsml(&session);
+    const started = try std.fmt.allocPrint(allocator, "{s}.started", .{capture_path});
+    defer allocator.free(started);
+    try waitForPath(io, started);
+
+    var first: ?Event = null;
+    var spins: usize = 0;
+    while (spins < 100) : (spins += 1) {
+        const pending = try loader.drainEvents();
+        if (pending.len != 0) {
+            first = pending[0];
+            if (pending.len != 1) return error.UnexpectedEvent;
+            allocator.free(pending);
+            break;
+        }
+        allocator.free(pending);
+        try std.Io.sleep(io, .fromMilliseconds(20), .awake);
+    }
+    const early = first orelse return error.TimedOut;
+    switch (early) {
+        .packets_loaded => |table| {
+            try std.testing.expect(!table.append);
+            try std.testing.expectEqual(@as(usize, 1), table.packets.len);
+            try std.testing.expectEqual(@as(u32, 1), table.packets[0].frame);
+            var mutable = early;
+            mutable.deinit(allocator);
+        },
+        else => return error.UnexpectedEvent,
+    }
+
+    const release = try std.fmt.allocPrint(allocator, "{s}.release", .{capture_path});
+    defer allocator.free(release);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = release, .data = "go\n" });
+    joinWorkers(&loader);
+    const rest = try loader.drainEvents();
+    defer allocator.free(rest);
+    var appended = false;
+    for (rest) |event| switch (event) {
+        .packets_loaded => |table| {
+            appended = true;
+            try std.testing.expect(table.append);
+            try std.testing.expectEqual(@as(u32, 2), table.packets[0].frame);
+        },
+        .done => {},
+        else => return error.UnexpectedEvent,
+    };
+    try std.testing.expect(appended);
+    for (rest) |*event| event.deinit(allocator);
 }

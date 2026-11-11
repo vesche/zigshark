@@ -99,6 +99,37 @@ pub const Session = struct {
         self.list_headers = &.{};
     }
 
+    pub fn appendPackets(self: *Session, more: []packet.PacketSummary) !void {
+        if (more.len == 0) {
+            self.allocator.free(more);
+            return;
+        }
+        if (self.packets.len == 0) {
+            self.packets = more;
+            self.packets_owned = true;
+            if (self.selected_index == null) self.selected_index = 0;
+            return;
+        }
+        const keep_frame = self.selectedFrame();
+        const merged = try self.allocator.alloc(packet.PacketSummary, self.packets.len + more.len);
+        @memcpy(merged[0..self.packets.len], self.packets);
+        @memcpy(merged[self.packets.len..], more);
+        if (self.packets_owned) self.allocator.free(self.packets);
+        self.allocator.free(more);
+        self.packets = merged;
+        self.packets_owned = true;
+        const resort = self.sort.column != 0 or !self.sort.ascending;
+        if (resort) self.applySort();
+        if (keep_frame) |frame| {
+            for (self.packets, 0..) |summary, index| {
+                if (summary.frame == frame) {
+                    self.selected_index = index;
+                    break;
+                }
+            }
+        }
+    }
+
     pub fn setPackets(self: *Session, summaries: []packet.PacketSummary) void {
         setPacketsOwned(self, summaries, true);
     }

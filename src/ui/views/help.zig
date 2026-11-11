@@ -29,7 +29,9 @@ pub const text =
     \\:theme list       Bundled and installed theme packs
     \\n / N             Next / previous search hit
     \\c                  Enter/leave copy mode
-    \\Ctrl-C             Copy in copy mode; otherwise quit
+    \\Ctrl-C             Copy. A field copy includes its filter and value
+    \\:filters          Saved filters. :filters save <name> stores the current one
+    \\Filter bar         Empty is neutral, valid is green, invalid shows tshark's error
     \\q / ZZ            Quit (confirm / immediate)
     \\Ctrl-Z            Suspend to the shell; fg resumes
     \\:columns          default, delta, absolute, or a tshark column format

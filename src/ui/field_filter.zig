@@ -138,6 +138,38 @@ pub fn conversation(
     );
 }
 
+pub fn formatFieldCopy(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    show: []const u8,
+    subtree: []const u8,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    if (name.len != 0) {
+        const atom = try expression(allocator, "", name, show, .eq);
+        defer allocator.free(atom);
+        try out.appendSlice(allocator, atom);
+        try out.append(allocator, '\n');
+        if (show.len != 0) {
+            try out.appendSlice(allocator, show);
+            try out.append(allocator, '\n');
+        }
+        if (subtree.len != 0) try out.append(allocator, '\n');
+    }
+    try out.appendSlice(allocator, subtree);
+    return out.toOwnedSlice(allocator);
+}
+
+test "field copy includes the filter atom and the raw value" {
+    const allocator = std.testing.allocator;
+    const text = try formatFieldCopy(allocator, "tcp.port", "443", "Source Port: 443");
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "tcp.port == 443") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\n443\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, text, "Source Port: 443"));
+}
+
 test "field filter quotes text and appends and or" {
     const allocator = std.testing.allocator;
     const eq = try expression(allocator, "", "tcp.port", "443", .eq);

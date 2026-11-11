@@ -32,6 +32,19 @@ pub fn Lru(comptime K: type, comptime V: type) type {
             self.map.deinit();
         }
 
+        pub fn setCapacity(self: *Self, io: std.Io, capacity: usize) void {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            self.capacity = @max(capacity, 1);
+            while (self.map.count() > self.capacity) {
+                const victim = self.tail orelse break;
+                self.detach(victim);
+                _ = self.map.remove(victim.key);
+                if (self.on_evict) |cb| cb(self.allocator, victim.key, victim.value);
+                self.allocator.destroy(victim);
+            }
+        }
+
         pub fn clear(self: *Self, io: std.Io) void {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);

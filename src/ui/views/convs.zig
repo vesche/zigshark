@@ -12,19 +12,24 @@ pub fn loadConversations(
     var argv = try process.argvConversations(allocator, tshark, path, conv_type);
     defer argv.deinit(allocator);
 
-    var out = try process.runCapture(allocator, io, argv.slice());
+    var out = try process.runCaptureLimited(allocator, io, argv.slice(), process.view_stdout_cap);
     defer out.deinit(allocator);
 
     if (out.stdout.len == 0) {
         return try std.fmt.allocPrint(allocator, "No conversations ({s}) in {s}\n{s}", .{ conv_type, path, out.stderr });
     }
 
-    const parsed = convs.parse(allocator, out.stdout) catch {
+    const parsed_all = convs.parse(allocator, out.stdout) catch {
+        if (out.truncated) {
+            return try std.fmt.allocPrint(allocator, "{s}\nStopped at the 1 MiB output cap. The rest was not loaded.", .{out.stdout});
+        }
         return try allocator.dupe(u8, out.stdout);
     };
+    const row_capped = parsed_all.len > process.view_row_cap;
+    const parsed = if (row_capped) parsed_all[0..process.view_row_cap] else parsed_all;
     defer {
-        for (parsed) |*conversation| conversation.deinit(allocator);
-        allocator.free(parsed);
+        for (parsed_all) |*conversation| conversation.deinit(allocator);
+        allocator.free(parsed_all);
     }
 
     var result: std.Io.Writer.Allocating = .init(allocator);
@@ -60,6 +65,8 @@ pub fn loadConversations(
         "\nUse a display filter such as tcp.stream == N, " ++
             "ip.addr == ADDRESS, or the :search-filter command.",
     );
+    if (row_capped) try result.writer.print("\nStopped after {d} rows. The rest was not loaded.", .{process.view_row_cap});
+    if (out.truncated) try result.writer.writeAll("\nStopped at the 1 MiB output cap. The rest was not loaded.");
     return result.toOwnedSlice();
 }
 

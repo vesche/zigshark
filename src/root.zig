@@ -73,6 +73,7 @@ pub const ui = struct {
         pub const header_bar = @import("ui/widgets/header_bar.zig");
     };
     pub const field_filter = @import("ui/field_filter.zig");
+    pub const color_rules = @import("ui/color_rules.zig");
 };
 
 comptime {
@@ -104,6 +105,7 @@ comptime {
     _ = ui.widgets.status_bar;
     _ = ui.widgets.header_bar;
     _ = ui.field_filter;
+    _ = ui.color_rules;
     _ = features.macros;
     _ = features.recents;
     _ = platform.clipboard;

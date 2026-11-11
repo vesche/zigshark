@@ -121,6 +121,8 @@ fn cloneBytes(allocator: std.mem.Allocator, bytes: PacketBytes) !PacketBytes {
 pub const PsmlTable = struct {
     headers: [][]u8 = &.{},
     packets: []PacketSummary = &.{},
+    /// A later chunk of the same tshark run. The caller appends instead of replacing.
+    append: bool = false,
 
     pub fn deinit(self: *PsmlTable, allocator: std.mem.Allocator) void {
         for (self.headers) |header| allocator.free(header);
@@ -191,6 +193,25 @@ pub fn parsePsml(allocator: std.mem.Allocator, xml: []const u8) !PsmlTable {
     };
 }
 
+pub fn summaryFromPsml(allocator: std.mem.Allocator, source: *psml.Packet) !PacketSummary {
+    const columns = try allocator.alloc([]const u8, source.columns.len);
+    errdefer allocator.free(columns);
+    for (source.columns, 0..) |column, column_index| columns[column_index] = column;
+    allocator.free(source.columns);
+    source.columns = &.{};
+    const summary = PacketSummary{
+        .frame = source.frame_number,
+        .columns = columns,
+        .fg_color = parseColor(source.fg),
+        .bg_color = parseColor(source.bg),
+    };
+    if (source.fg) |color| allocator.free(color);
+    if (source.bg) |color| allocator.free(color);
+    source.fg = null;
+    source.bg = null;
+    return summary;
+}
+
 fn parseColor(value: ?[]const u8) ?Color {
     const text = value orelse return null;
     if (text.len != 7 or text[0] != '#') return null;
@@ -205,7 +226,26 @@ fn parseColor(value: ?[]const u8) ?Color {
 pub fn parsePdmlPacket(allocator: std.mem.Allocator, xml: []const u8, frame: u32) !PacketDetail {
     var parsed = try pdml.parseSinglePacket(allocator, xml);
     defer parsed.deinit(allocator);
+    return packetDetailFromPdml(allocator, &parsed, frame);
+}
 
+pub fn parsePdmlPackets(allocator: std.mem.Allocator, xml: []const u8) ![]PacketDetail {
+    const parsed = try pdml.parse(allocator, xml);
+    defer pdml.deinitPackets(allocator, parsed);
+    const details = try allocator.alloc(PacketDetail, parsed.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (details[0..initialized]) |*detail| detail.deinit(allocator);
+        allocator.free(details);
+    }
+    for (parsed) |*source| {
+        details[initialized] = try packetDetailFromPdml(allocator, source, source.frame_number);
+        initialized += 1;
+    }
+    return details;
+}
+
+fn packetDetailFromPdml(allocator: std.mem.Allocator, parsed: *const pdml.PacketDetail, frame: u32) !PacketDetail {
     var visible_count: usize = 0;
     for (parsed.nodes) |*node| {
         if (!shouldOmitPdml(node)) visible_count += 1;
@@ -310,6 +350,51 @@ pub fn parseHexdump(allocator: std.mem.Allocator, text: []const u8, frame: u32) 
         .raw = try raw.toOwnedSlice(allocator),
         .hexdump_lines = try lines_list.toOwnedSlice(allocator),
     };
+}
+
+pub fn parseHexdumpPackets(allocator: std.mem.Allocator, text: []const u8) ![]PacketBytes {
+    var packets: std.ArrayList(PacketBytes) = .empty;
+    errdefer {
+        for (packets.items) |*bytes| bytes.deinit(allocator);
+        packets.deinit(allocator);
+    }
+
+    var lines_list: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (lines_list.items) |line| allocator.free(line);
+        lines_list.deinit(allocator);
+    }
+    var raw: std.ArrayList(u8) = .empty;
+    errdefer raw.deinit(allocator);
+
+    var line_iter = std.mem.splitScalar(u8, text, '\n');
+    while (line_iter.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        const new_packet = line.len == 0 or (std.mem.startsWith(u8, line, "0000") and raw.items.len > 0);
+        if (new_packet and raw.items.len > 0) {
+            try packets.append(allocator, .{
+                .frame = 0,
+                .raw = try raw.toOwnedSlice(allocator),
+                .hexdump_lines = try lines_list.toOwnedSlice(allocator),
+            });
+            lines_list = .empty;
+            raw = .empty;
+        }
+        if (line.len == 0) continue;
+        try lines_list.append(allocator, try allocator.dupe(u8, line));
+        try appendDumpBytes(allocator, &raw, line);
+    }
+    if (raw.items.len > 0 or lines_list.items.len > 0) {
+        try packets.append(allocator, .{
+            .frame = 0,
+            .raw = try raw.toOwnedSlice(allocator),
+            .hexdump_lines = try lines_list.toOwnedSlice(allocator),
+        });
+    } else {
+        lines_list.deinit(allocator);
+        raw.deinit(allocator);
+    }
+    return try packets.toOwnedSlice(allocator);
 }
 
 test "retain frames after a cutoff" {

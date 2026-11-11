@@ -81,6 +81,35 @@ test "recent files stay unique and capped" {
     try std.testing.expectEqualStrings("/tmp/c24.pcap", cfg.recent_files.items[1]);
 }
 
+test "saved filters and coloring rules round-trip" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var cfg = try config.Config.defaults(allocator);
+    defer cfg.deinit();
+    try cfg.parseToml(
+        \\[filters]
+        \\"web" = "tcp.port == 443"
+        \\
+        \\[coloring]
+        \\"dns" = "dns|#010203|#040506"
+    );
+    try std.testing.expectEqualStrings("tcp.port == 443", cfg.findNamedFilter("web").?);
+    try std.testing.expectEqual(@as(usize, 1), cfg.color_rules.items.len);
+    try std.testing.expectEqual(@as(u8, 1), cfg.color_rules.items[0].fg.?.r);
+    try std.testing.expectEqual(@as(u8, 4), cfg.color_rules.items[0].bg.?.r);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/config.toml", .{tmp.sub_path[0..]});
+    defer allocator.free(path);
+    try cfg.save(io, path);
+    var loaded = try config.Config.loadOrDefault(allocator, io, path);
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("tcp.port == 443", loaded.findNamedFilter("web").?);
+    try std.testing.expectEqualStrings("dns", loaded.color_rules.items[0].filter);
+    try std.testing.expectEqual(@as(u8, 6), loaded.color_rules.items[0].bg.?.b);
+}
+
 test "macros expand a known name and leave an unknown dollar sign" {
     const allocator = std.testing.allocator;
     var cfg = try config.Config.defaults(allocator);

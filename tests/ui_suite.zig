@@ -36,8 +36,10 @@ test "hex hit testing rejects the gutter and maps the ascii column" {
         .last_width = 80,
     };
     try std.testing.expect(view.offsetAt(0, 0) == null);
-    try std.testing.expectEqual(@as(?usize, 15), view.offsetAt(6 + 15 * 3, 0));
-    try std.testing.expect(view.offsetAt(6 + 15 * 3, 1) == null);
+    // Byte 8 sits one column further right because of the gap after byte 7.
+    try std.testing.expectEqual(@as(?usize, 15), view.offsetAt(6 + 15 * 3 + 1, 0));
+    try std.testing.expect(view.offsetAt(6 + 8 * 3, 0) == null);
+    try std.testing.expect(view.offsetAt(200, 1) == null);
     view.scroll_top = 1;
     try std.testing.expectEqual(@as(?usize, 16), view.offsetAt(6, 0));
 }

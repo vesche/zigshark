@@ -76,11 +76,15 @@ fn scriptedRun(
     _ = io;
     const script = active_script orelse return error.NoScript;
     try script.note(argv);
+    var failed = false;
+    for (argv) |arg| {
+        if (std.mem.indexOf(u8, arg, "nope") != null) failed = true;
+    }
     const stdout = try replyFor(allocator, argv);
     return .{
         .stdout = stdout,
-        .stderr = try allocator.dupe(u8, ""),
-        .term = .{ .exited = 0 },
+        .stderr = try allocator.dupe(u8, if (failed) "tshark: \"nope\" was unexpected\n" else ""),
+        .term = .{ .exited = if (failed) @as(u8, 1) else 0 },
     };
 }
 
@@ -604,6 +608,48 @@ test "filter bar recalls recent filters and an empty bar shows the list" {
     try std.testing.expect(std.mem.indexOf(u8, h.app.status.mode, "recent 2/2") != null);
 }
 
+test "saved filters apply by name and macros show before submit" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    try h.cfg.upsertNamedFilter("web", "tcp.port == 443");
+    try h.app.runCommand("filters", "web");
+    try std.testing.expectEqualStrings("tcp.port == 443", h.app.session.display_filter);
+
+    try h.cfg.macros.append(h.allocator, .{
+        .name = try h.allocator.dupe(u8, "web"),
+        .value = try h.allocator.dupe(u8, "tcp.port == 443"),
+    });
+    try h.app.filter.setText("ip.addr == $web");
+    h.app.pollFilterFeedback();
+    try std.testing.expectEqualStrings("ip.addr == tcp.port == 443", h.app.status.expansion);
+}
+
+test "filter feedback waits for a pause and shows the tshark error" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    h.app.filter_check_sync = true;
+
+    try h.app.filter.setText("nope");
+    h.app.pollFilterFeedback();
+    try std.testing.expect(h.app.filter.state == .neutral);
+
+    h.app.pollFilterFeedback();
+    h.app.pollFilterFeedback();
+    h.app.pollFilterFeedback();
+    try std.testing.expect(h.app.filter.state == .bad);
+    try std.testing.expect(std.mem.indexOf(u8, h.app.status.filter_error, "unexpected") != null);
+
+    try h.app.filter.setText("");
+    h.app.pollFilterFeedback();
+    h.app.pollFilterFeedback();
+    h.app.pollFilterFeedback();
+    h.app.pollFilterFeedback();
+    try std.testing.expect(h.app.filter.state == .neutral);
+    try std.testing.expectEqual(@as(usize, 0), h.app.status.filter_error.len);
+}
+
 test "theme load falls back from the config directory to themes/" {
     var h: Harness = undefined;
     try h.setup();
@@ -623,4 +669,110 @@ test "theme load falls back from the config directory to themes/" {
     });
     try h.app.runCommand("theme", "midnight");
     try std.testing.expect(h.app.theme.accent.eql(zigshark.ui.theme.rgb(1, 2, 3)));
+}
+
+fn ownedSummary(allocator: std.mem.Allocator, frame: u32) !packet.PacketSummary {
+    const columns = try allocator.alloc([]const u8, 1);
+    columns[0] = try std.fmt.allocPrint(allocator, "{d}", .{frame});
+    return .{ .frame = frame, .columns = columns };
+}
+
+test "a later packet chunk keeps the selected frame" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+
+    const headers = try h.allocator.alloc([]u8, 1);
+    headers[0] = try h.allocator.dupe(u8, "No.");
+    const first = try h.allocator.alloc(packet.PacketSummary, 2);
+    first[0] = try ownedSummary(h.allocator, 1);
+    first[1] = try ownedSummary(h.allocator, 2);
+    try h.app.loader.pushEvent(.{ .packets_loaded = .{
+        .headers = headers,
+        .packets = first,
+    } });
+    try h.app.processLoaderEvents();
+    try std.testing.expect(h.app.session.select(1));
+
+    const more = try h.allocator.alloc(packet.PacketSummary, 1);
+    more[0] = try ownedSummary(h.allocator, 3);
+    try h.app.loader.pushEvent(.{ .packets_loaded = .{
+        .packets = more,
+        .append = true,
+    } });
+    try h.app.processLoaderEvents();
+    try std.testing.expectEqual(@as(usize, 3), h.app.session.packets.len);
+    try std.testing.expectEqual(@as(u32, 2), h.app.session.selectedFrame().?);
+}
+
+test "applying the loaded filter does not request the list again" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    try h.app.commitFilter("dns", true);
+    const generation = h.app.loader.list_generation.load(.acquire);
+    try h.app.commitFilter("dns", true);
+    try std.testing.expectEqual(generation, h.app.loader.list_generation.load(.acquire));
+    try h.app.commitFilter("tcp", true);
+    try std.testing.expectEqual(generation + 1, h.app.loader.list_generation.load(.acquire));
+}
+
+fn manyConversations(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+) !process.RunOutput {
+    _ = io;
+    _ = argv;
+    var text: std.Io.Writer.Allocating = .init(allocator);
+    errdefer text.deinit();
+    var index: usize = 0;
+    while (index < process.view_row_cap + 5) : (index += 1) {
+        try text.writer.print(
+            "10.0.0.1 <-> 10.0.0.2  1 {d} bytes  1 1 bytes  2 2 bytes  0  0.1\n",
+            .{index + 1},
+        );
+    }
+    return .{
+        .stdout = try text.toOwnedSlice(),
+        .stderr = try allocator.dupe(u8, ""),
+        .term = .{ .exited = 0 },
+    };
+}
+
+fn manyChunks(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+) !process.RunOutput {
+    _ = io;
+    _ = argv;
+    var text: std.Io.Writer.Allocating = .init(allocator);
+    errdefer text.deinit();
+    try text.writer.writeAll("Filter: tcp.stream eq 7\nNode 0: a\nNode 1: b\n");
+    var index: usize = 0;
+    while (index < process.view_row_cap + 5) : (index += 1) {
+        try text.writer.print("{d}\n00000000  61\n", .{index % 2});
+    }
+    return .{
+        .stdout = try text.toOwnedSlice(),
+        .stderr = try allocator.dupe(u8, ""),
+        .term = .{ .exited = 0 },
+    };
+}
+
+test "conversation and stream views stop at the row cap" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+
+    h.app.process_runner = manyConversations;
+    try h.app.runCommand("convs", "tcp");
+    try std.testing.expectEqual(process.view_row_cap, h.app.conversations.len);
+    try std.testing.expect(std.mem.indexOf(u8, h.app.help_overlay.body, "Stopped after 200 rows") != null);
+
+    h.app.process_runner = manyChunks;
+    try h.app.runCommand("streams", "tcp 0");
+    try std.testing.expectEqual(process.view_row_cap, h.app.stream_chunks.len);
+    try std.testing.expect(std.mem.indexOf(u8, h.app.help_overlay.body, "Stopped after 200 rows") != null);
 }

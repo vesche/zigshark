@@ -3,6 +3,8 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const packet = @import("../../model/packet.zig");
 const theme_mod = @import("../theme.zig");
+const color_rules = @import("../color_rules.zig");
+const config_mod = @import("../../config.zig");
 const text_util = @import("text_util.zig");
 
 pub const PacketTable = struct {
@@ -10,6 +12,7 @@ pub const PacketTable = struct {
     headers: []const []const u8 = &.{},
     theme: theme_mod.Theme,
     packet_colors: bool = true,
+    color_rules: []const config_mod.Config.ColorRule = &.{},
     selected: usize = 0,
     scroll_top: usize = 0,
     viewport_rows: usize = 1,
@@ -168,7 +171,6 @@ pub const PacketTable = struct {
         else
             fillColumns(column_buf[0..7], size.width);
         const header_style: vaxis.Style = .{ .fg = self.theme.header_fg, .bg = self.theme.header_bg, .bold = true };
-        const normal: vaxis.Style = .{ .fg = self.theme.fg, .bg = self.theme.bg };
         const selected_style = theme_mod.selectionStyle(self.theme, self.focused);
 
         fillRow(&surf, 0, size.width, header_style);
@@ -186,16 +188,22 @@ pub const PacketTable = struct {
             idx += 1;
         }) {
             const row = self.rows[idx];
-            var style = normal;
-            if (idx == self.selected) {
-                style = selected_style;
-            } else if (self.packet_colors) {
-                style = theme_mod.protocolStyle(self.theme, protocolCell(self.headers, row));
-                if (row.fg_color) |c| style.fg = theme_mod.fromPacketColor(c);
-                if (row.bg_color) |c| style.bg = theme_mod.fromPacketColor(c);
-            } else if (idx % 2 == 1) {
-                // Subtle zebra striping when packet colors are off.
-                style = .{ .fg = self.theme.fg, .bg = theme_mod.rgb(18, 18, 28) };
+            var style = if (idx == self.selected)
+                selected_style
+            else
+                unselectedStyle(
+                    self.theme,
+                    self.packet_colors,
+                    protocolCell(self.headers, row),
+                    row.fg_color,
+                    row.bg_color,
+                    idx % 2 == 1,
+                );
+            if (idx != self.selected) {
+                if (color_rules.firstMatch(self.color_rules, protocolCell(self.headers, row), row.columns)) |rule| {
+                    if (rule.fg) |color| style.fg = theme_mod.fromPacketColor(color);
+                    if (rule.bg) |color| style.bg = theme_mod.fromPacketColor(color);
+                }
             }
             fillRow(&surf, line, size.width, style);
             const text = try formatRow(ctx.arena, columns, row);
@@ -204,6 +212,26 @@ pub const PacketTable = struct {
         return surf;
     }
 };
+
+/// tshark's row color wins. The protocol tint is only used when the row was not painted.
+pub fn unselectedStyle(
+    theme: theme_mod.Theme,
+    packet_colors: bool,
+    protocol: []const u8,
+    fg: ?packet.Color,
+    bg: ?packet.Color,
+    zebra: bool,
+) vaxis.Style {
+    if (fg != null or bg != null) {
+        var style: vaxis.Style = .{ .fg = theme.fg, .bg = theme.bg };
+        if (fg) |color| style.fg = theme_mod.fromPacketColor(color);
+        if (bg) |color| style.bg = theme_mod.fromPacketColor(color);
+        return style;
+    }
+    if (packet_colors) return theme_mod.protocolStyle(theme, protocol);
+    if (zebra) return .{ .fg = theme.fg, .bg = theme_mod.rgb(18, 18, 28) };
+    return .{ .fg = theme.fg, .bg = theme.bg };
+}
 
 const Semantic = enum {
     number,
@@ -352,6 +380,17 @@ fn clipAscii(text: []const u8, width: u16) []const u8 {
     if (width == 0) return "";
     if (text.len <= width) return text;
     return text[0..width];
+}
+
+test "tshark row color replaces the protocol tint" {
+    const theme = theme_mod.dark();
+    const tint = theme_mod.protocolStyle(theme, "TCP");
+    const painted = unselectedStyle(theme, true, "TCP", .{ .r = 1, .g = 2, .b = 3 }, .{ .r = 9, .g = 8, .b = 7 }, false);
+    try std.testing.expect(painted.fg.eql(theme_mod.rgb(1, 2, 3)));
+    try std.testing.expect(painted.bg.eql(theme_mod.rgb(9, 8, 7)));
+    try std.testing.expect(!painted.bg.eql(tint.bg));
+    const fallback = unselectedStyle(theme, true, "TCP", null, null, false);
+    try std.testing.expect(fallback.bg.eql(tint.bg));
 }
 
 test "header layout uses psml titles" {

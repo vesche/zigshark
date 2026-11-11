@@ -1,4 +1,5 @@
 const std = @import("std");
+const packet = @import("model/packet.zig");
 
 pub const Layout = enum { stacked, side_by_side, focus };
 
@@ -48,6 +49,8 @@ pub const Config = struct {
     recent_files: std.ArrayList([]u8) = .empty,
     recent_filters: std.ArrayList([]u8) = .empty,
     macros: std.ArrayList(Macro) = .empty,
+    named_filters: std.ArrayList(Macro) = .empty,
+    color_rules: std.ArrayList(ColorRule) = .empty,
     global_marks: std.ArrayList(GlobalMark) = .empty,
     profile: []u8 = &.{},
     wireshark_profile: []u8 = &.{},
@@ -58,6 +61,13 @@ pub const Config = struct {
     pub const Macro = struct {
         name: []u8,
         value: []u8,
+    };
+
+    pub const ColorRule = struct {
+        name: []u8,
+        filter: []u8,
+        fg: ?packet.Color = null,
+        bg: ?packet.Color = null,
     };
 
     pub const GlobalMark = struct {
@@ -77,6 +87,16 @@ pub const Config = struct {
             self.allocator.free(m.value);
         }
         self.macros.deinit(self.allocator);
+        for (self.named_filters.items) |filter| {
+            self.allocator.free(filter.name);
+            self.allocator.free(filter.value);
+        }
+        self.named_filters.deinit(self.allocator);
+        for (self.color_rules.items) |rule| {
+            self.allocator.free(rule.name);
+            self.allocator.free(rule.filter);
+        }
+        self.color_rules.deinit(self.allocator);
         for (self.global_marks.items) |mark| self.allocator.free(mark.path);
         self.global_marks.deinit(self.allocator);
     }
@@ -183,6 +203,22 @@ pub const Config = struct {
             for (self.macros.items) |m| try w.print("\"{s}\" = \"{s}\"\n", .{ m.name, m.value });
         }
 
+        if (self.named_filters.items.len != 0) {
+            try w.writeAll("\n[filters]\n");
+            for (self.named_filters.items) |filter| try w.print("\"{s}\" = \"{s}\"\n", .{ filter.name, filter.value });
+        }
+
+        if (self.color_rules.items.len != 0) {
+            try w.writeAll("\n[coloring]\n");
+            for (self.color_rules.items) |rule| {
+                try w.print("\"{s}\" = \"{s}|", .{ rule.name, rule.filter });
+                try writeColor(w, rule.fg);
+                try w.writeByte('|');
+                try writeColor(w, rule.bg);
+                try w.writeAll("\"\n");
+            }
+        }
+
         if (self.global_marks.items.len != 0) {
             try w.writeAll("\n[marks]\n");
             for (self.global_marks.items) |mark| {
@@ -239,6 +275,10 @@ pub const Config = struct {
                     .name = try self.allocator.dupe(u8, key),
                     .value = try self.allocator.dupe(u8, value),
                 });
+            } else if (std.mem.eql(u8, section, "filters")) {
+                try self.upsertNamed(key, value);
+            } else if (std.mem.eql(u8, section, "coloring")) {
+                try self.appendColorRule(key, value);
             } else if (std.mem.eql(u8, section, "marks") and key.len == 1 and
                 key[0] >= 'A' and key[0] <= 'Z')
             {
@@ -253,7 +293,59 @@ pub const Config = struct {
         }
     }
 
-    /// Apply one `key = value` pair from TOML or `:set`. Unknown keys fail.
+    pub fn findNamedFilter(self: *const Config, name: []const u8) ?[]const u8 {
+        for (self.named_filters.items) |filter| {
+            if (std.mem.eql(u8, filter.name, name)) return filter.value;
+        }
+        return null;
+    }
+
+    pub fn upsertNamedFilter(self: *Config, name: []const u8, value: []const u8) !void {
+        try self.upsertNamed(name, value);
+    }
+
+    pub fn deleteNamedFilter(self: *Config, name: []const u8) bool {
+        for (self.named_filters.items, 0..) |filter, index| {
+            if (!std.mem.eql(u8, filter.name, name)) continue;
+            self.allocator.free(filter.name);
+            self.allocator.free(filter.value);
+            _ = self.named_filters.orderedRemove(index);
+            return true;
+        }
+        return false;
+    }
+
+    fn upsertNamed(self: *Config, name: []const u8, value: []const u8) !void {
+        for (self.named_filters.items) |*filter| {
+            if (!std.mem.eql(u8, filter.name, name)) continue;
+            const copy = try self.allocator.dupe(u8, value);
+            self.allocator.free(filter.value);
+            filter.value = copy;
+            return;
+        }
+        try self.named_filters.append(self.allocator, .{
+            .name = try self.allocator.dupe(u8, name),
+            .value = try self.allocator.dupe(u8, value),
+        });
+    }
+
+    fn appendColorRule(self: *Config, name: []const u8, value: []const u8) !void {
+        var parts = std.mem.splitScalar(u8, value, '|');
+        const filter = parts.next() orelse return;
+        const fg_text = parts.next() orelse "";
+        const bg_text = parts.next() orelse "";
+        const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
+        const filter_copy = try self.allocator.dupe(u8, filter);
+        errdefer self.allocator.free(filter_copy);
+        try self.color_rules.append(self.allocator, .{
+            .name = name_copy,
+            .filter = filter_copy,
+            .fg = parseHexColor(fg_text),
+            .bg = parseHexColor(bg_text),
+        });
+    }
+
     pub fn applySetting(self: *Config, key: []const u8, value: []const u8) !void {
         if (std.mem.indexOfScalar(u8, value, '"') != null or std.mem.indexOfScalar(u8, value, '\n') != null) {
             return error.InvalidValue;
@@ -507,6 +599,19 @@ fn replaceOwned(allocator: std.mem.Allocator, dest: *[]u8, value: []const u8) !v
     const copy = try allocator.dupe(u8, value);
     if (dest.len != 0) allocator.free(dest.*);
     dest.* = copy;
+}
+
+fn writeColor(w: *std.Io.Writer, color: ?packet.Color) !void {
+    if (color) |c| try w.print("#{x:0>2}{x:0>2}{x:0>2}", .{ c.r, c.g, c.b });
+}
+
+fn parseHexColor(text: []const u8) ?packet.Color {
+    if (text.len != 7 or text[0] != '#') return null;
+    return .{
+        .r = std.fmt.parseInt(u8, text[1..3], 16) catch return null,
+        .g = std.fmt.parseInt(u8, text[3..5], 16) catch return null,
+        .b = std.fmt.parseInt(u8, text[5..7], 16) catch return null,
+    };
 }
 
 fn parseBool(value: []const u8) bool {

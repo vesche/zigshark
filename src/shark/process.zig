@@ -5,6 +5,8 @@ pub const RunOutput = struct {
     stdout: []u8,
     stderr: []u8,
     term: std.process.Child.Term,
+    /// Stdout hit `view_stdout_cap` or the limit passed to `runCaptureLimited`.
+    truncated: bool = false,
 
     pub fn deinit(self: *RunOutput, allocator: std.mem.Allocator) void {
         allocator.free(self.stdout);
@@ -94,8 +96,47 @@ pub fn columnFormatOrDefault(format: ?[]const u8) []const u8 {
     return default_column_format;
 }
 
+pub const view_stdout_cap: usize = 1024 * 1024;
+pub const view_row_cap: usize = 200;
+
 pub fn runCapture(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !RunOutput {
     return runCaptureCancellable(allocator, io, argv, null);
+}
+
+/// Read stdout as tshark writes it. `on_chunk` sees each new slice before the
+/// process exits. `saw_stdout` is set when any chunk is delivered, which keeps
+/// the permission retry from parsing the same bytes twice.
+pub fn runStdoutChunks(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    token: ?*CancellationToken,
+    context: *anyopaque,
+    on_chunk: *const fn (*anyopaque, []const u8) anyerror!void,
+    saw_stdout: *bool,
+) !RunOutput {
+    var first = try runStdoutOnce(allocator, io, argv, token, context, on_chunk, saw_stdout);
+    if (builtin.os.tag != .linux or first.term.success() or saw_stdout.*) return first;
+    const path_index = deniedCaptureArg(argv, first.stderr) orelse return first;
+
+    const copied = copyCaptureToTmp(allocator, io, argv[path_index]) catch return first;
+    defer allocator.free(copied);
+    defer std.Io.Dir.cwd().deleteFile(io, copied) catch {};
+
+    const replaced = allocator.alloc([]const u8, argv.len) catch |err| {
+        first.deinit(allocator);
+        return err;
+    };
+    defer allocator.free(replaced);
+    @memcpy(replaced, argv);
+    replaced[path_index] = copied;
+
+    const second = runStdoutOnce(allocator, io, replaced, token, context, on_chunk, saw_stdout) catch |err| {
+        first.deinit(allocator);
+        return err;
+    };
+    first.deinit(allocator);
+    return second;
 }
 
 pub fn runCaptureCancellable(
@@ -104,7 +145,7 @@ pub fn runCaptureCancellable(
     argv: []const []const u8,
     token: ?*CancellationToken,
 ) !RunOutput {
-    var first = try runOnce(allocator, io, argv, token);
+    var first = try runOnce(allocator, io, argv, token, null);
     if (builtin.os.tag != .linux or first.term.success()) return first;
     const path_index = deniedCaptureArg(argv, first.stderr) orelse return first;
 
@@ -120,7 +161,7 @@ pub fn runCaptureCancellable(
     @memcpy(replaced, argv);
     replaced[path_index] = copied;
 
-    const second = runOnce(allocator, io, replaced, token) catch |err| {
+    const second = runOnce(allocator, io, replaced, token, null) catch |err| {
         first.deinit(allocator);
         return err;
     };
@@ -128,11 +169,124 @@ pub fn runCaptureCancellable(
     return second;
 }
 
+pub fn runCaptureLimited(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    limit: usize,
+) !RunOutput {
+    var first = try runOnce(allocator, io, argv, null, limit);
+    if (first.truncated or builtin.os.tag != .linux or first.term.success()) return first;
+    const path_index = deniedCaptureArg(argv, first.stderr) orelse return first;
+
+    const copied = copyCaptureToTmp(allocator, io, argv[path_index]) catch return first;
+    defer allocator.free(copied);
+    defer std.Io.Dir.cwd().deleteFile(io, copied) catch {};
+
+    const replaced = allocator.alloc([]const u8, argv.len) catch |err| {
+        first.deinit(allocator);
+        return err;
+    };
+    defer allocator.free(replaced);
+    @memcpy(replaced, argv);
+    replaced[path_index] = copied;
+
+    const second = runOnce(allocator, io, replaced, null, limit) catch |err| {
+        first.deinit(allocator);
+        return err;
+    };
+    first.deinit(allocator);
+    return second;
+}
+
+/// Keep at most `limit` bytes, ending on a newline when one fits.
+pub fn clipStdout(allocator: std.mem.Allocator, text: *[]u8, limit: usize) !bool {
+    if (text.len <= limit) return false;
+    const end = if (std.mem.lastIndexOfScalar(u8, text.*[0..limit], '\n')) |index| index + 1 else limit;
+    const clipped = try allocator.dupe(u8, text.*[0..end]);
+    allocator.free(text.*);
+    text.* = clipped;
+    return true;
+}
+
 fn runOnce(
     allocator: std.mem.Allocator,
     io: std.Io,
     argv: []const []const u8,
     token: ?*CancellationToken,
+    limit: ?usize,
+) !RunOutput {
+    if (token) |cancel| {
+        if (cancel.isCancelled()) return error.Cancelled;
+    }
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    if (token) |cancel| cancel.bind(io, &child);
+    defer if (token) |cancel| {
+        cancel.release(io, &child);
+    } else if (child.id != null) {
+        child.kill(io);
+    };
+
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(allocator, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
+
+    var truncated = false;
+    while (multi_reader.fill(4096, .none)) |_| {
+        if (token) |cancel| {
+            if (cancel.isCancelled()) return error.Cancelled;
+        }
+        if (limit) |max| {
+            const stdout = multi_reader.reader(0);
+            if (stdout.end - stdout.seek >= max) {
+                truncated = true;
+                break;
+            }
+        }
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => {
+            if (token) |cancel| {
+                if (cancel.isCancelled()) return error.Cancelled;
+            }
+            return err;
+        },
+    }
+    const term = if (truncated) blk: {
+        if (child.id != null) child.kill(io);
+        break :blk std.process.Child.Term{ .unknown = 1 };
+    } else if (token) |cancel|
+        try cancel.waitUnlessCancelled(io, &child)
+    else
+        try child.wait(io);
+    var stdout_slice = try multi_reader.toOwnedSlice(0);
+    errdefer allocator.free(stdout_slice);
+    if (limit) |max| {
+        if (try clipStdout(allocator, &stdout_slice, max)) truncated = true;
+    }
+    const stderr_slice = try multi_reader.toOwnedSlice(1);
+    return .{
+        .stdout = stdout_slice,
+        .stderr = stderr_slice,
+        .term = term,
+        .truncated = truncated,
+    };
+}
+
+fn runStdoutOnce(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    token: ?*CancellationToken,
+    context: *anyopaque,
+    on_chunk: *const fn (*anyopaque, []const u8) anyerror!void,
+    saw_stdout: *bool,
 ) !RunOutput {
     if (token) |cancel| {
         if (cancel.isCancelled()) return error.Cancelled;
@@ -159,6 +313,13 @@ fn runOnce(
         if (token) |cancel| {
             if (cancel.isCancelled()) return error.Cancelled;
         }
+        const stdout = multi_reader.reader(0);
+        const chunk = stdout.buffered();
+        if (chunk.len != 0) {
+            saw_stdout.* = true;
+            try on_chunk(context, chunk);
+            stdout.seek = stdout.end;
+        }
     } else |err| switch (err) {
         error.EndOfStream => {},
         else => {
@@ -172,11 +333,9 @@ fn runOnce(
         try cancel.waitUnlessCancelled(io, &child)
     else
         try child.wait(io);
-    const stdout_slice = try multi_reader.toOwnedSlice(0);
-    errdefer allocator.free(stdout_slice);
     const stderr_slice = try multi_reader.toOwnedSlice(1);
     return .{
-        .stdout = stdout_slice,
+        .stdout = try allocator.alloc(u8, 0),
         .stderr = stderr_slice,
         .term = term,
     };
@@ -518,4 +677,38 @@ test "read denial selects the capture path" {
     const stdin_argv = [_][]const u8{ "tshark", "-r", "-", "-T", "psml" };
     const stdin_err = "tshark: You don't have permission to read the file \"-\".\n";
     try std.testing.expect(deniedCaptureArg(&stdin_argv, stdin_err) == null);
+}
+
+test "a capped capture stops reading and keeps a prefix" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const script_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/flood", .{tmp.sub_path[0..]});
+    defer allocator.free(script_path);
+    const script =
+        \\#!/bin/bash
+        \\i=0
+        \\while [ "$i" -lt 40 ]; do
+        \\  printf 'row %s\n' "$i"
+        \\  i=$((i + 1))
+        \\done
+        \\while true; do
+        \\  :
+        \\done
+    ;
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = script_path,
+        .data = script,
+        .flags = .{ .permissions = @fromBackingInt(@intCast(0o755)) },
+    });
+    const argv = [_][]const u8{script_path};
+    const before = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    var out = try runCaptureLimited(allocator, io, &argv, 48);
+    defer out.deinit(allocator);
+    const after = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    try std.testing.expect(out.truncated);
+    try std.testing.expect(out.stdout.len <= 48);
+    try std.testing.expect(std.mem.startsWith(u8, out.stdout, "row "));
+    try std.testing.expect(after - before < 3 * std.time.ns_per_s);
 }

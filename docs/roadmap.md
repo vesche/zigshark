@@ -86,9 +86,9 @@ The three panes work. What still feels like a tool you have to already know is t
 | Apply or prepare a filter from the selected field | **done** | `=` on the protocol tree opens equals, not-equals, and, or, not, and contains. Apply reloads. Prepare only fills the bar. And/or appends to the current expression. |
 | Filter from the packet list | **done** | `=` on the selected row builds an `ip.addr` pair, or tcp/udp with ports when the columns have them. Apply reloads. Prepare only fills the bar. Time reference waits until that feature exists. |
 | Recent filters on the filter bar | **done** | Up/Down while the filter bar is focused recalls recent filters. An empty bar also lists them on the status line. |
-| Filter expression feedback | **next** | Empty is neutral, valid is one color, invalid is another, and a slow tshark check does not freeze typing. Show the tshark error line, not only a red bar. |
-| Saved filter library | **later** | Named filters in the profile, separate from the recent list. `:filters` to apply one. |
-| Display-filter macros in the bar | **later** | Expansion already happens before validation. Show the expanded expression somewhere visible before it is applied. |
+| Filter expression feedback | **done** | Empty is neutral, a valid filter is green, and an invalid one is red. The check runs after a short pause. The tshark error line is on the status line. |
+| Saved filter library | **done** | Named filters live in the profile `[filters]` section, separate from the recent list. `:filters` lists them, Enter or `:filters <name>` applies one, and `:filters save <name>` stores the current expression. |
+| Display-filter macros in the bar | **done** | `$name` still expands before validation. The status line shows the expanded expression while the bar still contains the macro, before Enter applies it. |
 
 ### Menus and commands
 
@@ -96,9 +96,9 @@ The three panes work. What still feels like a tool you have to already know is t
 |------|--------|-------|
 | Header menus match the commands that exist | **done** | Analysis reaches filter-from-field, go-to-frame, streams, conversations, and capture info. Expert, hierarchy, endpoints, and export are listed and say they are not built yet. Misc reaches columns, theme, profile, marks, and tail. `:goto` is in the palette. |
 | Go to frame | **done** | `g` opens `:goto`, and `:goto 1234` selects that frame and loads its detail. Out-of-range is a message. |
-| Command help on the palette row | **next** | The selected command shows its arguments (`:streams`, `:columns set`, `:decode-as`) so the palette is usable without memorizing the user guide. |
-| Field copy includes the filter form | **next** | Copy already walks the visible subtree. Also offer the display-filter atom (`tcp.port == 443`) and the raw value. |
-| User guide matches the binary | **next** | The filter, goto, and recent-filter gestures are in `docs/user-guide.md` and the in-app help. The rest of the guide still describes an earlier command set. |
+| Command help on the palette row | **done** | The selected command shows its arguments, including `:streams [tcp\|udp] [index] [ascii\|hex\|raw]`, `:columns … set <format>`, and `:decode-as layer==selector,protocol`. |
+| Field copy includes the filter form | **done** | Copying a protocol field includes the display-filter atom (`tcp.port == 443`), the raw value, and the visible subtree. |
+| User guide matches the binary | **done** | `docs/user-guide.md` and the in-app help list the keys and commands the binary actually has. |
 
 ### Beautification
 
@@ -107,27 +107,27 @@ Keep the stacked list / tree / hex layout. Polish is in the details, not a new t
 - [x] **now** — One selected row treatment. Focused pane is bright. Unfocused selection stays readable and is not the same color as a protocol tint
 - [x] **now** — Tree guides that survive narrow terminals: marker, name, and value stay aligned when the value is truncated
 - [x] **now** — Status line: frame `n/total`, display filter active, capture or tail state, and the current key hint. Drop duplicated text
-- [ ] **next** — Packet colors from tshark win over the protocol tint. The tint is only the fallback when `--color` did not paint the row
-- [ ] **next** — Hex: offset ruler, a gap at 8 bytes, and the selected field's range visible while the cursor byte stays distinct
-- [ ] **later** — User coloring rules (`name`, filter, fg, bg) stored in the profile, evaluated in order, with tshark's rules as the default layer
-- [ ] **later** — A compact sequence diagram for the followed stream (client left, server right, one line per chunk). This is a TUI advantage over a cramped GUI window; build it after follow-stream frame mapping is honest
+- [x] **next** — Packet colors from tshark win over the protocol tint. The tint is only the fallback when `--color` did not paint the row
+- [x] **next** — Hex: offset ruler, a gap at 8 bytes, and the selected field's range visible while the cursor byte stays distinct
+- [x] **later** — User coloring rules (`name`, filter, fg, bg) stored in the profile, evaluated in order, with tshark's colors as the default layer. A rule matches a protocol name, `contains` text in any column, or every row when the filter is empty
+- [ ] **later** — A compact sequence diagram for the followed stream (client left, server right, one line per chunk). This waits until follow-stream frame mapping is honest; a chunk jump is still a `frame contains` guess
 
 ## 4. Performance
 
-The UI is not the bottleneck. tshark is. A large capture waits on a full PSML run before the list appears, and every newly selected packet pays for a PDML parse plus a hex dump.
+The UI is not the bottleneck. tshark is. The packet list now appends rows while that process is still running, and the detail cache keeps the neighboring frames from the same dissection. A newly selected packet that is not in the cache still pays for a PDML parse plus a hex dump.
 
-Measure before swapping formats. Add a timing log around PSML load, detail load, and filter validation on a multi-megabyte capture, and keep `tests/fixtures/1.pcap` as the correctness fixture.
+Measure before swapping formats. PSML load, detail load, and filter validation write a timing line on a multi-megabyte capture. Keep `tests/fixtures/1.pcap` as the correctness fixture.
 
 | Item | Status | Notes |
 |------|--------|-------|
-| Paint the first packet rows before tshark exits | **now** | `pcap-bundle-size` exists and is not used to stream the list onto the screen. Parse PSML as it arrives and append rows. A later bundle must not reset the selection. |
-| Prefetch detail for the next and previous frame | **next** | The LRU already holds bundles. Moving down the list should usually hit it. Cancel the prefetch when the user jumps. |
-| Resize the detail cache when the setting changes | **next** | `:set pcap-cache-size` writes `LoaderConfig.cache_size` and leaves the existing LRU at the old capacity. |
-| Stop reloading for a no-op | **next** | Applying the filter that is already loaded, and re-selecting the packet whose detail is cached, must not spawn tshark. |
-| Debounce filter validation | **next** | Validation is a tshark process. Run it after typing pauses, and drop the result if the text changed. |
-| Bound conversation, stream, and expert output | **later** | These views slurp the whole tshark stdout. Cap them and say so in the overlay when the cap hits. |
-| Choose PDML versus JSON from data | **later** | JSON may be cheaper to parse and heavier to generate. Time both on a fat protocol (TLS, QUIC) before switching the detail path. |
-| File-backed list for captures that do not fit | **later** | After streaming PSML works, keep the row index on disk or in a fixed record file so a million packets does not mean a million allocations. Only start this if a real capture still forces a swap. |
+| Paint the first packet rows before tshark exits | **done** | PSML is parsed as stdout arrives. Rows are appended in `pcap-bundle-size` chunks, and a later chunk keeps the selected frame. The log records how many rows were visible and how many milliseconds that took. |
+| Prefetch detail for the next and previous frame | **done** | The detail request covers the previous frame and the following frames that fit in `pcap-cache-size`. Those bundles go into the LRU. Selecting one of them does not spawn tshark. A new selection cancels the in-flight request. |
+| Resize the detail cache when the setting changes | **done** | `:set pcap-cache-size` changes the live LRU and drops the oldest bundles when the new cap is smaller. |
+| Stop reloading for a no-op | **done** | Submitting the display filter that is already loaded does not start another PSML run. A cached packet's detail is cloned from the LRU instead of spawning tshark. |
+| Debounce filter validation | **done** | The filter bar waits out a short pause, and a verdict is dropped when the text has changed. The log records how long the check took. |
+| Bound conversation, stream, and expert output | **done** | `:convs` and `:streams` stop at 200 rows or 1 MiB of tshark output, and the overlay says the rest was not loaded. `:expert` is still a section 5 view; it has to use the same cap. |
+| Choose PDML versus JSON from data | **done** | On `tests/fixtures/1.pcap` with tshark 4.7.4, JSON is smaller (6 KB vs 19 KB for frame 1, 96 KB vs 307 KB for the file) and both finishes are under a second. That size win does not pay for a new detail parser, so the detail path stays PDML. |
+| File-backed list for captures that do not fit | **later** | Streaming PSML is in place. This stays unstarted until a real capture forces the process to swap. |
 
 What not to chase: redrawing fewer cells, a custom dissector, or a packet-list virtualization pass. The table already draws the visible window.
 
@@ -226,7 +226,7 @@ These are already visible. Confirm each one before deleting anything.
 |------|--------|------------|
 | The UI controller is one file | `src/ui/app.zig`, about 2,200 lines | The section 2 command tests now exist (`tests/app_suite.zig`). Split command dispatch, capture/tail, and filter completion from drawing. The tests are there so the split does not change behavior unnoticed. |
 | Settings that persist and do nothing | `src/config.zig` | `disk-cache-size-mb`, `ui-cache-size`, `stream-cache-size`, `disable-shark-fin`, `conv-absolute-time`, `capture-command`, `tail-command`, `wormhole-length`, `wormhole-rendezvous-url`, and `wormhole-transit-relay` are saved and listed by `:set`. Either wire them (wormhole flags into the job argv, conversation time into the convs view, capture command into the live argv) or stop presenting them as live options. |
-| Detail cache size is sticky | `src/ui/app.zig` `:set pcap-cache-size` | Rebuild the LRU, or document that the setting applies on the next launch and stop writing the unused field. |
+| Detail cache size is sticky | `src/ui/app.zig` `:set pcap-cache-size` | Resolved. `:set pcap-cache-size` resizes the live LRU and evicts the oldest bundles when the cap shrinks. |
 | Two recent-file policies | `src/features/recents.zig`, `Config.addRecentFile` | Resolved. Opening a capture calls `addRecentFile`, which moves the newest path to index 0 and drops the oldest from the end. The separate `pushRecent` policy is gone. |
 | `--tty PATH` does not retarget the terminal | `src/cli.zig`, `src/main.zig` | The flag forces the TUI onto the controlling terminal. vaxis still opens `/dev/tty`. Say that in the help text until it is true. |
 | Palette match line is a no-op | `command_palette.zig` `matching` | `startsWith(..., "")` is always true. Use the parsed command as the needle and test an empty palette against a typed prefix. |

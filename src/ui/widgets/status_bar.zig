@@ -16,6 +16,8 @@ pub const StatusBar = struct {
     mode: []const u8 = "",
     pane: []const u8 = "list",
     hint: []const u8 = "",
+    filter_error: []const u8 = "",
+    expansion: []const u8 = "",
     tailing: bool = false,
     live: bool = false,
 
@@ -36,6 +38,8 @@ pub const StatusBar = struct {
         const state = self.stateLabel();
         if (state.len != 0) try print(out, "  {s}", .{state});
         if (self.hint.len != 0) try print(out, "  {s}", .{self.hint});
+        if (self.filter_error.len != 0) try print(out, "  {s}", .{self.filter_error});
+        if (self.expansion.len != 0) try print(out, "  → {s}", .{self.expansion});
         return writer.toOwnedSlice();
     }
 
