@@ -9,10 +9,11 @@ pub const LoaderConfig = struct {
     bundle_size: u32 = 1000,
     cache_size: u32 = 64,
     tshark_args: []const u8 = "",
+    column_format: []const u8 = "",
 };
 
 pub const Event = union(enum) {
-    packets_loaded: []packet.PacketSummary,
+    packets_loaded: packet.PsmlTable,
     detail_loaded: packet.DetailBundle,
     error_msg: []const u8,
     capture_progress: []const u8,
@@ -20,10 +21,7 @@ pub const Event = union(enum) {
 
     pub fn deinit(self: *Event, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .packets_loaded => |list| {
-                for (list) |*p| p.deinit(allocator);
-                allocator.free(list);
-            },
+            .packets_loaded => |*table| table.deinit(allocator),
             .detail_loaded => |*b| b.deinit(allocator),
             .error_msg => |s| allocator.free(@constCast(s)),
             .capture_progress => |s| allocator.free(@constCast(s)),
@@ -84,7 +82,7 @@ pub const CaptureLoader = struct {
     }
 
     pub fn deinit(self: *CaptureLoader, io: std.Io) void {
-        self.cancel_token.cancel();
+        self.cancel_token.cancel(io);
         if (self.live_child) |*child| child.kill(io);
         for (self.workers.items) |worker| worker.join();
         self.workers.deinit(self.allocator);
@@ -111,13 +109,15 @@ pub const CaptureLoader = struct {
 
     pub fn requestPsml(self: *CaptureLoader, session: *session_mod.Session) !void {
         session.loading = .loading_list;
-        self.cancel_token.reset();
+        self.cancel_token.cancel(self.io);
         const generation = self.list_generation.fetchAdd(1, .acq_rel) + 1;
+        self.cancel_token.reset();
         var argv = try process.argvPsmlLoad(
             self.allocator,
             self.tools.tshark,
             session.source,
             session.display_filter,
+            if (self.config.column_format.len != 0) self.config.column_format else null,
         );
         errdefer argv.deinit(self.allocator);
         try appendDissectionOptions(self.allocator, &argv, session, self.config.tshark_args);
@@ -142,8 +142,9 @@ pub const CaptureLoader = struct {
     ) !void {
         const path = self.filePath(session) orelse return error.NoCaptureFile;
         session.loading = .loading_detail;
-        self.cancel_token.reset();
+        self.cancel_token.cancel(self.io);
         const generation = self.detail_generation.fetchAdd(1, .acq_rel) + 1;
+        self.cancel_token.reset();
 
         if (self.detail_cache.get(self.io, frame)) |cached| {
             const copy = try cached.clone(self.allocator);
@@ -201,7 +202,13 @@ pub const CaptureLoader = struct {
 
     pub fn loadPsml(self: *CaptureLoader, io: std.Io, session: *session_mod.Session) !void {
         session.loading = .loading_list;
-        var argv = try process.argvPsmlLoad(self.allocator, self.tools.tshark, session.source, session.display_filter);
+        var argv = try process.argvPsmlLoad(
+            self.allocator,
+            self.tools.tshark,
+            session.source,
+            session.display_filter,
+            if (self.config.column_format.len != 0) self.config.column_format else null,
+        );
         defer argv.deinit(self.allocator);
         try appendDissectionOptions(self.allocator, &argv, session, self.config.tshark_args);
         if (self.tools.supports_color) try argv.append(self.allocator, "--color");
@@ -215,10 +222,12 @@ pub const CaptureLoader = struct {
             return;
         }
 
-        const summaries = try packet.parsePsml(self.allocator, out.stdout);
-        session.setPackets(summaries);
+        var table = try packet.parsePsml(self.allocator, out.stdout);
+        session.setListHeaders(table.headers);
+        table.headers = &.{};
+        session.setPackets(table.packets);
         session.loading = .idle;
-        try self.pushEvent(.{ .packets_loaded = summaries });
+        try self.pushEvent(.{ .packets_loaded = table });
     }
 
     pub fn loadDetailBundle(self: *CaptureLoader, io: std.Io, session: *const session_mod.Session, frame: u32) !void {
@@ -317,7 +326,7 @@ pub const CaptureLoader = struct {
     }
 
     pub fn cancel(self: *CaptureLoader, io: std.Io) void {
-        self.cancel_token.cancel();
+        self.cancel_token.cancel(io);
         self.stopLiveCapture(io);
     }
 
@@ -334,32 +343,34 @@ fn runPsmlWorker(task: *PsmlTask) void {
         loader.allocator.destroy(task);
     }
 
-    var output = process.runCapture(
+    var output = process.runCaptureCancellable(
         loader.allocator,
         loader.io,
         task.argv.slice(),
+        &loader.cancel_token,
     ) catch |err| {
+        if (err == error.Cancelled or task.generation != loader.list_generation.load(.acquire)) return;
         emitWorkerError(loader, @errorName(err));
         return;
     };
     defer output.deinit(loader.allocator);
+    if (task.generation != loader.list_generation.load(.acquire)) return;
     if (!output.term.success()) {
         emitWorkerError(loader, output.stderr);
         return;
     }
 
-    const summaries = packet.parsePsml(loader.allocator, output.stdout) catch |err| {
+    var table = packet.parsePsml(loader.allocator, output.stdout) catch |err| {
         emitWorkerError(loader, @errorName(err));
         return;
     };
     if (loader.cancel_token.isCancelled() or
         task.generation != loader.list_generation.load(.acquire))
     {
-        for (summaries) |*summary| summary.deinit(loader.allocator);
-        loader.allocator.free(summaries);
+        table.deinit(loader.allocator);
         return;
     }
-    var event: Event = .{ .packets_loaded = summaries };
+    var event: Event = .{ .packets_loaded = table };
     loader.pushEvent(event) catch {
         event.deinit(loader.allocator);
     };
@@ -373,11 +384,13 @@ fn runDetailWorker(task: *DetailTask) void {
         loader.allocator.destroy(task);
     }
 
-    var pdml_output = process.runCapture(
+    var pdml_output = process.runCaptureCancellable(
         loader.allocator,
         loader.io,
         task.pdml_argv.slice(),
+        &loader.cancel_token,
     ) catch |err| {
+        if (err == error.Cancelled or task.generation != loader.detail_generation.load(.acquire)) return;
         emitWorkerError(loader, @errorName(err));
         return;
     };
@@ -387,11 +400,13 @@ fn runDetailWorker(task: *DetailTask) void {
         return;
     }
 
-    var hex_output = process.runCapture(
+    var hex_output = process.runCaptureCancellable(
         loader.allocator,
         loader.io,
         task.hex_argv.slice(),
+        &loader.cancel_token,
     ) catch |err| {
+        if (err == error.Cancelled or task.generation != loader.detail_generation.load(.acquire)) return;
         emitWorkerError(loader, @errorName(err));
         return;
     };
@@ -498,8 +513,11 @@ test "load psml from fixture file" {
         const cwd = std.Io.Dir.cwd();
         const xml = try cwd.readFileAlloc(io, "tests/fixtures/1.psml", allocator, .unlimited);
         defer allocator.free(xml);
-        const summaries = try packet.parsePsml(allocator, xml);
-        session.setPackets(summaries);
+        var table = try packet.parsePsml(allocator, xml);
+        session.setListHeaders(table.headers);
+        table.headers = &.{};
+        session.setPackets(table.packets);
+        table.packets = &.{};
         try std.testing.expect(session.packets.len > 0);
         return;
     }
@@ -572,7 +590,7 @@ test "asynchronous summary request returns owned event" {
     defer allocator.free(events);
     try std.testing.expectEqual(@as(usize, 1), events.len);
     switch (events[0]) {
-        .packets_loaded => |packets| try std.testing.expectEqual(@as(usize, 18), packets.len),
+        .packets_loaded => |table| try std.testing.expectEqual(@as(usize, 18), table.packets.len),
         else => return error.UnexpectedEvent,
     }
     for (events) |*event| event.deinit(allocator);

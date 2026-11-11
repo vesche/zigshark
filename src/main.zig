@@ -80,7 +80,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const use_tui = stdin_tty and stdout_tty and cli_opts.pass_thru != .always;
+    const use_tui = cli_opts.force_tty or (stdin_tty and stdout_tty and cli_opts.pass_thru != .always);
     const pass_thru = cli_opts.pass_thru == .always or (cli_opts.pass_thru == .auto and !use_tui);
 
     if (pass_thru) {
@@ -170,6 +170,7 @@ pub fn main(init: std.process.Init) !void {
         .bundle_size = cfg.pcap_bundle_size,
         .cache_size = cfg.pcap_cache_size,
         .tshark_args = cfg.tshark_args,
+        .column_format = cfg.column_format,
     });
     defer loader.deinit(io);
 

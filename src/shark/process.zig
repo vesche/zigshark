@@ -13,9 +13,14 @@ pub const RunOutput = struct {
 
 pub const CancellationToken = struct {
     cancelled: std.atomic.Value(bool) = .init(false),
+    mutex: std.Io.Mutex = .init,
+    child: ?*std.process.Child = null,
 
-    pub fn cancel(self: *CancellationToken) void {
+    pub fn cancel(self: *CancellationToken, io: std.Io) void {
         self.cancelled.store(true, .release);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.child) |child| child.kill(io);
     }
 
     pub fn isCancelled(self: *const CancellationToken) bool {
@@ -24,6 +29,19 @@ pub const CancellationToken = struct {
 
     pub fn reset(self: *CancellationToken) void {
         self.cancelled.store(false, .release);
+    }
+
+    fn bind(self: *CancellationToken, io: std.Io, child: *std.process.Child) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.child = child;
+        if (self.cancelled.load(.acquire)) child.kill(io);
+    }
+
+    fn unbind(self: *CancellationToken, io: std.Io, child: *std.process.Child) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.child == child) self.child = null;
     }
 };
 
@@ -39,16 +57,73 @@ pub const Source = union(enum) {
 pub const default_column_format =
     "gui.column.format:\"No.\",\"%m\",\"Time\",\"%t\",\"Source\",\"%s\",\"Destination\",\"%d\",\"Protocol\",\"%p\",\"Length\",\"%L\",\"Info\",\"%i\"";
 
+pub const delta_column_format =
+    "gui.column.format:\"No.\",\"%m\",\"Time\",\"%t\",\"Delta\",\"%Gt\",\"Source\",\"%s\",\"Destination\",\"%d\",\"Protocol\",\"%p\",\"Length\",\"%L\",\"Info\",\"%i\"";
+
+pub const absolute_column_format =
+    "gui.column.format:\"No.\",\"%m\",\"Time\",\"%Yt\",\"Source\",\"%s\",\"Destination\",\"%d\",\"Protocol\",\"%p\",\"Length\",\"%L\",\"Info\",\"%i\"";
+
+pub fn columnFormatOrDefault(format: ?[]const u8) []const u8 {
+    if (format) |value| if (value.len != 0) return value;
+    return default_column_format;
+}
+
 pub fn runCapture(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !RunOutput {
-    const result = try std.process.run(allocator, io, .{
+    return runCaptureCancellable(allocator, io, argv, null);
+}
+
+pub fn runCaptureCancellable(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    token: ?*CancellationToken,
+) !RunOutput {
+    if (token) |cancel| {
+        if (cancel.isCancelled()) return error.Cancelled;
+    }
+    var child = try std.process.spawn(io, .{
         .argv = argv,
-        .stdout_limit = .unlimited,
-        .stderr_limit = .unlimited,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
     });
+    if (token) |cancel| cancel.bind(io, &child);
+    defer if (token) |cancel| cancel.unbind(io, &child);
+    defer child.kill(io);
+
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(allocator, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
+
+    while (multi_reader.fill(4096, .none)) |_| {
+        if (token) |cancel| {
+            if (cancel.isCancelled()) {
+                child.kill(io);
+                return error.Cancelled;
+            }
+        }
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => {
+            if (token) |cancel| {
+                if (cancel.isCancelled()) return error.Cancelled;
+            }
+            return err;
+        },
+    }
+    if (token) |cancel| {
+        if (cancel.isCancelled()) return error.Cancelled;
+    }
+
+    const term = try child.wait(io);
+    const stdout_slice = try multi_reader.toOwnedSlice(0);
+    errdefer allocator.free(stdout_slice);
+    const stderr_slice = try multi_reader.toOwnedSlice(1);
     return .{
-        .stdout = result.stdout,
-        .stderr = result.stderr,
-        .term = result.term,
+        .stdout = stdout_slice,
+        .stderr = stderr_slice,
+        .term = term,
     };
 }
 
@@ -69,14 +144,20 @@ pub const Argv = struct {
     }
 };
 
-pub fn argvPsmlLoad(allocator: std.mem.Allocator, tshark: []const u8, source: Source, display_filter: ?[]const u8) !Argv {
+pub fn argvPsmlLoad(
+    allocator: std.mem.Allocator,
+    tshark: []const u8,
+    source: Source,
+    display_filter: ?[]const u8,
+    column_format: ?[]const u8,
+) !Argv {
     var a: Argv = .{};
     errdefer a.deinit(allocator);
     try a.append(allocator, tshark);
     try a.append(allocator, "-T");
     try a.append(allocator, "psml");
     try a.append(allocator, "-o");
-    try a.append(allocator, default_column_format);
+    try a.append(allocator, columnFormatOrDefault(column_format));
     switch (source) {
         .file => |path| {
             try a.append(allocator, "-r");
@@ -301,7 +382,7 @@ pub fn argvTsharkLiveFallback(
 
 test "argv builders produce expected heads" {
     const allocator = std.testing.allocator;
-    var psml = try argvPsmlLoad(allocator, "/usr/bin/tshark", .{ .file = "/tmp/x.pcap" }, "tcp");
+    var psml = try argvPsmlLoad(allocator, "/usr/bin/tshark", .{ .file = "/tmp/x.pcap" }, "tcp", null);
     defer psml.deinit(allocator);
     try std.testing.expectEqualStrings("/usr/bin/tshark", psml.list.items[0]);
     try std.testing.expectEqual(@as(usize, 9), psml.list.items.len);

@@ -108,4 +108,4 @@ When stdout is not a TTY (or `--pass-thru`), zigshark execs `tshark` with the re
 
 - **Linux / macOS / BSD**: full feature set including FIFOs and stdin.
 - **Windows**: file open, TUI, and tool discovery; dumpcap/extcap paths may need `capture-command` style configuration; Unix job control is unavailable.
-- **Android/Termux**: deferred in this release.
+- **Android/Termux**: not supported.

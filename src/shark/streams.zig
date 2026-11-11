@@ -124,6 +124,25 @@ const sample =
     \\00000000  57 6f 72 6c 64
 ;
 
+pub fn frameContainsFilter(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    try writer.writer.writeAll("frame contains ");
+    const limit = @min(bytes.len, 8);
+    for (bytes[0..limit], 0..) |byte, index| {
+        if (index != 0) try writer.writer.writeByte(':');
+        try writer.writer.print("{x:0>2}", .{byte});
+    }
+    return writer.toOwnedSlice();
+}
+
+test "frame contains filter uses the first bytes" {
+    const alloc = std.testing.allocator;
+    const filter = try frameContainsFilter(alloc, "Hello");
+    defer alloc.free(filter);
+    try std.testing.expectEqualStrings("frame contains 48:65:6c:6c:6f", filter);
+}
+
 test "parse follow stream raw" {
     const alloc = std.testing.allocator;
     var sf = try parse(alloc, sample);

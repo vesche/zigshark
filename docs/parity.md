@@ -7,7 +7,8 @@ Legend:
 - **done** — wired into the application and verified
 - **partial** — usable, but termshark has a richer workflow
 - **missing** — not ported yet
-- **deferred** — outside the first desktop release scope
+- **deferred** — implemented far enough to run, but not verified until capture VMs are available
+- **out of scope** — will not be built
 
 | Area | Status | Notes / tests |
 |------|--------|---------------|
@@ -16,19 +17,19 @@ Legend:
 | Display-filter completion | **done** | Lazy field cache. Tab and Shift-Tab cycle matches for the token being typed and show `n/total` |
 | Capture filter (CLI) | **done** | Applied to dumpcap/tshark live capture |
 | Interface list `-D` | done | `shark/tools.listInterfaces` |
-| Live capture dumpcap + tshark fallback | **partial** | Multi-interface and growing-file refresh work; fake-dumpcap integration passes. Privileged local capture is unavailable on the development host |
+| Live capture dumpcap + tshark fallback | **deferred** | Dumpcap, the tshark fallback, multi-interface selection, and growing-file refresh are implemented. `:clear-packets` during a capture hides frames already on screen and keeps packets that arrive after that. Privileged capture will be verified later on VMs, not on this machine |
 | Stdin | **done** | Spools stdin to a temporary PCAP so details remain seekable |
-| FIFO / continuously streaming input | **partial** | File/FIFO source exists; continuous tail semantics still need hardening |
+| FIFO / continuously streaming input | **done** | Named pipes are tailed automatically. `:tail` toggles the same refresh for a capture another process is still writing |
 | PSML packet list | **done** | Stable seven-column format, aligned responsive columns, sorting, Wireshark colors |
 | PDML protocol tree | **done** | Nested proto/field hierarchy, expansion, scrolling and byte ranges |
 | Hex/bytes view + highlight | **done** | Responsive 4/8/16-byte rows, field and search highlights |
 | Async list/detail loading + LRU | **done** | Background tshark workers, stale-request generations, bounded detail cache |
-| Background-worker process cancellation | **partial** | Stale results are dropped; already-running one-shot tshark children finish before final teardown |
+| Background-worker process cancellation | **done** | A new list or detail request, and shutdown, kill the tshark child instead of waiting for it to finish |
 | Packet colors | **done** | `tshark --color` foreground/background PSML attributes |
 | Layouts and resizing | **done** | Vertical list/tree/hex default, side-by-side alternate, keyboard and mouse split resizing |
 | Column formats parser | **done** | Modern two/three-field rows covered |
-| Column editor / arbitrary Wireshark columns | **partial** | Fixed parity-oriented columns plus mouse sorting; editor still missing |
-| Follow TCP/UDP streams | **partial** | `:streams [tcp\|udp] [index] [ascii\|hex\|raw]` follows the current packet's stream when the index is omitted. The view lists chunks. Enter applies `tcp.stream` / `udp.stream`. tshark's follow output has no frame numbers, so a chunk cannot jump to its packet yet |
+| Column editor / arbitrary Wireshark columns | **done** | `:columns default`, `delta`, `absolute`, or `set gui.column.format:...`. The list uses the PSML titles tshark returns. Click a heading to sort |
+| Follow TCP/UDP streams | **done** | `:streams` follows the current packet. Enter on a chunk searches for its first bytes with `frame contains` inside that stream, which jumps to the packet even though tshark's follow text has no frame numbers |
 | Conversations | **done** | `:convs [tcp\|udp\|ip\|ipv6\|eth]` is a selectable list. Enter builds a two-endpoint display filter and applies it |
 | Capinfos | **done** | Scrollable `:capinfo` view |
 | Search list/details/bytes/hex | **done** | Focus-aware `Ctrl-F`, `n`/`N`, literal and hex byte search |
@@ -40,16 +41,16 @@ Legend:
 | Profiles | **done** | `:profile list`, `create`, `use`, and `delete` |
 | Wireshark profile | **done** | Configured profile passed to summary/detail tshark commands |
 | Themes | **done** | Light/dark plus TOML packs. `:theme midnight` loads `themes/midnight.toml` or `~/.config/zigshark/themes/`. `:theme list` |
-| Wormhole transfer | **partial** | External CLI integration with missing-tool error; no progress UI |
+| Wormhole transfer | **done** | `:wormhole` runs in the background and the overlay shows the code and transfer output as wormhole prints it |
 | Pass-through to tshark | **done** | Auto/explicit modes, zigshark-only flag stripping, file shorthand tests |
 | Decode-as / timestamp CLI | **done** | Applied to summary and detail tshark commands |
-| Config TOML | **partial** | Core settings, marks, and `:set` values persist. Not every key has a dedicated editor |
+| Config TOML | **done** | `:set` lists every key and writes it back to `config.toml`. Load ignores unknown or malformed keys so an old file still opens |
 | Help, menus and command palette | **done** | Keyboard help, clickable header menus, fuzzy command palette |
 | Terminal restore / Ctrl-C | **done** | PTY test verifies clean alternate-screen exit with no allocator dump |
-| Unix suspend/resume and `--tty` | **missing** | Job-control parity remains |
+| Unix suspend/resume and `--tty` | **done** | Ctrl-Z restores the terminal and stops the process; `fg` resumes the UI. `--tty` forces the interface onto the controlling terminal |
 | Windows/macOS/FreeBSD build | **done** | Native Linux tests plus successful release cross-compiles |
-| Platform-specific live capture behavior | **partial** | Requires real-host integration tests on macOS/BSD/Windows |
-| Android/Termux | **deferred** | Outside first desktop scope |
+| Platform-specific live capture behavior | **deferred** | Same as live capture: the code paths exist, and host checks wait for VMs |
+| Android/Termux | **out of scope** | Not planned. zigshark targets desktop Linux, macOS, BSD, and Windows |
 | termshark config migration | **n/a** | Clean break by design |
 
 ## Known upstream fixes included

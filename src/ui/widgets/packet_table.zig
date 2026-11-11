@@ -7,6 +7,7 @@ const text_util = @import("text_util.zig");
 
 pub const PacketTable = struct {
     rows: []const packet.PacketSummary = &.{},
+    headers: []const []const u8 = &.{},
     theme: theme_mod.Theme,
     packet_colors: bool = true,
     selected: usize = 0,
@@ -89,8 +90,7 @@ pub const PacketTable = struct {
                 if (m.button == .left and m.row >= 0 and m.col >= 0) {
                     const row: usize = @intCast(m.row);
                     if (row == 0) {
-                        if (semanticAtColumn(self.last_width, @intCast(m.col))) |semantic| {
-                            const column = @intFromEnum(semantic);
+                        if (columnAt(self.headers, self.last_width, @intCast(m.col))) |column| {
                             if (column == self.sort_column) {
                                 self.sort_ascending = !self.sort_ascending;
                             } else {
@@ -170,8 +170,11 @@ pub const PacketTable = struct {
         if (size.width == 0 or size.height == 0) return surf;
 
         self.last_width = size.width;
-        var column_buf: [7]Column = undefined;
-        const columns = fillColumns(&column_buf, size.width);
+        var column_buf: [12]Column = undefined;
+        const columns = if (self.headers.len > 0)
+            layoutHeaders(self.headers, size.width, &column_buf)
+        else
+            fillColumns(column_buf[0..7], size.width);
         const header_style: vaxis.Style = .{ .fg = self.theme.header_fg, .bg = self.theme.header_bg, .bold = true };
         const normal: vaxis.Style = .{ .fg = self.theme.fg, .bg = self.theme.bg };
         const selected_style: vaxis.Style = if (self.focused)
@@ -198,7 +201,7 @@ pub const PacketTable = struct {
             if (idx == self.selected) {
                 style = selected_style;
             } else if (self.packet_colors) {
-                style = theme_mod.protocolStyle(self.theme, cellFor(row, .protocol));
+                style = theme_mod.protocolStyle(self.theme, protocolCell(self.headers, row));
                 if (row.fg_color) |c| style.fg = theme_mod.fromPacketColor(c);
                 if (row.bg_color) |c| style.bg = theme_mod.fromPacketColor(c);
             } else if (idx % 2 == 1) {
@@ -229,46 +232,80 @@ const Column = struct {
     semantic: Semantic,
     title: []const u8,
     width: u16,
+    index: usize = 0,
+    from_header: bool = false,
 };
 
-fn fillColumns(buf: *[7]Column, total_width: u16) []const Column {
+fn fillColumns(buf: []Column, total_width: u16) []const Column {
     if (total_width < 70) {
-        buf.* = .{
-            .{ .semantic = .number, .title = "No.", .width = 5 },
-            .{ .semantic = .time, .title = "Time", .width = 10 },
-            .{ .semantic = .protocol, .title = "Proto", .width = 9 },
-            .{ .semantic = .length, .title = "Len", .width = 6 },
-            .{ .semantic = .info, .title = "Info", .width = @max(total_width -| 33, 8) },
-            .{ .semantic = .source, .title = "", .width = 0 },
-            .{ .semantic = .destination, .title = "", .width = 0 },
-        };
-        return buf.*[0..5];
+        buf[0] = .{ .semantic = .number, .title = "No.", .width = 5 };
+        buf[1] = .{ .semantic = .time, .title = "Time", .width = 10 };
+        buf[2] = .{ .semantic = .protocol, .title = "Proto", .width = 9 };
+        buf[3] = .{ .semantic = .length, .title = "Len", .width = 6 };
+        buf[4] = .{ .semantic = .info, .title = "Info", .width = @max(total_width -| 33, 8) };
+        return buf[0..5];
     }
     const fixed: u16 = 5 + 11 + 18 + 18 + 9 + 6;
     const gaps: u16 = 6;
     const info_w: u16 = if (total_width > fixed + gaps) total_width - fixed - gaps else 8;
-    buf.* = .{
-        .{ .semantic = .number, .title = "No.", .width = 5 },
-        .{ .semantic = .time, .title = "Time", .width = 11 },
-        .{ .semantic = .source, .title = "Source", .width = 18 },
-        .{ .semantic = .destination, .title = "Dest", .width = 18 },
-        .{ .semantic = .protocol, .title = "Proto", .width = 9 },
-        .{ .semantic = .length, .title = "Len", .width = 6 },
-        .{ .semantic = .info, .title = "Info", .width = @max(info_w, 4) },
-    };
-    return buf.*[0..];
+    buf[0] = .{ .semantic = .number, .title = "No.", .width = 5 };
+    buf[1] = .{ .semantic = .time, .title = "Time", .width = 11 };
+    buf[2] = .{ .semantic = .source, .title = "Source", .width = 18 };
+    buf[3] = .{ .semantic = .destination, .title = "Dest", .width = 18 };
+    buf[4] = .{ .semantic = .protocol, .title = "Proto", .width = 9 };
+    buf[5] = .{ .semantic = .length, .title = "Len", .width = 6 };
+    buf[6] = .{ .semantic = .info, .title = "Info", .width = @max(info_w, 4) };
+    return buf[0..7];
 }
 
-fn semanticAtColumn(width: u16, clicked: u16) ?Semantic {
-    var buf: [7]Column = undefined;
+fn columnAt(headers: []const []const u8, width: u16, clicked: u16) ?usize {
+    var buf: [12]Column = undefined;
+    const columns = if (headers.len > 0) layoutHeaders(headers, width, &buf) else fillColumns(buf[0..7], width);
     var col: u16 = 0;
-    for (fillColumns(&buf, width)) |column| {
+    for (columns) |column| {
         if (column.width == 0) continue;
         const end = col + column.width;
-        if (clicked >= col and clicked < end + 1) return column.semantic;
+        if (clicked >= col and clicked < end + 1) return if (headers.len > 0) column.index else @intFromEnum(column.semantic);
         col = end + 1;
     }
     return null;
+}
+
+fn layoutHeaders(headers: []const []const u8, total_width: u16, buf: *[12]Column) []const Column {
+    const count = @min(headers.len, buf.len);
+    if (count == 0) return buf[0..0];
+    var used: u16 = 0;
+    for (headers[0..count], 0..) |title, index| {
+        const numeric = isNumericTitle(title);
+        const width: u16 = if (index + 1 == count) 0 else if (numeric) 8 else 16;
+        buf[index] = .{
+            .semantic = .info,
+            .title = title,
+            .width = width,
+            .index = index,
+            .from_header = true,
+        };
+        if (index + 1 != count) used += width + 1;
+    }
+    buf[count - 1].width = if (total_width > used) total_width - used else 8;
+    return buf[0..count];
+}
+
+fn isNumericTitle(title: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(title, "No.") or
+        std.ascii.eqlIgnoreCase(title, "Len") or
+        std.ascii.eqlIgnoreCase(title, "Length") or
+        std.mem.indexOf(u8, title, "Bytes") != null;
+}
+
+fn protocolCell(headers: []const []const u8, row: packet.PacketSummary) []const u8 {
+    if (headers.len == 0) return cellFor(row, .protocol);
+    for (headers, 0..) |header, index| {
+        if (std.ascii.indexOfIgnoreCase(header, "proto") != null and index < row.columns.len) {
+            return row.columns[index];
+        }
+    }
+    return if (row.columns.len > 4) row.columns[4] else "";
 }
 
 fn fillRow(surface: *vxfw.Surface, row: u16, width: u16, style: vaxis.Style) void {
@@ -300,9 +337,15 @@ fn formatRow(arena: std.mem.Allocator, columns: []const Column, row: ?packet.Pac
     for (columns, 0..) |column, i| {
         if (column.width == 0) continue;
         if (i != 0) try list.append(arena, ' ');
-        const raw = if (row) |packet_row| cellFor(packet_row, column.semantic) else column.title;
+        const raw = if (row) |packet_row|
+            if (column.from_header)
+                if (column.index < packet_row.columns.len) packet_row.columns[column.index] else ""
+            else
+                cellFor(packet_row, column.semantic)
+        else
+            column.title;
         const clipped = clipAscii(raw, column.width);
-        const right = column.semantic == .number or column.semantic == .length;
+        const right = column.semantic == .number or column.semantic == .length or (column.from_header and isNumericTitle(column.title));
         if (right and clipped.len < column.width) {
             var pad: usize = 0;
             while (pad < column.width - clipped.len) : (pad += 1) try list.append(arena, ' ');
@@ -320,6 +363,15 @@ fn clipAscii(text: []const u8, width: u16) []const u8 {
     if (width == 0) return "";
     if (text.len <= width) return text;
     return text[0..width];
+}
+
+test "header layout uses psml titles" {
+    var buf: [12]Column = undefined;
+    const headers = [_][]const u8{ "No.", "Time", "Delta", "Info" };
+    const cols = layoutHeaders(&headers, 80, &buf);
+    try std.testing.expectEqual(@as(usize, 4), cols.len);
+    try std.testing.expectEqualStrings("Delta", cols[2].title);
+    try std.testing.expect(cols[3].width > cols[0].width);
 }
 
 test "format row pads columns" {

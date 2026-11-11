@@ -51,24 +51,6 @@ pub const OverlayKind = enum {
     capinfo,
 };
 
-fn parseCommandBool(value: []const u8) ?bool {
-    if (std.ascii.eqlIgnoreCase(value, "true") or
-        std.ascii.eqlIgnoreCase(value, "yes") or
-        std.mem.eql(u8, value, "1") or
-        std.ascii.eqlIgnoreCase(value, "on"))
-    {
-        return true;
-    }
-    if (std.ascii.eqlIgnoreCase(value, "false") or
-        std.ascii.eqlIgnoreCase(value, "no") or
-        std.mem.eql(u8, value, "0") or
-        std.ascii.eqlIgnoreCase(value, "off"))
-    {
-        return false;
-    }
-    return null;
-}
-
 fn hexNeedleLength(value: []const u8) usize {
     var digits: usize = 0;
     for (value) |char| {
@@ -136,6 +118,12 @@ pub const AppModel = struct {
     conversations: []convs_shark.Conversation = &.{},
     conversation_proto: []u8 = &.{},
     stream_filter: []u8 = &.{},
+    stream_chunks: []streams_shark.Chunk = &.{},
+    tailing: bool = false,
+    tail_size: u64 = 0,
+    tail_ticks: u8 = 0,
+    hide_through_frame: u32 = 0,
+    transfer_job: ?*transfer.Job = null,
 
     hsplit_main: hsplit.HSplit,
     hsplit_detail: hsplit.HSplit,
@@ -188,6 +176,12 @@ pub const AppModel = struct {
         self.conversations = &.{};
         self.conversation_proto = &.{};
         self.stream_filter = &.{};
+        self.stream_chunks = &.{};
+        self.tailing = false;
+        self.tail_size = 0;
+        self.tail_ticks = 0;
+        self.hide_through_frame = 0;
+        self.transfer_job = null;
 
         self.packet_table = .{
             .theme = self.theme,
@@ -270,6 +264,8 @@ pub const AppModel = struct {
         self.clearConversations();
         if (self.conversation_proto.len != 0) self.allocator.free(self.conversation_proto);
         if (self.stream_filter.len != 0) self.allocator.free(self.stream_filter);
+        self.clearStreamChunks();
+        if (self.transfer_job) |job| job.destroy();
         if (self.completion_prefix.len != 0) self.allocator.free(self.completion_prefix);
         self.protocol_tree.deinit();
         self.filter.deinit();
@@ -278,6 +274,7 @@ pub const AppModel = struct {
 
     fn syncFromSession(self: *AppModel) void {
         self.packet_table.rows = self.session.packets;
+        self.packet_table.headers = self.session.list_headers;
         if (self.session.selected_index) |idx| {
             self.packet_table.selected = idx;
         }
@@ -602,9 +599,19 @@ pub const AppModel = struct {
         defer self.allocator.free(events);
         for (events) |*ev| {
             switch (ev.*) {
-                .packets_loaded => |packets| {
+                .packets_loaded => |*table| {
                     const selected_frame = self.session.selectedFrame();
-                    self.session.setPackets(packets);
+                    self.session.setListHeaders(table.headers);
+                    table.headers = &.{};
+                    if (self.hide_through_frame != 0) {
+                        table.packets = try packet.retainFramesAfter(
+                            self.allocator,
+                            table.packets,
+                            self.hide_through_frame,
+                        );
+                    }
+                    self.session.setPackets(table.packets);
+                    table.packets = &.{};
                     if (selected_frame) |frame| {
                         for (self.session.packets, 0..) |summary, index| {
                             if (summary.frame == frame) {
@@ -664,6 +671,8 @@ pub const AppModel = struct {
     fn openCapture(self: *AppModel, path: []const u8) !void {
         if (self.live_capture) self.loader.stopLiveCapture(self.io);
         try self.session.setFileSource(path);
+        self.hide_through_frame = 0;
+        self.noteTail(path);
         try recents.pushRecent(self.config, path);
         self.live_capture = false;
         self.clearDetail();
@@ -760,6 +769,7 @@ pub const AppModel = struct {
                 try self.showMessage("Usage: :search <text>");
                 return;
             }
+            self.search.case_sensitive = self.config.search_case_sensitive;
             self.search.kind = .string;
             self.search.target = switch (self.focus) {
                 .protocol => .details,
@@ -774,6 +784,7 @@ pub const AppModel = struct {
                 try self.showMessage("Usage: :search-regex <pattern>");
                 return;
             }
+            self.search.case_sensitive = self.config.search_case_sensitive;
             self.search.kind = .regex;
             self.search.target = switch (self.focus) {
                 .protocol => .details,
@@ -807,10 +818,9 @@ pub const AppModel = struct {
             try self.loader.requestPsml(self.session);
             self.syncFromSession();
         } else if (std.mem.eql(u8, cmd, "clear-packets")) {
-            if (self.live_capture) {
-                try self.showMessage("Clearing only pre-existing live packets is not implemented yet");
-                return;
-            }
+            var newest: u32 = self.hide_through_frame;
+            for (self.session.packets) |summary| newest = @max(newest, summary.frame);
+            if (self.live_capture or self.tailing) self.hide_through_frame = newest;
             self.session.clearPackets();
             self.clearDetail();
             self.syncFromSession();
@@ -822,7 +832,7 @@ pub const AppModel = struct {
                 return;
             };
             var proto: []const u8 = "tcp";
-            var mode: []const u8 = "ascii";
+            var mode: []const u8 = if (self.config.stream_view.len != 0) self.config.stream_view else "ascii";
             var index: u32 = 0;
             var explicit_index = false;
             var stream_args = std.mem.tokenizeAny(u8, args, " \t");
@@ -883,10 +893,14 @@ pub const AppModel = struct {
         } else if (std.mem.eql(u8, cmd, "marks")) {
             try self.showMarks();
         } else if (std.mem.eql(u8, cmd, "columns")) {
-            try self.showMessage(
-                "Columns: No., Time, Source, Destination, Protocol, Length, Info\n" ++
-                    "Click a column heading to sort; click again to reverse.",
-            );
+            try self.applyColumns(args);
+        } else if (std.mem.eql(u8, cmd, "tail")) {
+            self.tailing = !self.tailing;
+            if (self.tailing) self.tail_size = 0;
+            try self.showMessage(if (self.tailing)
+                "Tailing the capture. New packets appear as the file grows."
+            else
+                "Stopped tailing the capture.");
         } else if (std.mem.eql(u8, cmd, "config")) {
             const config_path = try self.paths.configFile(self.allocator);
             defer self.allocator.free(config_path);
@@ -974,13 +988,19 @@ pub const AppModel = struct {
                 .file => |p| p,
                 else => args,
             };
-            transfer.sendFile(self.allocator, self.io, path) catch |err| {
+            if (path.len == 0) {
+                try self.showMessage("Usage: :wormhole <file>");
+                return;
+            }
+            if (self.transfer_job) |job| job.destroy();
+            self.transfer_job = transfer.Job.start(self.allocator, self.io, path) catch |err| {
                 switch (err) {
                     error.WormholeNotFound => try self.showMessage("wormhole CLI not found"),
-                    error.WormholeFailed => try self.showMessage("wormhole transfer failed"),
-                    else => return err,
+                    else => try self.showMessage("Could not start wormhole"),
                 }
+                return;
             };
+            try self.showMessage("Sending via wormhole…");
         } else {
             try self.showMessage("Unknown command");
         }
@@ -1104,68 +1124,138 @@ pub const AppModel = struct {
     }
 
     fn runSetCommand(self: *AppModel, args: []const u8) !void {
-        const separator = std.mem.indexOfScalar(u8, args, ' ') orelse {
-            try self.showMessage(
-                "Usage: :set <option> <value>\n" ++
-                    "Options: packet-colors, dark-mode, packet-list-ratio, detail-ratio, wireshark-profile",
-            );
+        const trimmed = std.mem.trim(u8, args, " \t");
+        if (trimmed.len == 0) {
+            const text = try self.config.formatSettings(self.allocator);
+            defer self.allocator.free(text);
+            try self.showMessage(text);
+            return;
+        }
+        const separator = std.mem.indexOfScalar(u8, trimmed, ' ') orelse {
+            try self.showMessage("Usage: :set <key> <value>   (:set alone lists every key)");
             return;
         };
-        const name = std.mem.trim(u8, args[0..separator], " \t");
-        const value = std.mem.trim(u8, args[separator + 1 ..], " \t");
+        const name = std.mem.trim(u8, trimmed[0..separator], " \t");
+        const value = std.mem.trim(u8, trimmed[separator + 1 ..], " \t");
+        self.config.applySetting(name, value) catch |err| switch (err) {
+            error.UnknownSetting => try self.showMessage("Unknown setting. :set lists them."),
+            error.InvalidValue => try self.showMessage("That value is not valid for the setting."),
+            else => return err,
+        };
         if (std.mem.eql(u8, name, "packet-colors")) {
-            const enabled = parseCommandBool(value) orelse {
-                try self.showMessage("Expected true or false");
-                return;
-            };
-            self.config.packet_colors = enabled;
-            self.packet_table.packet_colors = enabled;
-        } else if (std.mem.eql(u8, name, "dark-mode")) {
-            const enabled = parseCommandBool(value) orelse {
-                try self.showMessage("Expected true or false");
-                return;
-            };
-            self.config.dark_mode = enabled;
-            self.applyTheme(self.loadConfiguredTheme() catch theme_mod.resolve(enabled));
+            self.packet_table.packet_colors = self.config.packet_colors;
+        } else if (std.mem.eql(u8, name, "dark-mode") or std.mem.eql(u8, name, "theme")) {
+            self.applyTheme(self.loadConfiguredTheme() catch theme_mod.resolve(self.config.dark_mode));
         } else if (std.mem.eql(u8, name, "packet-list-ratio")) {
-            self.config.packet_list_ratio = std.math.clamp(
-                std.fmt.parseFloat(f32, value) catch {
-                    try self.showMessage("Expected a ratio from 0.1 to 0.9");
-                    return;
-                },
-                0.1,
-                0.9,
-            );
             self.hsplit_main.ratio = self.config.packet_list_ratio;
             self.vsplit_main.ratio = self.config.packet_list_ratio;
         } else if (std.mem.eql(u8, name, "detail-ratio")) {
-            self.config.detail_ratio = std.math.clamp(
-                std.fmt.parseFloat(f32, value) catch {
-                    try self.showMessage("Expected a ratio from 0.1 to 0.9");
-                    return;
-                },
-                0.1,
-                0.9,
-            );
             self.hsplit_detail.ratio = self.config.detail_ratio;
+        } else if (std.mem.eql(u8, name, "layout")) {
+            self.layout_stacked = self.config.layout != .side_by_side;
         } else if (std.mem.eql(u8, name, "wireshark-profile")) {
-            try self.config.setWiresharkProfile(value);
             try self.session.setWiresharkProfile(value);
             self.clearDetail();
             self.loader.clearDetailCache(self.io);
             try self.loader.requestPsml(self.session);
-        } else {
-            try self.showMessage("Unknown option");
-            return;
+        } else if (std.mem.eql(u8, name, "tshark-args")) {
+            self.loader.config.tshark_args = self.config.tshark_args;
+        } else if (std.mem.eql(u8, name, "pcap-bundle-size")) {
+            self.loader.config.bundle_size = self.config.pcap_bundle_size;
+        } else if (std.mem.eql(u8, name, "pcap-cache-size")) {
+            self.loader.config.cache_size = self.config.pcap_cache_size;
+        } else if (std.mem.eql(u8, name, "search-case-sensitive")) {
+            self.search.case_sensitive = self.config.search_case_sensitive;
         }
         self.persistConfig();
         try self.showMessage("Option updated");
+    }
+
+    fn applyColumns(self: *AppModel, args: []const u8) !void {
+        const trimmed = std.mem.trim(u8, args, " \t");
+        if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "show")) {
+            const current = if (self.config.column_format.len != 0) self.config.column_format else process_mod.default_column_format;
+            const message = try std.fmt.allocPrint(
+                self.allocator,
+                "Columns\n{s}\n\n:columns default\n:columns delta\n:columns absolute\n:columns set gui.column.format:\"No.\",\"%m\",...\nClick a heading to sort.",
+                .{current},
+            );
+            defer self.allocator.free(message);
+            try self.showMessage(message);
+            return;
+        }
+        if (std.mem.eql(u8, trimmed, "default")) {
+            try self.config.setColumnFormat("");
+        } else if (std.mem.eql(u8, trimmed, "delta")) {
+            try self.config.setColumnFormat(process_mod.delta_column_format);
+        } else if (std.mem.eql(u8, trimmed, "absolute")) {
+            try self.config.setColumnFormat(process_mod.absolute_column_format);
+        } else if (std.mem.startsWith(u8, trimmed, "set ")) {
+            try self.config.setColumnFormat(std.mem.trim(u8, trimmed["set ".len..], " \t"));
+        } else {
+            try self.showMessage("Usage: :columns [default|delta|absolute|set <gui.column.format:...>]");
+            return;
+        }
+        self.loader.config.column_format = self.config.column_format;
+        self.persistConfig();
+        self.clearDetail();
+        try self.loader.requestPsml(self.session);
+        try self.showMessage("Column layout updated");
+    }
+
+    fn noteTail(self: *AppModel, path: []const u8) void {
+        self.tailing = false;
+        self.tail_size = 0;
+        const cwd = std.Io.Dir.cwd();
+        const stat = cwd.statFile(self.io, path, .{}) catch return;
+        self.tail_size = stat.size;
+        self.tailing = stat.kind == .named_pipe;
+    }
+
+    fn refreshTailedFile(self: *AppModel) !void {
+        const path = self.capturePath() orelse return;
+        const cwd = std.Io.Dir.cwd();
+        const stat = cwd.statFile(self.io, path, .{}) catch return;
+        if (stat.size == self.tail_size) return;
+        self.tail_size = stat.size;
+        try self.loader.requestPsml(self.session);
+    }
+
+    fn pollTransfer(self: *AppModel) void {
+        const job = self.transfer_job orelse return;
+        const text = job.snapshot(self.allocator) catch return;
+        if (job.isFinished()) {
+            if (self.overlay_body_owned.len != 0) self.allocator.free(self.overlay_body_owned);
+            self.overlay_body_owned = text;
+            self.msg_overlay.body = self.overlay_body_owned;
+            self.msg_overlay.visible = true;
+            self.overlay = .message;
+            job.destroy();
+            self.transfer_job = null;
+            return;
+        }
+        if (std.mem.eql(u8, text, self.overlay_body_owned)) {
+            self.allocator.free(text);
+            return;
+        }
+        if (self.overlay_body_owned.len != 0) self.allocator.free(self.overlay_body_owned);
+        self.overlay_body_owned = text;
+        self.msg_overlay.body = self.overlay_body_owned;
+        self.msg_overlay.title = "Wormhole";
+        self.msg_overlay.visible = true;
+        self.overlay = .message;
     }
 
     fn persistConfig(self: *AppModel) void {
         const path = self.paths.configFile(self.allocator) catch return;
         defer self.allocator.free(path);
         self.config.save(self.io, path) catch {};
+    }
+
+    fn clearStreamChunks(self: *AppModel) void {
+        for (self.stream_chunks) |*chunk| chunk.deinit(self.allocator);
+        if (self.stream_chunks.len != 0) self.allocator.free(self.stream_chunks);
+        self.stream_chunks = &.{};
     }
 
     fn clearConversations(self: *AppModel) void {
@@ -1195,6 +1285,9 @@ pub const AppModel = struct {
             try self.showPick("Stream", body, .streams);
             return;
         };
+        self.clearStreamChunks();
+        self.stream_chunks = parsed.chunks;
+        parsed.chunks = &.{};
         defer parsed.deinit(self.allocator);
         if (parsed.filter.len != 0) {
             self.allocator.free(self.stream_filter);
@@ -1219,7 +1312,7 @@ pub const AppModel = struct {
         }
         const owned = try text.toOwnedSlice();
         defer self.allocator.free(owned);
-        try self.showPick("Stream  Enter applies the stream filter", owned, .streams);
+        try self.showPick("Stream  Enter jumps to that chunk", owned, .streams);
     }
 
     fn showConversations(self: *AppModel, path: []const u8, proto: []const u8) !void {
@@ -1268,12 +1361,23 @@ pub const AppModel = struct {
                 try onFilterSubmit(self, filter);
             },
             .streams => {
-                const filter = try self.allocator.dupe(u8, self.stream_filter);
+                const index = self.help_overlay.selected;
+                const filter = if (index < self.stream_chunks.len and self.stream_chunks[index].data.len > 0) blk: {
+                    const contains = try streams_shark.frameContainsFilter(
+                        self.allocator,
+                        self.stream_chunks[index].data,
+                    );
+                    defer self.allocator.free(contains);
+                    break :blk try std.fmt.allocPrint(
+                        self.allocator,
+                        "({s}) and ({s})",
+                        .{ self.stream_filter, contains },
+                    );
+                } else try self.allocator.dupe(u8, self.stream_filter);
                 defer self.allocator.free(filter);
                 if (filter.len == 0) return;
                 self.dismissOverlays();
-                try self.filter.setText(filter);
-                try onFilterSubmit(self, filter);
+                try self.searchByDisplayFilter(filter);
             },
             else => {},
         }
@@ -1551,7 +1655,14 @@ pub const AppModel = struct {
                         self.live_refresh_ticks = 0;
                         try self.refreshLiveCapture();
                     }
+                } else if (self.tailing) {
+                    self.tail_ticks +%= 1;
+                    if (self.tail_ticks >= 10) {
+                        self.tail_ticks = 0;
+                        self.refreshTailedFile() catch {};
+                    }
                 }
+                self.pollTransfer();
                 try ctx.tick(100, self.widget());
                 ctx.redraw = true;
             },
@@ -1592,6 +1703,11 @@ pub const AppModel = struct {
                         return ctx.consumeAndRedraw();
                     }
                     self.dismissOverlays();
+                    return ctx.consumeAndRedraw();
+                }
+                if (key.matches('z', .{ .ctrl = true })) {
+                    signals.suspendJob();
+                    try ctx.queueRefresh();
                     return ctx.consumeAndRedraw();
                 }
                 if (key.matches('q', .{})) {

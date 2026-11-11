@@ -118,9 +118,48 @@ fn cloneBytes(allocator: std.mem.Allocator, bytes: PacketBytes) !PacketBytes {
     };
 }
 
-/// Parse PSML (packet list) output into summaries.
-pub fn parsePsml(allocator: std.mem.Allocator, xml: []const u8) ![]PacketSummary {
+pub const PsmlTable = struct {
+    headers: [][]u8 = &.{},
+    packets: []PacketSummary = &.{},
+
+    pub fn deinit(self: *PsmlTable, allocator: std.mem.Allocator) void {
+        for (self.headers) |header| allocator.free(header);
+        if (self.headers.len != 0) allocator.free(self.headers);
+        for (self.packets) |*summary| summary.deinit(allocator);
+        if (self.packets.len != 0) allocator.free(self.packets);
+    }
+};
+
+/// Parse PSML (packet list) output into summaries and column titles.
+/// Drop summaries at or before `frame`, freeing them. The returned slice is a new allocation.
+pub fn retainFramesAfter(allocator: std.mem.Allocator, packets: []PacketSummary, frame: u32) ![]PacketSummary {
+    var keep: usize = 0;
+    for (packets) |summary| {
+        if (summary.frame > frame) keep += 1;
+    }
+    if (keep == packets.len) return packets;
+    const kept = try allocator.alloc(PacketSummary, keep);
+    var index: usize = 0;
+    for (packets) |*summary| {
+        if (summary.frame > frame) {
+            kept[index] = summary.*;
+            index += 1;
+        } else {
+            summary.deinit(allocator);
+        }
+    }
+    allocator.free(packets);
+    return kept;
+}
+
+pub fn parsePsml(allocator: std.mem.Allocator, xml: []const u8) !PsmlTable {
     var document = try psml.parse(allocator, xml);
+    const headers = document.headers;
+    document.headers = &.{};
+    errdefer {
+        for (headers) |header| allocator.free(header);
+        if (headers.len != 0) allocator.free(headers);
+    }
     defer document.deinit(allocator);
 
     const summaries = try allocator.alloc(PacketSummary, document.packets.len);
@@ -146,7 +185,10 @@ pub fn parsePsml(allocator: std.mem.Allocator, xml: []const u8) ![]PacketSummary
         };
         initialized += 1;
     }
-    return summaries;
+    return .{
+        .headers = headers,
+        .packets = summaries,
+    };
 }
 
 fn parseColor(value: ?[]const u8) ?Color {
@@ -265,6 +307,21 @@ pub fn parseHexdump(allocator: std.mem.Allocator, text: []const u8, frame: u32) 
     };
 }
 
+test "retain frames after a cutoff" {
+    const allocator = std.testing.allocator;
+    var first = [_][]const u8{"1"};
+    var second = [_][]const u8{"2"};
+    var third = [_][]const u8{"3"};
+    const packets = try allocator.alloc(PacketSummary, 3);
+    packets[0] = .{ .frame = 1, .columns = &first, .owns_columns = false };
+    packets[1] = .{ .frame = 2, .columns = &second, .owns_columns = false };
+    packets[2] = .{ .frame = 4, .columns = &third, .owns_columns = false };
+    const kept = try retainFramesAfter(allocator, packets, 2);
+    defer allocator.free(kept);
+    try std.testing.expectEqual(@as(usize, 1), kept.len);
+    try std.testing.expectEqual(@as(u32, 4), kept[0].frame);
+}
+
 test "parse psml fixture" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
@@ -272,13 +329,11 @@ test "parse psml fixture" {
     const xml = try cwd.readFileAlloc(io, "tests/fixtures/1.psml", allocator, .unlimited);
     defer allocator.free(xml);
 
-    const packets = try parsePsml(allocator, xml);
-    defer {
-        for (packets) |*p| p.deinit(allocator);
-        allocator.free(packets);
-    }
-    try std.testing.expect(packets.len > 0);
-    try std.testing.expectEqual(@as(u32, 1), packets[0].frame);
+    var table = try parsePsml(allocator, xml);
+    defer table.deinit(allocator);
+    try std.testing.expect(table.packets.len > 0);
+    try std.testing.expect(table.headers.len >= 7);
+    try std.testing.expectEqual(@as(u32, 1), table.packets[0].frame);
 }
 
 test "parse modern PSML packet colors" {
@@ -289,14 +344,11 @@ test "parse modern PSML packet colors" {
         \\<section>42</section><section>TCP</section>
         \\</packet></psml>
     ;
-    const packets = try parsePsml(allocator, document);
-    defer {
-        for (packets) |*summary| summary.deinit(allocator);
-        allocator.free(packets);
-    }
-    try std.testing.expectEqual(@as(u32, 42), packets[0].frame);
-    try std.testing.expectEqual(Color{ .r = 0x12, .g = 0x27, .b = 0x2e }, packets[0].fg_color.?);
-    try std.testing.expectEqual(Color{ .r = 0xe7, .g = 0xe6, .b = 0xff }, packets[0].bg_color.?);
+    var table = try parsePsml(allocator, document);
+    defer table.deinit(allocator);
+    try std.testing.expectEqual(@as(u32, 42), table.packets[0].frame);
+    try std.testing.expectEqual(Color{ .r = 0x12, .g = 0x27, .b = 0x2e }, table.packets[0].fg_color.?);
+    try std.testing.expectEqual(Color{ .r = 0xe7, .g = 0xe6, .b = 0xff }, table.packets[0].bg_color.?);
 }
 
 test "parse hexdump first packet" {

@@ -28,6 +28,9 @@ pub const text =
     \\c                  Enter/leave copy mode
     \\Ctrl-C             Copy in copy mode; otherwise quit
     \\q / ZZ            Quit (confirm / immediate)
+    \\Ctrl-Z            Suspend to the shell; fg resumes
+    \\:columns          default, delta, absolute, or a tshark column format
+    \\:tail             Follow a growing capture file
     \\Ctrl-L            Redraw
     \\Esc               Dismiss overlays
     \\

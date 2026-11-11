@@ -37,6 +37,7 @@ pub const Session = struct {
     wireshark_profile: []u8 = &.{},
     packets: []packet.PacketSummary = &.{},
     packets_owned: bool = false,
+    list_headers: [][]u8 = &.{},
     selected_index: ?usize = null,
     loading: LoadingState = .idle,
     error_message: []u8 = &.{},
@@ -55,6 +56,7 @@ pub const Session = struct {
 
     pub fn deinit(self: *Session) void {
         self.clearPackets();
+        self.clearListHeaders();
         self.freeFilterStrings();
         for (self.decode_as.items) |*d| d.deinit(self.allocator);
         self.decode_as.deinit(self.allocator);
@@ -84,6 +86,17 @@ pub const Session = struct {
         self.packets = &.{};
         self.packets_owned = false;
         self.selected_index = null;
+    }
+
+    pub fn setListHeaders(self: *Session, headers: [][]u8) void {
+        self.clearListHeaders();
+        self.list_headers = headers;
+    }
+
+    pub fn clearListHeaders(self: *Session) void {
+        for (self.list_headers) |header| self.allocator.free(header);
+        if (self.list_headers.len != 0) self.allocator.free(self.list_headers);
+        self.list_headers = &.{};
     }
 
     pub fn setPackets(self: *Session, summaries: []packet.PacketSummary) void {
