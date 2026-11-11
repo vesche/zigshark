@@ -10,6 +10,7 @@ pub fn loadFollow(
     stream_index: u32,
     proto: []const u8,
     mode: []const u8,
+    runner: ?process.Runner,
 ) ![]u8 {
     var argv = try process.argvFollowStreamMode(
         allocator,
@@ -21,7 +22,10 @@ pub fn loadFollow(
     );
     defer argv.deinit(allocator);
 
-    var out = try process.runCapture(allocator, io, argv.slice());
+    var out = if (runner) |run|
+        try run(allocator, io, argv.slice())
+    else
+        try process.runCapture(allocator, io, argv.slice());
     defer out.deinit(allocator);
 
     if (out.stdout.len == 0) {

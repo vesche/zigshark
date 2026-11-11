@@ -39,18 +39,20 @@ VM checklist, for whenever those hosts exist:
 
 `zig build test` is the bar. It already covers CLI parsing, config and profiles, the `tests/fixtures/1.pcap` PSML/PDML/hex fixtures, conversations, streams, columns, fields, capinfos, session sort and marks, search, frame retention, cancellation before spawn, the detail LRU, theme files, hex hit testing, protocol-tree jump on the real PDML, column hit testing, the command palette, and a live tshark integration test that skips when tshark is absent. Linux CI also runs `tests/pty_smoke.py` for a render and a clean Ctrl-C.
 
-The hole is `src/ui/app.zig`. Almost every command, the filter-completion cycle, hex-to-tree linking, tail, and `:clear-packets` live there and are only exercised by hand. The PTY smoke test checks that the process draws and dies cleanly. It does not press keys.
+The hole was `src/ui/app.zig`: command dispatch, filter completion, hex-to-tree linking, and `:clear-packets` lived only in the draw loop. `tests/app_suite.zig` now drives those without a TTY. The PTY smoke test still only checks that the process draws and dies cleanly. It does not press keys. Tail refresh, and the cases under Next, are still untested.
 
 ### Now
 
-- [ ] Pull command handling out of the draw loop far enough that tests can run `:convs`, `:streams`, `:columns`, `:set`, `:clear-packets`, `:search-filter`, and mark jumps without a TTY
-- [ ] Filter completion: Tab and Shift-Tab cycle the original stem, the `n/total` note matches, and a new stem resets the index
-- [ ] `:clear-packets` during tail or live capture sets the cutoff and the next PSML load keeps only newer frames. Opening a file clears the cutoff
-- [ ] Hex cursor calls `selectCovering` once per move. The link guard stops the tree from moving the cursor back
-- [ ] `:columns default|delta|absolute|set` changes the format string passed into the PSML argv
-- [ ] Stream-from-packet uses `tcp.stream` then `udp.stream`. A chunk builds `frame contains` from its first bytes and does not replace the list filter
-- [ ] Conversation Enter builds the display filter for tcp, udp, eth, and ip/ipv6
-- [ ] `:set` of a bad value does not persist, and an unknown key does not wipe the file
+Headless coverage lives in `tests/app_suite.zig`. `AppModel.initOffline` builds the controller and `runCommand` / `completeFilter` / `applyMark` / `activatePick` run without a TTY. tshark is not spawned; a scripted runner supplies stdout, and the loader records the PSML argv. Splitting `src/ui/app.zig` itself stays in section 6, now that these tests exist.
+
+- [x] Pull command handling out of the draw loop far enough that tests can run `:convs`, `:streams`, `:columns`, `:set`, `:clear-packets`, `:search-filter`, and mark jumps without a TTY
+- [x] Filter completion: Tab and Shift-Tab cycle the original stem, the `n/total` note matches, and a new stem resets the index
+- [x] `:clear-packets` during tail or live capture sets the cutoff and the next PSML load keeps only newer frames. Opening a file clears the cutoff
+- [x] Hex cursor calls `selectCovering` once per move. The link guard stops the tree from moving the cursor back
+- [x] `:columns default|delta|absolute|set` changes the format string passed into the PSML argv
+- [x] Stream-from-packet uses `tcp.stream` then `udp.stream`. A chunk builds `frame contains` from its first bytes and does not replace the list filter
+- [x] Conversation Enter builds the display filter for tcp, udp, eth, and ip/ipv6
+- [x] `:set` of a bad value does not persist, and an unknown key does not wipe the file
 
 ### Next
 
@@ -222,7 +224,7 @@ These are already visible. Confirm each one before deleting anything.
 
 | Item | Where | What to do |
 |------|--------|------------|
-| The UI controller is one file | `src/ui/app.zig`, about 2,200 lines | Split command dispatch, capture/tail, and filter completion from drawing once the command tests in section 2 exist. The tests are the condition, so the split does not change behavior unnoticed. |
+| The UI controller is one file | `src/ui/app.zig`, about 2,200 lines | The section 2 command tests now exist (`tests/app_suite.zig`). Split command dispatch, capture/tail, and filter completion from drawing. The tests are there so the split does not change behavior unnoticed. |
 | Settings that persist and do nothing | `src/config.zig` | `disk-cache-size-mb`, `ui-cache-size`, `stream-cache-size`, `disable-shark-fin`, `conv-absolute-time`, `capture-command`, `tail-command`, `wormhole-length`, `wormhole-rendezvous-url`, and `wormhole-transit-relay` are saved and listed by `:set`. Either wire them (wormhole flags into the job argv, conversation time into the convs view, capture command into the live argv) or stop presenting them as live options. |
 | Detail cache size is sticky | `src/ui/app.zig` `:set pcap-cache-size` | Rebuild the LRU, or document that the setting applies on the next launch and stop writing the unused field. |
 | Two recent-file policies | `src/features/recents.zig`, `Config.addRecentFile` | `pushRecent` ignores a path it has already seen and drops the oldest from the front. `addRecentFile` moves the newest to index 0. `list` walks the slice and returns it unchanged. Pick the config behavior and delete the other. |

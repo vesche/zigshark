@@ -61,6 +61,7 @@ pub fn build(b: *std.Build) void {
         "tests/parse_suite.zig",
         "tests/model_suite.zig",
         "tests/ui_suite.zig",
+        "tests/app_suite.zig",
     };
     var suite_steps: [suite_roots.len]*std.Build.Step = undefined;
     for (suite_roots, 0..) |path, index| {

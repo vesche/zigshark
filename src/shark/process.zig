@@ -12,6 +12,10 @@ pub const RunOutput = struct {
     }
 };
 
+/// Optional stand-in for `runCapture`. Headless tests use this so command
+/// dispatch can run without spawning tshark.
+pub const Runner = *const fn (std.mem.Allocator, std.Io, []const []const u8) anyerror!RunOutput;
+
 pub const CancellationToken = struct {
     cancelled: std.atomic.Value(bool) = .init(false),
     mutex: std.Io.Mutex = .init,
@@ -219,7 +223,7 @@ fn copyCaptureToTmp(allocator: std.mem.Allocator, io: std.Io, src: []const u8) !
     defer in_file.close(io);
     const out_file = try cwd.createFile(io, dest, .{
         .truncate = true,
-        .permissions = @enumFromInt(0o600),
+        .permissions = @fromBackingInt(@intCast(0o600)),
     });
     errdefer out_file.close(io);
 

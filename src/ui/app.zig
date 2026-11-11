@@ -112,6 +112,7 @@ pub const AppModel = struct {
     pending_global_frame: ?u32 = null,
     link_guard: bool = false,
     completion_prefix: []u8 = &.{},
+    completion_match: []u8 = &.{},
     completion_index: usize = 0,
     completion_note: [96]u8 = @splat(0),
     completion_note_len: usize = 0,
@@ -124,6 +125,7 @@ pub const AppModel = struct {
     tail_ticks: u8 = 0,
     hide_through_frame: u32 = 0,
     transfer_job: ?*transfer.Job = null,
+    process_runner: ?process_mod.Runner = null,
 
     hsplit_main: hsplit.HSplit,
     hsplit_detail: hsplit.HSplit,
@@ -132,6 +134,24 @@ pub const AppModel = struct {
     flex_items: [4]vxfw.FlexItem = undefined,
 
     pub fn init(self: *AppModel, allocator: std.mem.Allocator, io: std.Io, opts: runtime_mod.RunOptions) !void {
+        try self.initPrepared(allocator, io, opts);
+        try self.startInitialLoad();
+    }
+
+    /// Same widgets and session wiring as `init`, without starting tshark.
+    /// Command tests call `runCommand` on this model and never open a TTY.
+    pub fn initOffline(self: *AppModel, allocator: std.mem.Allocator, io: std.Io, opts: runtime_mod.RunOptions) !void {
+        try self.initPrepared(allocator, io, opts);
+    }
+
+    fn startInitialLoad(self: *AppModel) !void {
+        switch (self.session.source) {
+            .file, .fifo, .stdin => try self.loader.requestPsml(self.session),
+            .interfaces => try self.startLiveCapture(),
+        }
+    }
+
+    fn initPrepared(self: *AppModel, allocator: std.mem.Allocator, io: std.Io, opts: runtime_mod.RunOptions) !void {
         self.* = undefined;
         self.allocator = allocator;
         self.io = io;
@@ -170,6 +190,7 @@ pub const AppModel = struct {
         self.pending_global_frame = null;
         self.link_guard = false;
         self.completion_prefix = &.{};
+        self.completion_match = &.{};
         self.completion_index = 0;
         self.completion_note = @splat(0);
         self.completion_note_len = 0;
@@ -182,6 +203,7 @@ pub const AppModel = struct {
         self.tail_ticks = 0;
         self.hide_through_frame = 0;
         self.transfer_job = null;
+        self.process_runner = null;
 
         self.packet_table = .{
             .theme = self.theme,
@@ -243,12 +265,6 @@ pub const AppModel = struct {
 
         self.empty_pcap = try self.paths.emptyPcapPath(allocator);
         self.syncFromSession();
-        switch (self.session.source) {
-            .file, .fifo, .stdin => {
-                try self.loader.requestPsml(self.session);
-            },
-            .interfaces => try self.startLiveCapture(),
-        }
     }
 
     pub fn deinit(self: *AppModel) void {
@@ -267,6 +283,7 @@ pub const AppModel = struct {
         self.clearStreamChunks();
         if (self.transfer_job) |job| job.destroy();
         if (self.completion_prefix.len != 0) self.allocator.free(self.completion_prefix);
+        if (self.completion_match.len != 0) self.allocator.free(self.completion_match);
         self.protocol_tree.deinit();
         self.filter.deinit();
         self.command.deinit();
@@ -324,6 +341,39 @@ pub const AppModel = struct {
         self.pending_global_frame = mark.frame;
         try self.openCapture(mark.path);
         return true;
+    }
+
+    pub fn applyMark(self: *AppModel, label: u8, global: bool, jump: bool) !void {
+        if (!jump) {
+            if (global) {
+                self.session.markGlobal(label);
+                if (self.capturePath()) |path| {
+                    if (self.session.selectedFrame()) |frame| {
+                        try self.config.setGlobalMark(label, path, frame);
+                        self.persistConfig();
+                    }
+                }
+            } else {
+                self.session.markLocal(label);
+            }
+            try self.showMessage("Mark set");
+            return;
+        }
+        const found = if (global)
+            try self.jumpGlobalMark(label)
+        else
+            self.session.jumpToMark(label, false);
+        if (found) {
+            self.syncFromSession();
+            try self.loadDetailForSelection();
+        } else {
+            try self.showMessage("Mark not set");
+        }
+    }
+
+    fn runProcess(self: *AppModel, argv: []const []const u8) !process_mod.RunOutput {
+        if (self.process_runner) |run| return run(self.allocator, self.io, argv);
+        return process_mod.runCapture(self.allocator, self.io, argv);
     }
 
     fn onHeaderMenu(userdata: ?*anyopaque, menu: header_bar.HeaderBar.Menu) void {
@@ -394,12 +444,13 @@ pub const AppModel = struct {
         const expanded = try macros_feature.expand(self.allocator, self.config, text);
         defer self.allocator.free(expanded);
         self.filter.state = .neutral;
-        const ok = try filter_mod.validateDisplayFilter(
+        const ok = try filter_mod.validateDisplayFilterRun(
             self.allocator,
             self.io,
             self.tools.tshark,
             self.empty_pcap,
             expanded,
+            self.process_runner,
         );
         self.filter.state = if (ok) .ok else .bad;
         if (!ok) return;
@@ -515,7 +566,7 @@ pub const AppModel = struct {
         self.fields = try names.toOwnedSlice(self.allocator);
     }
 
-    fn completeFilter(self: *AppModel, forward: bool) !bool {
+    pub fn completeFilter(self: *AppModel, forward: bool) !bool {
         if (!self.fields_ready.load(.acquire) or self.fields.len == 0) return false;
         const text = try self.filter.copyText(self.allocator);
         defer self.allocator.free(text);
@@ -529,11 +580,14 @@ pub const AppModel = struct {
         const token = text[start..];
         if (token.len == 0) return false;
 
-        const continuing = self.completion_prefix.len != 0 and std.mem.startsWith(u8, token, self.completion_prefix);
+        // A cycle continues only while the token is still the last insertion.
+        // Editing to a new stem, even one that shares the old prefix, starts over.
+        const continuing = self.completion_match.len != 0 and std.mem.eql(u8, token, self.completion_match);
         const stem = if (continuing) self.completion_prefix else token;
         if (!continuing) {
+            const prefix = try self.allocator.dupe(u8, token);
             if (self.completion_prefix.len != 0) self.allocator.free(self.completion_prefix);
-            self.completion_prefix = try self.allocator.dupe(u8, token);
+            self.completion_prefix = prefix;
             self.completion_index = 0;
         }
 
@@ -550,6 +604,8 @@ pub const AppModel = struct {
             } else {
                 self.completion_index -= 1;
             }
+        } else if (!forward) {
+            self.completion_index = total - 1;
         } else if (self.completion_index >= total) {
             self.completion_index = 0;
         }
@@ -567,6 +623,9 @@ pub const AppModel = struct {
         const completed = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ text[0..start], chosen });
         defer self.allocator.free(completed);
         try self.filter.setText(completed);
+        const match = try self.allocator.dupe(u8, chosen);
+        if (self.completion_match.len != 0) self.allocator.free(self.completion_match);
+        self.completion_match = match;
         const note = std.fmt.bufPrint(&self.completion_note, " complete {d}/{d}", .{
             self.completion_index + 1,
             total,
@@ -594,7 +653,7 @@ pub const AppModel = struct {
         self.fields_cancelled.store(false, .release);
     }
 
-    fn processLoaderEvents(self: *AppModel) !void {
+    pub fn processLoaderEvents(self: *AppModel) !void {
         const events = try self.loader.drainEvents();
         defer self.allocator.free(events);
         for (events) |*ev| {
@@ -733,7 +792,7 @@ pub const AppModel = struct {
         try self.showMessage(buffer.items);
     }
 
-    fn runCommand(self: *AppModel, cmd: []const u8, args: []const u8) !void {
+    pub fn runCommand(self: *AppModel, cmd: []const u8, args: []const u8) !void {
         if (std.mem.eql(u8, cmd, "quit")) {
             self.quit_confirm = true;
             self.overlay = .quit;
@@ -871,6 +930,7 @@ pub const AppModel = struct {
                 index,
                 proto,
                 mode,
+                self.process_runner,
             );
             defer self.allocator.free(body);
             try self.showStream(proto, index, body);
@@ -1055,12 +1115,13 @@ pub const AppModel = struct {
             try self.showMessage("Display-filter search requires a seekable capture file");
             return;
         };
-        if (!try filter_mod.validateDisplayFilter(
+        if (!try filter_mod.validateDisplayFilterRun(
             self.allocator,
             self.io,
             self.tools.tshark,
             self.empty_pcap,
             filter,
+            self.process_runner,
         )) {
             try self.showMessage("Invalid display filter");
             return;
@@ -1091,7 +1152,7 @@ pub const AppModel = struct {
             try argv.append(self.allocator, decode_as);
         }
 
-        var output = try process_mod.runCapture(self.allocator, self.io, argv.slice());
+        var output = try self.runProcess(argv.slice());
         defer output.deinit(self.allocator);
         if (!output.term.success()) {
             try self.showMessage(if (output.stderr.len != 0) output.stderr else "Filter search failed");
@@ -1138,8 +1199,14 @@ pub const AppModel = struct {
         const name = std.mem.trim(u8, trimmed[0..separator], " \t");
         const value = std.mem.trim(u8, trimmed[separator + 1 ..], " \t");
         self.config.applySetting(name, value) catch |err| switch (err) {
-            error.UnknownSetting => try self.showMessage("Unknown setting. :set lists them."),
-            error.InvalidValue => try self.showMessage("That value is not valid for the setting."),
+            error.UnknownSetting => {
+                try self.showMessage("Unknown setting. :set lists them.");
+                return;
+            },
+            error.InvalidValue => {
+                try self.showMessage("That value is not valid for the setting.");
+                return;
+            },
             else => return err,
         };
         if (std.mem.eql(u8, name, "packet-colors")) {
@@ -1318,7 +1385,7 @@ pub const AppModel = struct {
     fn showConversations(self: *AppModel, path: []const u8, proto: []const u8) !void {
         var argv = try process_mod.argvConversations(self.allocator, self.tools.tshark, path, proto);
         defer argv.deinit(self.allocator);
-        var out = try process_mod.runCapture(self.allocator, self.io, argv.slice());
+        var out = try self.runProcess(argv.slice());
         defer out.deinit(self.allocator);
         self.clearConversations();
         if (self.conversation_proto.len != 0) self.allocator.free(self.conversation_proto);
@@ -1345,7 +1412,7 @@ pub const AppModel = struct {
         try self.showPick("Conversations  Enter filters the list", owned, .convs);
     }
 
-    fn activatePick(self: *AppModel) !void {
+    pub fn activatePick(self: *AppModel) !void {
         switch (self.overlay) {
             .convs => {
                 const index = self.help_overlay.selected;
@@ -1858,29 +1925,7 @@ pub const AppModel = struct {
                     if (lower >= 'a' and lower <= 'z') {
                         const is_global = key.mods.shift or (raw.? >= 'A' and raw.? <= 'Z');
                         const ch = if (is_global) std.ascii.toUpper(lower) else lower;
-                        if (self.awaiting_mark) {
-                            if (is_global) {
-                                self.session.markGlobal(ch);
-                                if (self.capturePath()) |path| {
-                                    if (self.session.selectedFrame()) |frame| {
-                                        try self.config.setGlobalMark(ch, path, frame);
-                                    self.persistConfig();
-                                    }
-                                }
-                            } else {
-                                self.session.markLocal(ch);
-                            }
-                            try self.showMessage("Mark set");
-                        } else if (if (is_global)
-                            try self.jumpGlobalMark(ch)
-                        else
-                            self.session.jumpToMark(ch, false))
-                        {
-                            self.syncFromSession();
-                            try self.loadDetailForSelection();
-                        } else {
-                            try self.showMessage("Mark not set");
-                        }
+                        try self.applyMark(ch, is_global, self.awaiting_jump);
                         self.awaiting_mark = false;
                         self.awaiting_jump = false;
                         return ctx.consumeAndRedraw();
@@ -2162,4 +2207,3 @@ fn drawDivider(ctx: vxfw.DrawContext, width: u16, theme: theme_mod.Theme) std.me
     }
     return surf;
 }
-

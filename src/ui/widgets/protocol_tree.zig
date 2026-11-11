@@ -29,6 +29,8 @@ pub const ProtocolTree = struct {
     userdata: ?*anyopaque = null,
     onSelect: ?*const fn (?*anyopaque, usize, usize) void = null,
     onFocus: ?*const fn (?*anyopaque) void = null,
+    /// When set, incremented once per `selectCovering` call.
+    cover_probe: ?*usize = null,
 
     pub fn init(allocator: std.mem.Allocator, theme: theme_mod.Theme) ProtocolTree {
         return .{
@@ -177,6 +179,7 @@ pub const ProtocolTree = struct {
     /// Expand every ancestor of the tightest field covering `offset` and select it.
     /// This is the termshark hex-cursor → protocol-tree jump.
     pub fn selectCovering(self: *ProtocolTree, offset: usize) void {
+        if (self.cover_probe) |probe| probe.* += 1;
         const root = self.root orelse return;
         var current: *const packet.DetailNode = root;
         var target: ?*const packet.DetailNode = null;

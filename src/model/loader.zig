@@ -57,6 +57,10 @@ pub const CaptureLoader = struct {
     detail_generation: std.atomic.Value(u64) = .init(0),
     cancel_token: process.CancellationToken = .{},
     live_child: ?std.process.Child = null,
+    /// Headless tests record the PSML argv and skip worker threads.
+    defer_spawn: bool = false,
+    psml_argv: process.Argv = .{},
+    has_psml_argv: bool = false,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -83,6 +87,7 @@ pub const CaptureLoader = struct {
 
     pub fn deinit(self: *CaptureLoader, io: std.Io) void {
         self.cancel_token.cancel(io);
+        if (self.has_psml_argv) self.psml_argv.deinit(self.allocator);
         if (self.live_child) |*child| child.kill(io);
         for (self.workers.items) |worker| worker.join();
         self.workers.deinit(self.allocator);
@@ -123,6 +128,13 @@ pub const CaptureLoader = struct {
         try appendDissectionOptions(self.allocator, &argv, session, self.config.tshark_args);
         if (self.tools.supports_color) try argv.append(self.allocator, "--color");
 
+        if (self.defer_spawn) {
+            if (self.has_psml_argv) self.psml_argv.deinit(self.allocator);
+            self.psml_argv = argv;
+            self.has_psml_argv = true;
+            return;
+        }
+
         const task = try self.allocator.create(PsmlTask);
         errdefer self.allocator.destroy(task);
         task.* = .{
@@ -140,6 +152,7 @@ pub const CaptureLoader = struct {
         session: *session_mod.Session,
         frame: u32,
     ) !void {
+        if (self.defer_spawn) return;
         const path = self.filePath(session) orelse return error.NoCaptureFile;
         session.loading = .loading_detail;
         self.cancel_token.cancel(self.io);

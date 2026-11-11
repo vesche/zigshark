@@ -8,12 +8,26 @@ pub fn validateDisplayFilter(
     empty_pcap: []const u8,
     filter: []const u8,
 ) !bool {
+    return validateDisplayFilterRun(allocator, io, tshark, empty_pcap, filter, null);
+}
+
+pub fn validateDisplayFilterRun(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    tshark: []const u8,
+    empty_pcap: []const u8,
+    filter: []const u8,
+    runner: ?process.Runner,
+) !bool {
     if (filter.len == 0) return true;
 
     var argv = try process.argvFilterValidate(allocator, tshark, empty_pcap, filter);
     defer argv.deinit(allocator);
 
-    var out = try process.runCapture(allocator, io, argv.slice());
+    var out = if (runner) |run|
+        try run(allocator, io, argv.slice())
+    else
+        try process.runCapture(allocator, io, argv.slice());
     defer out.deinit(allocator);
 
     if (out.term.success()) return true;
@@ -26,7 +40,7 @@ pub fn validateDisplayFilter(
         return false;
     }
 
-  // Non-zero exit without syntax hints still means invalid for empty capture.
+    // Non-zero exit without syntax hints still means invalid for empty capture.
     return false;
 }
 
@@ -42,7 +56,7 @@ test "empty filter is valid" {
 
 test "filter validation with tshark" {
     const io = std.testing.io;
-  const tools = @import("tools.zig");
+    const tools = @import("tools.zig");
     if (!tools.tsharkAvailable(io)) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;

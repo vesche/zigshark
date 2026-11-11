@@ -241,3 +241,59 @@ test "conversation display filter includes both ports" {
     try std.testing.expect(std.mem.indexOf(u8, filter, "tcp.port == 12345") != null);
     try std.testing.expect(std.mem.indexOf(u8, filter, "tcp.port == 80") != null);
 }
+
+fn sampleConversation(allocator: std.mem.Allocator, a: []const u8, b: []const u8, port_a: ?u16, port_b: ?u16) !Conversation {
+    return .{
+        .addr_a = try allocator.dupe(u8, a),
+        .port_a = port_a,
+        .addr_b = try allocator.dupe(u8, b),
+        .port_b = port_b,
+        .frames_ab = 1,
+        .bytes_ab = 1,
+        .frames_ba = 1,
+        .bytes_ba = 1,
+        .frames_total = 2,
+        .bytes_total = 2,
+        .rel_start = 0,
+        .duration = 0,
+    };
+}
+
+test "conversation display filters for udp eth ip and ipv6" {
+    const alloc = std.testing.allocator;
+    var udp = try sampleConversation(alloc, "10.0.0.1", "10.0.0.2", 12345, 53);
+    defer udp.deinit(alloc);
+    const udp_filter = try displayFilter(alloc, udp, "udp");
+    defer alloc.free(udp_filter);
+    try std.testing.expectEqualStrings(
+        "(ip.addr == 10.0.0.1 and ip.addr == 10.0.0.2) and (udp.port == 12345 and udp.port == 53)",
+        udp_filter,
+    );
+
+    var eth = try sampleConversation(alloc, "aa:bb:cc:dd:ee:ff", "11:22:33:44:55:6a", null, null);
+    defer eth.deinit(alloc);
+    const eth_filter = try displayFilter(alloc, eth, "eth");
+    defer alloc.free(eth_filter);
+    try std.testing.expectEqualStrings(
+        "eth.addr == aa:bb:cc:dd:ee:ff and eth.addr == 11:22:33:44:55:6a",
+        eth_filter,
+    );
+
+    var ip = try sampleConversation(alloc, "10.1.1.1", "10.2.2.2", null, null);
+    defer ip.deinit(alloc);
+    const ip_filter = try displayFilter(alloc, ip, "ip");
+    defer alloc.free(ip_filter);
+    try std.testing.expectEqualStrings(
+        "ip.addr == 10.1.1.1 and ip.addr == 10.2.2.2",
+        ip_filter,
+    );
+
+    var ipv6 = try sampleConversation(alloc, "2001:db8::a", "2001:db8::b", null, null);
+    defer ipv6.deinit(alloc);
+    const ipv6_filter = try displayFilter(alloc, ipv6, "ipv6");
+    defer alloc.free(ipv6_filter);
+    try std.testing.expectEqualStrings(
+        "ipv6.addr == 2001:db8::a and ipv6.addr == 2001:db8::b",
+        ipv6_filter,
+    );
+}
