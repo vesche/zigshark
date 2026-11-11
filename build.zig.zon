@@ -1,0 +1,21 @@
+.{
+    .name = .zigshark,
+    .version = "0.1.0",
+    .fingerprint = 0x9df123a5d72ba06d,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .vaxis = .{
+            .url = "git+https://github.com/rockorager/libvaxis.git#c6c23fbda5b2fb2aa277fe4c02b4efb27bb4e376",
+            .hash = "vaxis-0.6.0-BWNV_PW0DQAHFemkOYfxWOatp7EmUgBajplto8z86mjG",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+        "docs",
+        "LICENSE",
+        "README.md",
+    },
+}

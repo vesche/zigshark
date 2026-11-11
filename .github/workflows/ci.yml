@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Install tshark (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tshark || sudo apt-get install -y wireshark-common
+
+      - name: Install tshark (macOS)
+        if: runner.os == 'macOS'
+        run: brew install wireshark || true
+
+      - name: Build
+        run: zig build
+
+      - name: Test
+        run: zig build test
+
+      - name: PTY render and Ctrl-C smoke test
+        if: runner.os == 'Linux'
+        run: python3 tests/pty_smoke.py
+
+      - name: Optimized build
+        run: zig build -Doptimize=ReleaseSafe
