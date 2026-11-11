@@ -9,27 +9,23 @@ pub const Config = struct {
     tshark: []u8 = &.{},
     dumpcap: []u8 = &.{},
     capinfos: []u8 = &.{},
-    capture_command: []u8 = &.{},
-    tail_command: []u8 = &.{},
     tshark_args: []u8 = &.{},
 
     always_keep_pcap: bool = false,
     auto_scroll: bool = true,
     pcap_bundle_size: u32 = 1000,
     pcap_cache_size: u32 = 64,
-    disk_cache_size_mb: u32 = 64,
-    ui_cache_size: u32 = 1000,
-    stream_cache_size: u32 = 32,
 
     dark_mode: bool = true,
     packet_colors: bool = true,
     layout: Layout = .stacked,
-    disable_shark_fin: bool = false,
     stream_view: []u8 = &.{},
     theme: []u8 = &.{},
 
     column_format: []u8 = &.{},
     tls_keylog_file: []u8 = &.{},
+    /// tshark `-N` flags. Empty leaves name resolution off.
+    name_resolution: []u8 = &.{},
     conv_types: []u8 = &.{},
     conv_absolute_time: bool = false,
     conv_resolve_names: bool = true,
@@ -75,6 +71,7 @@ pub const Config = struct {
         label: u8,
         path: []u8,
         frame: u32,
+        note: []u8 = &.{},
     };
 
     pub fn deinit(self: *Config) void {
@@ -98,19 +95,22 @@ pub const Config = struct {
             self.allocator.free(rule.filter);
         }
         self.color_rules.deinit(self.allocator);
-        for (self.global_marks.items) |mark| self.allocator.free(mark.path);
+        for (self.global_marks.items) |mark| {
+            self.allocator.free(mark.path);
+            if (mark.note.len != 0) self.allocator.free(mark.note);
+        }
         self.global_marks.deinit(self.allocator);
     }
 
     fn freeOwned(self: *Config) void {
         const fields = .{
             "tshark",                  "dumpcap",                "capinfos",
-            "capture_command",         "tail_command",           "tshark_args",
+            "tshark_args",
             "stream_view",             "theme",                  "column_format",
             "conv_types",              "search_type",            "search_target",
             "copy_command",            "browse_command",         "pager",
             "wormhole_rendezvous_url", "wormhole_transit_relay", "profile",
-            "wireshark_profile",       "tls_keylog_file",
+            "wireshark_profile",       "tls_keylog_file",        "name_resolution",
         };
         inline for (fields) |name| {
             const ptr = &@field(self, name);
@@ -126,7 +126,6 @@ pub const Config = struct {
         cfg.tshark = try allocator.dupe(u8, "tshark");
         cfg.dumpcap = try allocator.dupe(u8, "dumpcap");
         cfg.capinfos = try allocator.dupe(u8, "capinfos");
-        cfg.tail_command = try allocator.dupe(u8, "tail");
         cfg.stream_view = try allocator.dupe(u8, "hex");
         cfg.search_type = try allocator.dupe(u8, "filter");
         cfg.search_target = try allocator.dupe(u8, "list");
@@ -163,15 +162,9 @@ pub const Config = struct {
         try w.print("auto-scroll = {}\n", .{self.auto_scroll});
         try w.print("pcap-bundle-size = {d}\n", .{self.pcap_bundle_size});
         try w.print("pcap-cache-size = {d}\n", .{self.pcap_cache_size});
-        try w.print("disk-cache-size-mb = {d}\n", .{self.disk_cache_size_mb});
-        try w.print("ui-cache-size = {d}\n", .{self.ui_cache_size});
-        try w.print("stream-cache-size = {d}\n", .{self.stream_cache_size});
-        try w.print("disable-shark-fin = {}\n", .{self.disable_shark_fin});
         try w.print("stream-view = \"{s}\"\n", .{self.stream_view});
         try w.print("conv-absolute-time = {}\n", .{self.conv_absolute_time});
         if (self.tshark_args.len != 0) try w.print("tshark-args = \"{s}\"\n", .{self.tshark_args});
-        if (self.capture_command.len != 0) try w.print("capture-command = \"{s}\"\n", .{self.capture_command});
-        if (self.tail_command.len != 0) try w.print("tail-command = \"{s}\"\n", .{self.tail_command});
         if (self.wormhole_rendezvous_url.len != 0) try w.print("wormhole-rendezvous-url = \"{s}\"\n", .{self.wormhole_rendezvous_url});
         if (self.wormhole_transit_relay.len != 0) try w.print("wormhole-transit-relay = \"{s}\"\n", .{self.wormhole_transit_relay});
         try w.print("dark-mode = {}\n", .{self.dark_mode});
@@ -190,6 +183,7 @@ pub const Config = struct {
         try w.print("wormhole-length = {d}\n", .{self.wormhole_length});
         try w.print("profile = \"{s}\"\n", .{self.profile});
         if (self.column_format.len != 0) try w.print("column-format = \"{s}\"\n", .{self.column_format});
+        if (self.name_resolution.len != 0) try w.print("name-resolution = \"{s}\"\n", .{self.name_resolution});
         if (self.copy_command.len != 0) try w.print("copy-command = \"{s}\"\n", .{self.copy_command});
         if (self.browse_command.len != 0) try w.print("browse-command = \"{s}\"\n", .{self.browse_command});
         if (self.pager.len != 0) try w.print("pager = \"{s}\"\n", .{self.pager});
@@ -224,11 +218,20 @@ pub const Config = struct {
         if (self.global_marks.items.len != 0) {
             try w.writeAll("\n[marks]\n");
             for (self.global_marks.items) |mark| {
-                try w.print("\"{c}\" = \"{d}|{s}\"\n", .{
-                    mark.label,
-                    mark.frame,
-                    mark.path,
-                });
+                if (mark.note.len == 0) {
+                    try w.print("\"{c}\" = \"{d}|{s}\"\n", .{
+                        mark.label,
+                        mark.frame,
+                        mark.path,
+                    });
+                } else {
+                    try w.print("\"{c}\" = \"{d}|{s}|{s}\"\n", .{
+                        mark.label,
+                        mark.frame,
+                        mark.path,
+                        mark.note,
+                    });
+                }
             }
         }
 
@@ -286,10 +289,15 @@ pub const Config = struct {
             {
                 const separator = std.mem.indexOfScalar(u8, value, '|') orelse continue;
                 const frame = std.fmt.parseInt(u32, value[0..separator], 10) catch continue;
+                const rest = value[separator + 1 ..];
+                const note_at = std.mem.indexOfScalar(u8, rest, '|');
+                const path = if (note_at) |at| rest[0..at] else rest;
+                const note = if (note_at) |at| rest[at + 1 ..] else "";
                 try self.global_marks.append(self.allocator, .{
                     .label = key[0],
                     .frame = frame,
-                    .path = try self.allocator.dupe(u8, value[separator + 1 ..]),
+                    .path = try self.allocator.dupe(u8, path),
+                    .note = try self.allocator.dupe(u8, note),
                 });
             }
         }
@@ -331,6 +339,22 @@ pub const Config = struct {
         });
     }
 
+    pub fn upsertColorRule(self: *Config, name: []const u8, value: []const u8) !void {
+        _ = self.deleteColorRule(name);
+        try self.appendColorRule(name, value);
+    }
+
+    pub fn deleteColorRule(self: *Config, name: []const u8) bool {
+        for (self.color_rules.items, 0..) |rule, index| {
+            if (!std.mem.eql(u8, rule.name, name)) continue;
+            self.allocator.free(rule.name);
+            self.allocator.free(rule.filter);
+            _ = self.color_rules.orderedRemove(index);
+            return true;
+        }
+        return false;
+    }
+
     fn appendColorRule(self: *Config, name: []const u8, value: []const u8) !void {
         var parts = std.mem.splitScalar(u8, value, '|');
         const filter = parts.next() orelse return;
@@ -365,15 +389,10 @@ pub const Config = struct {
             \\dumpcap = {s}
             \\capinfos = {s}
             \\tshark-args = {s}
-            \\capture-command = {s}
-            \\tail-command = {s}
             \\always-keep-pcap = {}
             \\auto-scroll = {}
             \\pcap-bundle-size = {d}
             \\pcap-cache-size = {d}
-            \\disk-cache-size-mb = {d}
-            \\ui-cache-size = {d}
-            \\stream-cache-size = {d}
             \\dark-mode = {}
             \\packet-colors = {}
             \\layout = {s}
@@ -399,15 +418,10 @@ pub const Config = struct {
             self.dumpcap,
             self.capinfos,
             self.tshark_args,
-            self.capture_command,
-            self.tail_command,
             self.always_keep_pcap,
             self.auto_scroll,
             self.pcap_bundle_size,
             self.pcap_cache_size,
-            self.disk_cache_size_mb,
-            self.ui_cache_size,
-            self.stream_cache_size,
             self.dark_mode,
             self.packet_colors,
             @tagName(self.layout),
@@ -434,6 +448,7 @@ pub const Config = struct {
             \\wormhole-transit-relay = {s}
             \\wireshark-profile = {s}
             \\tls-keylog-file = {s}
+            \\name-resolution = {s}
             \\
         , .{
             self.wormhole_length,
@@ -441,6 +456,7 @@ pub const Config = struct {
             self.wormhole_transit_relay,
             self.wireshark_profile,
             self.tls_keylog_file,
+            self.name_resolution,
         });
         return writer.toOwnedSlice();
     }
@@ -454,10 +470,6 @@ pub const Config = struct {
             try replaceOwned(self.allocator, &self.capinfos, value);
         } else if (std.mem.eql(u8, key, "tshark-args")) {
             try replaceOwned(self.allocator, &self.tshark_args, value);
-        } else if (std.mem.eql(u8, key, "capture-command")) {
-            try replaceOwned(self.allocator, &self.capture_command, value);
-        } else if (std.mem.eql(u8, key, "tail-command")) {
-            try replaceOwned(self.allocator, &self.tail_command, value);
         } else if (std.mem.eql(u8, key, "always-keep-pcap")) {
             self.always_keep_pcap = parseBool(value);
         } else if (std.mem.eql(u8, key, "auto-scroll")) {
@@ -466,14 +478,6 @@ pub const Config = struct {
             self.pcap_bundle_size = std.fmt.parseInt(u32, value, 10) catch return error.InvalidValue;
         } else if (std.mem.eql(u8, key, "pcap-cache-size")) {
             self.pcap_cache_size = std.fmt.parseInt(u32, value, 10) catch return error.InvalidValue;
-        } else if (std.mem.eql(u8, key, "disk-cache-size-mb")) {
-            self.disk_cache_size_mb = std.fmt.parseInt(u32, value, 10) catch return error.InvalidValue;
-        } else if (std.mem.eql(u8, key, "ui-cache-size")) {
-            self.ui_cache_size = std.fmt.parseInt(u32, value, 10) catch return error.InvalidValue;
-        } else if (std.mem.eql(u8, key, "stream-cache-size")) {
-            self.stream_cache_size = std.fmt.parseInt(u32, value, 10) catch return error.InvalidValue;
-        } else if (std.mem.eql(u8, key, "disable-shark-fin")) {
-            self.disable_shark_fin = parseBool(value);
         } else if (std.mem.eql(u8, key, "dark-mode")) {
             self.dark_mode = parseBool(value);
         } else if (std.mem.eql(u8, key, "packet-colors")) {
@@ -524,6 +528,10 @@ pub const Config = struct {
             try replaceOwned(self.allocator, &self.wireshark_profile, value);
         } else if (std.mem.eql(u8, key, "tls-keylog-file")) {
             try replaceOwned(self.allocator, &self.tls_keylog_file, value);
+        } else if (std.mem.eql(u8, key, "name-resolution")) {
+            if (!validNameFlags(value)) return error.InvalidValue;
+            const stored = if (std.mem.eql(u8, value, "off") or std.mem.eql(u8, value, "none")) "" else value;
+            try replaceOwned(self.allocator, &self.name_resolution, stored);
         } else return false;
         return true;
     }
@@ -575,7 +583,7 @@ pub const Config = struct {
         try replaceOwned(self.allocator, &self.column_format, format);
     }
 
-    pub fn setGlobalMark(self: *Config, label: u8, path: []const u8, frame: u32) !void {
+    pub fn setGlobalMark(self: *Config, label: u8, path: []const u8, frame: u32, note: ?[]const u8) !void {
         if (label < 'A' or label > 'Z') return;
         for (self.global_marks.items) |*mark| {
             if (mark.label == label) {
@@ -583,6 +591,7 @@ pub const Config = struct {
                 self.allocator.free(mark.path);
                 mark.path = copy;
                 mark.frame = frame;
+                if (note) |text| try replaceOwned(self.allocator, &mark.note, text);
                 return;
             }
         }
@@ -590,7 +599,16 @@ pub const Config = struct {
             .label = label,
             .path = try self.allocator.dupe(u8, path),
             .frame = frame,
+            .note = try self.allocator.dupe(u8, note orelse ""),
         });
+    }
+
+    fn validNameFlags(value: []const u8) bool {
+        if (value.len == 0 or std.mem.eql(u8, value, "off") or std.mem.eql(u8, value, "none")) return true;
+        for (value) |char| {
+            if (std.mem.indexOfScalar(u8, "dmnNtv", char) == null) return false;
+        }
+        return true;
     }
 
     pub fn getGlobalMark(self: *const Config, label: u8) ?GlobalMark {
@@ -651,11 +669,11 @@ test "parse toml config" {
     try std.testing.expectEqual(@as(u32, 42), cfg.getGlobalMark('A').?.frame);
     try std.testing.expectEqualStrings("/tmp/a.pcap", cfg.getGlobalMark('A').?.path);
     try cfg.applySetting("tshark-args", "-o tcp.check_checksum:true");
-    try cfg.applySetting("disk-cache-size-mb", "32");
     try cfg.applySetting("copy-command", "wl-copy");
     try std.testing.expectError(error.UnknownSetting, cfg.applySetting("nope", "1"));
+    try std.testing.expectError(error.UnknownSetting, cfg.applySetting("disk-cache-size-mb", "32"));
+    try std.testing.expectError(error.UnknownSetting, cfg.applySetting("tail-command", "tail"));
     try std.testing.expectEqualStrings("-o tcp.check_checksum:true", cfg.tshark_args);
-    try std.testing.expectEqual(@as(u32, 32), cfg.disk_cache_size_mb);
 
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -666,6 +684,5 @@ test "parse toml config" {
     var loaded = try Config.loadOrDefault(allocator, io, path);
     defer loaded.deinit();
     try std.testing.expectEqualStrings("wl-copy", loaded.copy_command);
-    try std.testing.expectEqual(@as(u32, 32), loaded.disk_cache_size_mb);
     try std.testing.expect(!loaded.dark_mode);
 }

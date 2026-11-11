@@ -28,12 +28,24 @@ pub const text =
     \\< / >             Resize tree / hex
     \\m[a-z] / '[a-z]   Set / jump local mark
     \\m[A-Z] / '[A-Z]   Set / jump global mark
+    \\:mark <label>     Mark this frame and store a one-line note
+    \\[ ]               Previous / next packet in this conversation
+    \\{ }               Previous / next packet with this source address
+    \\p                 Other side of a request/response
+    \\Ctrl-P / :back    Previous display filter
+    \\:streams          Follow a stream. Enter jumps to the frame, or guesses
+    \\:set name-resolution  tshark -N flags. off clears them
+    \\:iograph [secs]   Packets per interval. Enter filters that range
+    \\:dns / :http      Name or request rows. Enter filters
+    \\:compare <file>   Frames that differ. Enter selects one here
+    \\:color            List, save, or delete a coloring rule
+    \\:comment [text]   Read or write this frame's pcapng comment
+    \\:lua <script>     Run a tshark Lua script on this capture
     \\Ctrl-F            Search focused pane
     \\:search-regex     . * + ? [] ^ $ across list, tree, or hex
     \\:search-filter    Jump to the next packet matching a filter
     \\Tab / Shift-Tab   Cycle display-filter field names
     \\:convs            Conversations; j/k and Enter apply a filter
-    \\:streams          Follow this packet's stream; Enter filters it
     \\:profile          list, create, use, delete
     \\:theme list       Bundled and installed theme packs
     \\n / N             Next / previous search hit

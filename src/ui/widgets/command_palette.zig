@@ -19,6 +19,13 @@ pub const defaultCommands = [_]CommandDef{
     .{ .name = "decode-as", .description = "Decode the selected packet, or add a raw rule", .usage = ":decode-as [layer==selector,protocol]" },
     .{ .name = "hierarchy", .description = "Protocol hierarchy; Enter filters", .usage = ":hierarchy" },
     .{ .name = "endpoints", .description = "Loudest addresses; Enter filters", .usage = ":endpoints [tcp|udp|ip|ipv6|eth]" },
+    .{ .name = "iograph", .description = "Packets per interval", .usage = ":iograph [seconds]" },
+    .{ .name = "dns", .description = "DNS names; Enter filters", .usage = ":dns" },
+    .{ .name = "http", .description = "HTTP requests and responses; Enter filters", .usage = ":http" },
+    .{ .name = "compare", .description = "Frames whose identity differs from another file", .usage = ":compare <file.pcap>" },
+    .{ .name = "color", .description = "Add or delete a coloring rule", .usage = ":color [name filter|#fg|#bg|delete name]" },
+    .{ .name = "comment", .description = "Read or write this frame's pcapng comment", .usage = ":comment [text]" },
+    .{ .name = "lua", .description = "Run a tshark Lua script on this capture", .usage = ":lua <script.lua>" },
     .{ .name = "export", .description = "Write packets, one packet, json, csv, or objects", .usage = ":export packets|packet|json|csv <path> | objects http|smb <dir>" },
     .{ .name = "timestamp", .description = "Set tshark timestamp format", .usage = ":timestamp a|ad|adoy|d|dd|e|r|u|ud|udoy" },
     .{ .name = "search", .description = "Search packet list", .usage = ":search <text>" },
@@ -43,6 +50,9 @@ pub const defaultCommands = [_]CommandDef{
     .{ .name = "recent-filter", .description = "Apply a numbered recent filter", .usage = ":recent-filter <number>" },
     .{ .name = "filters", .description = "Apply a saved filter", .usage = ":filters [name|save <name>|delete <name>]" },
     .{ .name = "marks", .description = "List marks", .usage = ":marks" },
+    .{ .name = "mark", .description = "Mark this frame with a note", .usage = ":mark <label> [note]" },
+    .{ .name = "related", .description = "Jump to a related packet", .usage = ":related [conv|addr|pair] [next|prev]" },
+    .{ .name = "back", .description = "Restore the previous display filter", .usage = ":back" },
     .{ .name = "set", .description = "List or change any config setting", .usage = ":set [<key> <value>]" },
     .{ .name = "profile", .description = "Switch profile", .usage = ":profile [list|create|use|delete] <name>" },
     .{ .name = "wormhole", .description = "Send file via wormhole", .usage = ":wormhole [file]" },
@@ -116,9 +126,8 @@ pub const CommandPalette = struct {
     fn matching(self: *CommandPalette, arena: std.mem.Allocator) ![]usize {
         const raw = filter_bar.fieldText(arena, &self.field) catch return error.OutOfMemory;
         defer arena.free(raw);
-        const needle = std.mem.trim(u8, raw, " \t");
-        const parsed = parseCommandLine(needle);
-        const q = if (std.mem.startsWith(u8, parsed.cmd, "")) parsed.cmd else needle;
+        const parsed = parseCommandLine(std.mem.trim(u8, raw, " \t"));
+        const q = parsed.cmd;
         var list: std.ArrayList(usize) = .empty;
         for (self.commands, 0..) |cmd, i| {
             if (fuzzyMatch(cmd.name, q) or fuzzyMatch(cmd.description, q))
@@ -228,6 +237,28 @@ pub const CommandPalette = struct {
         return surf;
     }
 };
+
+test "palette needle is the parsed command" {
+    const allocator = std.testing.allocator;
+    var palette = CommandPalette.init(allocator, theme_mod.dark());
+    defer palette.deinit();
+    try palette.setText(":fil extra");
+    const matches = try palette.matching(allocator);
+    defer allocator.free(matches);
+    var saw_filter = false;
+    var saw_quit = false;
+    for (matches) |index| {
+        if (std.mem.eql(u8, palette.commands[index].name, "filter")) saw_filter = true;
+        if (std.mem.eql(u8, palette.commands[index].name, "quit")) saw_quit = true;
+    }
+    try std.testing.expect(saw_filter);
+    try std.testing.expect(!saw_quit);
+
+    try palette.setText("");
+    const all = try palette.matching(allocator);
+    defer allocator.free(all);
+    try std.testing.expectEqual(palette.commands.len, all.len);
+}
 
 test "fuzzy match" {
     try std.testing.expect(fuzzyMatch("clear-filter", "clf"));

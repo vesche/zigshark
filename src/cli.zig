@@ -103,7 +103,6 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) !Options {
             opts.log_tty = true;
         } else if (std.mem.eql(u8, arg, "--tty")) {
             opts.force_tty = true;
-            if (i + 1 < args.len and args[i + 1].len > 0 and args[i + 1][0] != '-') i += 1;
         } else if (arg.len > 0 and arg[0] != '-') {
             if (!saw_command and (std.mem.eql(u8, arg, "help") or std.mem.eql(u8, arg, "version"))) {
                 if (std.mem.eql(u8, arg, "help")) {
@@ -171,7 +170,7 @@ pub fn printHelp(writer: *std.Io.Writer) !void {
         \\  -C, --profile NAME     Use named zigshark profile
         \\  -D, interfaces         List capture interfaces
         \\  --pass-thru[=auto]     Pass through to tshark when not a TTY
-        \\  --tty [PATH]           Force the UI on the controlling terminal
+        \\  --tty                  Force the UI on the controlling terminal
         \\  --log-tty              Mirror logs to stderr
         \\  -v, --version          Print version (-vv includes tshark)
         \\  -h, --help             Show this help

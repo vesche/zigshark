@@ -8,6 +8,8 @@ const text_util = @import("text_util.zig");
 pub const StatusBar = struct {
     theme: theme_mod.Theme,
     packet_count: usize = 0,
+    /// Unfiltered capture size, when a full load has been seen.
+    packet_total: ?usize = null,
     selected_index: ?usize = null,
     selected_frame: ?u32 = null,
     loading: session_mod.LoadingState = .idle,
@@ -22,6 +24,7 @@ pub const StatusBar = struct {
     live: bool = false,
     expert_count: usize = 0,
     tls_keys: bool = false,
+    names: bool = false,
     time_zero: ?u32 = null,
 
     pub fn format(self: *const StatusBar, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
@@ -33,7 +36,21 @@ pub const StatusBar = struct {
             try writeAll(out, "  ");
         }
         if (self.selected_index) |index| {
-            try print(out, "frame {d}/{d}", .{ index + 1, self.packet_count });
+            if (self.packet_total) |total| {
+                if (total != self.packet_count) {
+                    try print(out, "frame {d}/{d} of {d}", .{ index + 1, self.packet_count, total });
+                } else {
+                    try print(out, "frame {d}/{d}", .{ index + 1, self.packet_count });
+                }
+            } else {
+                try print(out, "frame {d}/{d}", .{ index + 1, self.packet_count });
+            }
+        } else if (self.packet_total) |total| {
+            if (total != self.packet_count) {
+                try print(out, "frame -/{d} of {d}", .{ self.packet_count, total });
+            } else {
+                try print(out, "frame -/{d}", .{self.packet_count});
+            }
         } else {
             try print(out, "frame -/{d}", .{self.packet_count});
         }
@@ -43,6 +60,7 @@ pub const StatusBar = struct {
         if (self.expert_count != 0) try print(out, "  expert {d}", .{self.expert_count});
         if (self.time_zero) |frame| try print(out, "  t0 {d}", .{frame});
         if (self.tls_keys) try writeAll(out, "  tls-keys");
+        if (self.names) try writeAll(out, "  names");
         if (self.hint.len != 0) try print(out, "  {s}", .{self.hint});
         if (self.filter_error.len != 0) try print(out, "  {s}", .{self.filter_error});
         if (self.expansion.len != 0) try print(out, "  → {s}", .{self.expansion});

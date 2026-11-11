@@ -29,7 +29,7 @@ Legend:
 | Layouts and resizing | **done** | Vertical list/tree/hex default, side-by-side alternate, keyboard and mouse split resizing |
 | Column formats parser | **done** | Modern two/three-field rows covered |
 | Column editor / arbitrary Wireshark columns | **done** | `:columns default`, `delta`, `absolute`, or `set gui.column.format:...`. The list uses the PSML titles tshark returns. Click a heading to sort |
-| Follow TCP/UDP streams | **done** | `:streams` follows the current packet. Enter on a chunk searches for its first bytes with `frame contains` inside that stream, which jumps to the packet even though tshark's follow text has no frame numbers |
+| Follow TCP/UDP streams | **done** | `:streams` follows the current packet. Yaml follow supplies the frame number and Enter selects it. Without that output, Enter still searches with `frame contains` and the status line says `guess` |
 | Conversations | **done** | `:convs [tcp\|udp\|ip\|ipv6\|eth]` is a selectable list. Enter builds a two-endpoint display filter and applies it |
 | Capinfos | **done** | Scrollable `:capinfo` view |
 | Search list/details/bytes/hex | **done** | Focus-aware `Ctrl-F`, `n`/`N`, literal and hex byte search |

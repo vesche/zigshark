@@ -162,6 +162,7 @@ pub fn main(init: std.process.Init) !void {
     if (cli_opts.timestamp_format) |format| try session.setTimestampFormat(format);
     if (cfg.wireshark_profile.len != 0) try session.setWiresharkProfile(cfg.wireshark_profile);
     if (cfg.tls_keylog_file.len != 0) try session.setTlsKeylog(cfg.tls_keylog_file);
+    if (cfg.name_resolution.len != 0) try session.setNameResolution(cfg.name_resolution);
     for (cli_opts.decode_as.items) |decode_as| try session.addDecodeAs(decode_as);
     if (cli_opts.file) |file| {
         if (!std.mem.eql(u8, file, "-")) try cfg.addRecentFile(file);

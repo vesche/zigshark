@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const tools_mod = @import("../shark/tools.zig");
 const process = @import("../shark/process.zig");
 const packet = @import("packet.zig");
@@ -670,6 +671,10 @@ fn appendDissectionOptions(
         try argv.append(allocator, "-o");
         try argv.append(allocator, option);
     }
+    if (session.name_resolution.len != 0) {
+        try argv.append(allocator, "-N");
+        try argv.append(allocator, session.name_resolution);
+    }
     var extra = std.mem.tokenizeAny(u8, configured_args, " \t\r\n");
     while (extra.next()) |arg| try argv.append(allocator, arg);
 }
@@ -787,46 +792,9 @@ test "asynchronous summary request returns owned event" {
     for (events) |*event| event.deinit(allocator);
 }
 
-const fake_tshark =
-    \\#!/bin/bash
-    \\path=
-    \\prev=
-    \\for arg in "$@"; do
-    \\  if [ "$prev" = "-r" ]; then
-    \\    path=$arg
-    \\  fi
-    \\  prev=$arg
-    \\done
-    \\case "$path" in
-    \\  *hold*)
-    \\    echo started > "$path.started"
-    \\    while [ ! -f "$path.release" ]; do
-    \\      :
-    \\    done
-    \\    printf '%s\n' '<psml><packet><section>1</section></packet></psml>'
-    \\    ;;
-    \\  *slow*)
-    \\    echo started > "$path.started"
-    \\    start=$SECONDS
-    \\    while (( SECONDS - start < 5 )); do
-    \\      :
-    \\    done
-    \\    echo finished > "$path.finished"
-    \\    printf '%s\n' '<psml><packet><section>4</section></packet></psml>'
-    \\    ;;
-    \\  *)
-    \\    printf '%s\n' '<psml><packet><section>9</section></packet></psml>'
-    \\    ;;
-    \\esac
-    \\exit 0
-;
-
-fn writeExecutable(io: std.Io, path: []const u8, body: []const u8) !void {
-    try std.Io.Dir.cwd().writeFile(io, .{
-        .sub_path = path,
-        .data = body,
-        .flags = .{ .permissions = @fromBackingInt(@intCast(0o755)) },
-    });
+fn fakeTsharkPath(allocator: std.mem.Allocator) ![]u8 {
+    const name = if (builtin.os.tag == .windows) "fake-tshark.exe" else "fake-tshark";
+    return std.fmt.allocPrint(allocator, "zig-out/bin/{s}", .{name});
 }
 
 fn waitForPath(io: std.Io, path: []const u8) !void {
@@ -884,17 +852,16 @@ test "stale psml generation is dropped and a second request cancels the first ch
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const script_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/tshark", .{tmp.sub_path[0..]});
-    defer allocator.free(script_path);
+    const tool = try fakeTsharkPath(allocator);
+    defer allocator.free(tool);
     const hold_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/hold.pcap", .{tmp.sub_path[0..]});
     defer allocator.free(hold_path);
     const slow_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/slow.pcap", .{tmp.sub_path[0..]});
     defer allocator.free(slow_path);
     const fast_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/fast.pcap", .{tmp.sub_path[0..]});
     defer allocator.free(fast_path);
-    try writeExecutable(io, script_path, fake_tshark);
 
-    var tools = try testingTools(allocator, script_path);
+    var tools = try testingTools(allocator, tool);
     defer tools.deinit();
     var loader = CaptureLoader.init(allocator, io, &tools, .{});
     defer {
@@ -957,13 +924,12 @@ test "a detail load does not cancel the packet list" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const script_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/tshark", .{tmp.sub_path[0..]});
-    defer allocator.free(script_path);
+    const tool = try fakeTsharkPath(allocator);
+    defer allocator.free(tool);
     const hold_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/hold.pcap", .{tmp.sub_path[0..]});
     defer allocator.free(hold_path);
-    try writeExecutable(io, script_path, fake_tshark);
 
-    var tools = try testingTools(allocator, script_path);
+    var tools = try testingTools(allocator, tool);
     defer tools.deinit();
     var loader = CaptureLoader.init(allocator, io, &tools, .{});
     defer {
@@ -993,6 +959,32 @@ test "a detail load does not cancel the packet list" {
         if (event == .packets_loaded) saw_packets = true;
     }
     try std.testing.expect(saw_packets);
+}
+
+test "deinit returns while a packet-list child is still held" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tool = try fakeTsharkPath(allocator);
+    defer allocator.free(tool);
+    const hold_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/hold.pcap", .{tmp.sub_path[0..]});
+    defer allocator.free(hold_path);
+
+    var tools = try testingTools(allocator, tool);
+    defer tools.deinit();
+    var loader = CaptureLoader.init(allocator, io, &tools, .{});
+    var session = session_mod.Session.init(allocator, .{ .file = hold_path });
+    defer session.deinit();
+    try loader.requestPsml(&session);
+    const started = try std.fmt.allocPrint(allocator, "{s}.started", .{hold_path});
+    defer allocator.free(started);
+    try waitForPath(io, started);
+
+    const before = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    loader.deinit(io);
+    const after = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    try std.testing.expect(after - before < 3 * std.time.ns_per_s);
 }
 
 test "detail cache eviction frees the bundle" {
@@ -1088,37 +1080,17 @@ test "shrinking the detail cache drops the oldest bundle" {
     try std.testing.expect(loader.detail_cache.get(io, 2) != null);
 }
 
-const stream_tshark =
-    \\#!/bin/bash
-    \\path=
-    \\prev=
-    \\for arg in "$@"; do
-    \\  if [ "$prev" = "-r" ]; then
-    \\    path=$arg
-    \\  fi
-    \\  prev=$arg
-    \\done
-    \\echo started > "$path.started"
-    \\printf '%s\n' '<psml><structure><section>No.</section></structure><packet><section>1</section></packet>'
-    \\while [ ! -f "$path.release" ]; do
-    \\  :
-    \\done
-    \\printf '%s\n' '<packet><section>2</section></packet></psml>'
-    \\exit 0
-;
-
 test "psml rows arrive before tshark exits and a later chunk appends" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const script_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/tshark", .{tmp.sub_path[0..]});
-    defer allocator.free(script_path);
+    const tool = try fakeTsharkPath(allocator);
+    defer allocator.free(tool);
     const capture_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/stream.pcap", .{tmp.sub_path[0..]});
     defer allocator.free(capture_path);
-    try writeExecutable(io, script_path, stream_tshark);
 
-    var tools = try testingTools(allocator, script_path);
+    var tools = try testingTools(allocator, tool);
     defer tools.deinit();
     var loader = CaptureLoader.init(allocator, io, &tools, .{ .bundle_size = 1 });
     defer {

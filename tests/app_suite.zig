@@ -38,6 +38,10 @@ const follow_text =
     \\1
     \\00000000  57 6f 72 6c 64
 ;
+const io_stat_text =
+    \\| 0.0 <> 1.0 |      3 |   298 |
+    \\| 1.0 <> 2.0 |      5 |   800 |
+;
 const hierarchy_text =
     \\frame                                    frames:4 bytes:40
     \\  eth                                    frames:4 bytes:40
@@ -103,7 +107,21 @@ fn scriptedRun(
     };
 }
 
+fn argvHas(argv: []const []const u8, needle: []const u8) bool {
+    for (argv) |arg| if (std.mem.eql(u8, arg, needle)) return true;
+    return false;
+}
+
 fn replyFor(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
+    if (argvHas(argv, "dns.qry.name")) return allocator.dupe(u8, "4\texample.com\t0\n");
+    if (argvHas(argv, "http.request.method")) return allocator.dupe(u8, "7\tM-SEARCH\t\t*\t\n");
+    if (argvHas(argv, "frame.comment")) return allocator.dupe(u8, "saved note\n");
+    if (argvHas(argv, "ip.src")) {
+        for (argv) |item| if (std.mem.indexOf(u8, item, "other.pcap") != null) {
+            return allocator.dupe(u8, "9\t10.0.0.9\t10.0.0.8\t\t\t53\t\t40\n");
+        };
+        return allocator.dupe(u8, "1\t10.0.0.1\t10.0.0.2\t80\t\t\t\t60\n2\t10.0.0.9\t10.0.0.8\t\t\t53\t\t40\n");
+    }
     for (argv) |arg| {
         if (std.mem.startsWith(u8, arg, "conv,")) {
             if (std.mem.endsWith(u8, arg, "udp")) return allocator.dupe(u8, udp_conversation);
@@ -114,6 +132,8 @@ fn replyFor(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
         }
         if (std.mem.startsWith(u8, arg, "follow,")) return allocator.dupe(u8, follow_text);
         if (std.mem.eql(u8, arg, "io,phs")) return allocator.dupe(u8, hierarchy_text);
+        if (std.mem.startsWith(u8, arg, "io,stat,")) return allocator.dupe(u8, io_stat_text);
+        if (std.mem.startsWith(u8, arg, "lua_script:")) return allocator.dupe(u8, "lua ok\n");
         if (std.mem.startsWith(u8, arg, "endpoints,")) return allocator.dupe(u8, endpoint_text);
         if (std.mem.eql(u8, arg, "protocols")) return allocator.dupe(u8, protocol_text);
         if (std.mem.eql(u8, arg, "frame.number")) return allocator.dupe(u8, "1\n4\n9\n");
@@ -343,7 +363,7 @@ test "commands run without a tty" {
     try h.app.applyMark('Q', true, true);
     try std.testing.expectEqual(@as(?u32, 9), h.app.session.selectedFrame());
 
-    try h.app.config.setGlobalMark('C', "other.pcap", 7);
+    try h.app.config.setGlobalMark('C', "other.pcap", 7, null);
     try h.app.applyMark('C', true, true);
     try std.testing.expectEqual(@as(?u32, 7), h.app.pending_global_frame);
     switch (h.app.session.source) {
@@ -996,4 +1016,164 @@ test "decode-as offers the selected packet's port and a short protocol list" {
     try h.app.activatePick();
     try std.testing.expectEqual(@as(usize, 1), h.app.session.decode_as_args.items.len);
     try std.testing.expectEqualStrings("tcp.port==443,http", h.app.session.decode_as_args.items[0]);
+}
+
+test "io graph, dns, http, and compare apply a filter from the selected row" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+
+    try h.app.runCommand("iograph", "1");
+    try std.testing.expect(h.script.saw("io,stat,"));
+    try std.testing.expect(std.mem.indexOf(u8, h.app.help_overlay.body, "#") != null);
+    try h.app.activatePick();
+    try std.testing.expect(std.mem.indexOf(u8, h.app.session.display_filter, "frame.time_relative") != null);
+
+    try h.app.runCommand("dns", "");
+    try std.testing.expect(std.mem.indexOf(u8, h.app.help_overlay.body, "example.com") != null);
+    try h.app.activatePick();
+    try std.testing.expectEqualStrings("dns.qry.name == \"example.com\"", h.app.session.display_filter);
+
+    try h.app.runCommand("http", "");
+    try std.testing.expect(std.mem.indexOf(u8, h.app.help_overlay.body, "M-SEARCH") != null);
+    try h.app.activatePick();
+    try std.testing.expectEqualStrings("http.request.method == \"M-SEARCH\"", h.app.session.display_filter);
+
+    try h.app.runCommand("compare", "other.pcap");
+    try std.testing.expect(std.mem.indexOf(u8, h.app.help_overlay.body, "only here") != null);
+    try h.app.activatePick();
+    try std.testing.expectEqualStrings("frame.number == 1", h.app.session.display_filter);
+}
+
+test "color rules, packet comments, and lua scripts" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    try h.app.runCommand("color", "dns dns|#112233|#445566");
+    try std.testing.expectEqual(@as(usize, 1), h.app.config.color_rules.items.len);
+    try std.testing.expectEqualStrings("dns", h.app.config.color_rules.items[0].filter);
+    try h.app.runCommand("color", "delete dns");
+    try std.testing.expectEqual(@as(usize, 0), h.app.config.color_rules.items.len);
+
+    try h.setFrames(&.{ 7 });
+    try h.app.runCommand("comment", "");
+    try std.testing.expect(std.mem.indexOf(u8, h.app.msg_overlay.body, "saved note") != null);
+    try h.app.runCommand("comment", "hello");
+    try std.testing.expect(h.script.saw("-a"));
+    try std.testing.expect(h.script.saw("7:hello"));
+
+    try h.app.runCommand("lua", "script.lua");
+    try std.testing.expect(h.script.saw("lua_script:script.lua"));
+    try std.testing.expect(std.mem.indexOf(u8, h.app.msg_overlay.body, "lua ok") != null);
+}
+
+fn endpointRow(
+    allocator: std.mem.Allocator,
+    frame: u32,
+    source: []const u8,
+    dest: []const u8,
+    info: []const u8,
+) !packet.PacketSummary {
+    const columns = try allocator.alloc([]const u8, 3);
+    columns[0] = try allocator.dupe(u8, source);
+    columns[1] = try allocator.dupe(u8, dest);
+    columns[2] = try allocator.dupe(u8, info);
+    return .{ .frame = frame, .columns = columns };
+}
+
+test "related packets, the previous filter, and shown of total" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    const headers = try h.allocator.alloc([]u8, 3);
+    headers[0] = try h.allocator.dupe(u8, "Source");
+    headers[1] = try h.allocator.dupe(u8, "Destination");
+    headers[2] = try h.allocator.dupe(u8, "Info");
+    h.app.session.setListHeaders(headers);
+    const packets = try h.allocator.alloc(packet.PacketSummary, 3);
+    packets[0] = try endpointRow(h.allocator, 1, "10.0.0.1", "10.0.0.2", "12345 → 80 request");
+    packets[1] = try endpointRow(h.allocator, 2, "10.0.0.1", "10.0.0.9", "111 → 53 query");
+    packets[2] = try endpointRow(h.allocator, 3, "10.0.0.2", "10.0.0.1", "80 → 12345 response");
+    h.app.session.setPackets(packets);
+
+    try h.app.runCommand("related", "conv next");
+    try std.testing.expectEqual(@as(?u32, 3), h.app.session.selectedFrame());
+    try h.app.runCommand("related", "pair next");
+    try std.testing.expectEqual(@as(?u32, 1), h.app.session.selectedFrame());
+    try h.app.runCommand("related", "addr next");
+    try std.testing.expectEqual(@as(?u32, 2), h.app.session.selectedFrame());
+
+    try h.app.commitFilter("dns", true);
+    try h.app.commitFilter("tcp", true);
+    try h.app.runCommand("back", "");
+    try std.testing.expectEqualStrings("dns", h.app.session.display_filter);
+    try h.app.runCommand("back", "");
+    try std.testing.expectEqualStrings("tcp", h.app.session.display_filter);
+
+    h.app.session.setFilter("", null) catch {};
+    try h.app.loader.pushEvent(.done);
+    try h.app.processLoaderEvents();
+    try std.testing.expectEqual(@as(?usize, 3), h.app.unfiltered_total);
+    try h.app.commitFilter("tcp", true);
+    try std.testing.expectEqual(@as(?usize, 3), h.app.status.packet_total);
+}
+
+test "a display filter during tail keeps the cutoff and the tail flag" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    h.app.tailing = true;
+    h.app.hide_through_frame = 3;
+    try h.app.commitFilter("tcp", true);
+    try std.testing.expect(h.app.tailing);
+    try std.testing.expectEqual(@as(u32, 3), h.app.hide_through_frame);
+    try std.testing.expectEqualStrings("tcp", h.app.session.display_filter);
+
+    const headers = try h.allocator.alloc([]u8, 1);
+    headers[0] = try h.allocator.dupe(u8, "No.");
+    const rows = try h.allocator.alloc(packet.PacketSummary, 3);
+    rows[0] = try endpointRow(h.allocator, 1, "1", "", "");
+    rows[1] = try endpointRow(h.allocator, 2, "2", "", "");
+    rows[2] = try endpointRow(h.allocator, 5, "5", "", "");
+    try h.app.loader.pushEvent(.{ .packets_loaded = .{ .headers = headers, .packets = rows } });
+    try h.app.processLoaderEvents();
+    try std.testing.expect(h.app.tailing);
+    try std.testing.expectEqual(@as(usize, 1), h.app.session.packets.len);
+    try std.testing.expectEqual(@as(u32, 5), h.app.session.packets[0].frame);
+}
+
+test "name resolution reaches tshark and a mark keeps its note" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    try h.setFrames(&.{ 7 });
+    try h.app.runCommand("set", "name-resolution dmN");
+    try std.testing.expectEqualStrings("dmN", h.app.session.name_resolution);
+    var saw_flag = false;
+    const argv = h.loader.psml_argv.slice();
+    for (argv, 0..) |arg, index| {
+        if (std.mem.eql(u8, arg, "-N") and index + 1 < argv.len and std.mem.eql(u8, argv[index + 1], "dmN")) {
+            saw_flag = true;
+        }
+    }
+    try std.testing.expect(saw_flag);
+    try h.app.runCommand("set", "name-resolution nope");
+    try std.testing.expect(std.mem.indexOf(u8, h.app.msg_overlay.body, "not valid") != null);
+    try std.testing.expectEqualStrings("dmN", h.app.session.name_resolution);
+
+    try h.app.runCommand("mark", "A handshake");
+    try std.testing.expectEqual(@as(usize, 1), h.app.config.global_marks.items.len);
+    try std.testing.expectEqualStrings("handshake", h.app.config.global_marks.items[0].note);
+    try h.app.runCommand("marks", "");
+    try std.testing.expect(std.mem.indexOf(u8, h.app.msg_overlay.body, "handshake") != null);
+
+    const data = try h.allocator.dupe(u8, "hi");
+    const chunks = try h.allocator.alloc(zigshark.shark.streams.Chunk, 1);
+    chunks[0] = .{ .direction = .client, .data = data, .frame = 7 };
+    h.app.stream_chunks = chunks;
+    h.app.overlay = .streams;
+    h.app.help_overlay.selected = 0;
+    try h.app.activatePick();
+    try std.testing.expectEqual(@as(?u32, 7), h.app.session.selectedFrame());
+    try std.testing.expect(!h.script.saw("frame contains"));
 }

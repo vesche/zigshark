@@ -186,6 +186,27 @@ test "parse pdml fixture frame and tree" {
     try std.testing.expectEqual(@as(?u32, 14), eth.?.size);
 }
 
+test "an extra pdml attribute does not fail the parse" {
+    const alloc = std.testing.allocator;
+    const sample =
+        \\<?xml version="1.0"?>
+        \\<pdml>
+        \\<packet>
+        \\<proto name="frame" showname="Frame 1" unparsed="yes" extra="kept">
+        \\<field name="frame.number" showname="Frame Number: 3" show="3" pos="0" size="1" hide="no" vendor="no"/>
+        \\</proto>
+        \\</packet>
+        \\</pdml>
+    ;
+    const packets = try parse(alloc, sample);
+    defer deinitPackets(alloc, packets);
+    try std.testing.expectEqual(@as(usize, 1), packets.len);
+    try std.testing.expectEqual(@as(u32, 3), packets[0].frame_number);
+    const frame = findNodeNamed(packets[0].nodes, "frame");
+    try std.testing.expect(frame != null);
+    try std.testing.expectEqualStrings("Frame 1", frame.?.showname.?);
+}
+
 test "entity unescape in showname" {
     const alloc = std.testing.allocator;
     const fixture = try readFixture(alloc, "tests/fixtures/1.pdml");

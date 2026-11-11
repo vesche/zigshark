@@ -77,6 +77,7 @@ pub const ui = struct {
     pub const color_rules = @import("ui/color_rules.zig");
     pub const expert = @import("ui/expert.zig");
     pub const time_ref = @import("ui/time_ref.zig");
+    pub const related = @import("ui/related.zig");
 };
 
 comptime {
@@ -112,6 +113,7 @@ comptime {
     _ = ui.color_rules;
     _ = ui.expert;
     _ = ui.time_ref;
+    _ = ui.related;
     _ = features.macros;
     _ = features.recents;
     _ = platform.clipboard;

@@ -613,6 +613,79 @@ pub fn argvEndpoints(allocator: std.mem.Allocator, tshark: []const u8, path: []c
     return a;
 }
 
+pub fn argvIoStat(allocator: std.mem.Allocator, tshark: []const u8, path: []const u8, interval: []const u8) !Argv {
+    var a: Argv = .{};
+    errdefer a.deinit(allocator);
+    try a.append(allocator, tshark);
+    try a.append(allocator, "-r");
+    try a.append(allocator, path);
+    try a.append(allocator, "-q");
+    try a.append(allocator, "-z");
+    const spec = try std.fmt.allocPrint(allocator, "io,stat,{s}", .{interval});
+    defer allocator.free(spec);
+    try a.append(allocator, spec);
+    return a;
+}
+
+pub fn argvFieldDump(
+    allocator: std.mem.Allocator,
+    tshark: []const u8,
+    path: []const u8,
+    display_filter: []const u8,
+    fields: []const []const u8,
+) !Argv {
+    var a: Argv = .{};
+    errdefer a.deinit(allocator);
+    try a.append(allocator, tshark);
+    try a.append(allocator, "-r");
+    try a.append(allocator, path);
+    if (display_filter.len != 0) {
+        try a.append(allocator, "-Y");
+        try a.append(allocator, display_filter);
+    }
+    try a.append(allocator, "-T");
+    try a.append(allocator, "fields");
+    for (fields) |field| {
+        try a.append(allocator, "-e");
+        try a.append(allocator, field);
+    }
+    return a;
+}
+
+pub fn argvLua(allocator: std.mem.Allocator, tshark: []const u8, path: []const u8, script: []const u8) !Argv {
+    var a: Argv = .{};
+    errdefer a.deinit(allocator);
+    try a.append(allocator, tshark);
+    try a.append(allocator, "-r");
+    try a.append(allocator, path);
+    try a.append(allocator, "-q");
+    try a.append(allocator, "-X");
+    const option = try std.fmt.allocPrint(allocator, "lua_script:{s}", .{script});
+    defer allocator.free(option);
+    try a.append(allocator, option);
+    return a;
+}
+
+pub fn argvEditcapComment(
+    allocator: std.mem.Allocator,
+    editcap: []const u8,
+    src: []const u8,
+    dst: []const u8,
+    frame: u32,
+    comment: []const u8,
+) !Argv {
+    var a: Argv = .{};
+    errdefer a.deinit(allocator);
+    try a.append(allocator, editcap);
+    const spec = try std.fmt.allocPrint(allocator, "{d}:{s}", .{ frame, comment });
+    defer allocator.free(spec);
+    try a.append(allocator, "-a");
+    try a.append(allocator, spec);
+    try a.append(allocator, src);
+    try a.append(allocator, dst);
+    return a;
+}
+
 pub fn argvProtocolList(allocator: std.mem.Allocator, tshark: []const u8) !Argv {
     var a: Argv = .{};
     errdefer a.deinit(allocator);
@@ -773,30 +846,17 @@ test "read denial selects the capture path" {
     try std.testing.expect(deniedCaptureArg(&stdin_argv, stdin_err) == null);
 }
 
+fn fakeTsharkPath(allocator: std.mem.Allocator) ![]u8 {
+    const name = if (builtin.os.tag == .windows) "fake-tshark.exe" else "fake-tshark";
+    return std.fmt.allocPrint(allocator, "zig-out/bin/{s}", .{name});
+}
+
 test "a capped capture stops reading and keeps a prefix" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const script_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/flood", .{tmp.sub_path[0..]});
-    defer allocator.free(script_path);
-    const script =
-        \\#!/bin/bash
-        \\i=0
-        \\while [ "$i" -lt 40 ]; do
-        \\  printf 'row %s\n' "$i"
-        \\  i=$((i + 1))
-        \\done
-        \\while true; do
-        \\  :
-        \\done
-    ;
-    try std.Io.Dir.cwd().writeFile(io, .{
-        .sub_path = script_path,
-        .data = script,
-        .flags = .{ .permissions = @fromBackingInt(@intCast(0o755)) },
-    });
-    const argv = [_][]const u8{script_path};
+    const tool = try fakeTsharkPath(allocator);
+    defer allocator.free(tool);
+    const argv = [_][]const u8{tool};
     const before = std.Io.Timestamp.now(io, .awake).nanoseconds;
     var out = try runCaptureLimited(allocator, io, &argv, 48);
     defer out.deinit(allocator);

@@ -281,6 +281,21 @@ test "available parse keeps an unfinished packet" {
     try std.testing.expectEqual(@as(u32, 2), second.packets[1].frame_number);
 }
 
+test "an extra psml attribute does not fail the parse" {
+    const alloc = std.testing.allocator;
+    const xml_input =
+        \\<psml><structure><section>No.</section></structure>
+        \\<packet foreground='#aabbcc' unparsed='yes' extra='kept'>
+        \\<section>7</section>
+        \\</packet></psml>
+    ;
+    var doc = try parse(alloc, xml_input);
+    defer doc.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), doc.packets.len);
+    try std.testing.expectEqual(@as(u32, 7), doc.packets[0].frame_number);
+    try std.testing.expectEqualStrings("#aabbcc", doc.packets[0].fg.?);
+}
+
 test "modern tshark color attribute names" {
     const alloc = std.testing.allocator;
     const xml_input =

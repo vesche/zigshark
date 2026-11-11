@@ -5,6 +5,8 @@ pub const Direction = enum { client, server };
 pub const Chunk = struct {
     direction: Direction,
     data: []u8,
+    /// Frame number from a follow format that carries one. Null means the jump is a payload guess.
+    frame: ?u32 = null,
 
     pub fn deinit(self: *Chunk, allocator: std.mem.Allocator) void {
         allocator.free(self.data);
@@ -124,6 +126,92 @@ const sample =
     \\00000000  57 6f 72 6c 64
 ;
 
+/// `tshark -z follow,<proto>,yaml,<n>` lists `packet:` as the capture frame number.
+pub fn parseYaml(allocator: std.mem.Allocator, text: []const u8) !StreamFollow {
+    var chunks: std.ArrayList(Chunk) = .empty;
+    errdefer {
+        for (chunks.items) |*chunk| chunk.deinit(allocator);
+        chunks.deinit(allocator);
+    }
+
+    var frame: ?u32 = null;
+    var direction: Direction = .client;
+    var in_packet = false;
+    var collecting = false;
+    var encoded: std.ArrayList(u8) = .empty;
+    defer encoded.deinit(allocator);
+
+    var lines = std.mem.splitAny(u8, text, "\n\r");
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t");
+        if (line.len == 0) continue;
+        if (std.mem.startsWith(u8, line, "- packet:")) {
+            if (in_packet) try finishYamlPacket(allocator, &chunks, frame, direction, encoded.items);
+            encoded.clearRetainingCapacity();
+            frame = std.fmt.parseInt(u32, std.mem.trim(u8, line["- packet:".len..], " \t"), 10) catch null;
+            direction = .client;
+            in_packet = true;
+            collecting = false;
+            continue;
+        }
+        if (!in_packet) continue;
+        if (std.mem.startsWith(u8, line, "peer:")) {
+            const peer = std.mem.trim(u8, line["peer:".len..], " \t");
+            direction = if (std.mem.eql(u8, peer, "1")) .server else .client;
+            collecting = false;
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "data:")) {
+            collecting = true;
+            continue;
+        }
+        if (collecting and isBase64Line(line)) {
+            try encoded.appendSlice(allocator, line);
+            continue;
+        }
+        collecting = false;
+    }
+    if (in_packet) try finishYamlPacket(allocator, &chunks, frame, direction, encoded.items);
+    if (chunks.items.len == 0) return ParseError.InvalidStream;
+
+    return .{
+        .filter = try allocator.dupe(u8, ""),
+        .node0 = try allocator.dupe(u8, ""),
+        .node1 = try allocator.dupe(u8, ""),
+        .chunks = try chunks.toOwnedSlice(allocator),
+    };
+}
+
+fn finishYamlPacket(
+    allocator: std.mem.Allocator,
+    chunks: *std.ArrayList(Chunk),
+    frame: ?u32,
+    direction: Direction,
+    encoded: []const u8,
+) !void {
+    const data = decodeBase64(allocator, encoded) catch try allocator.alloc(u8, 0);
+    try chunks.append(allocator, .{ .direction = direction, .data = data, .frame = frame });
+}
+
+fn isBase64Line(line: []const u8) bool {
+    if (line.len == 0) return false;
+    for (line) |char| {
+        const ok = std.ascii.isAlphanumeric(char) or char == '+' or char == '/' or char == '=';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+fn decodeBase64(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
+    if (encoded.len == 0) return try allocator.alloc(u8, 0);
+    const decoder = std.base64.standard.Decoder;
+    const len = try decoder.calcSizeForSlice(encoded);
+    const out = try allocator.alloc(u8, len);
+    errdefer allocator.free(out);
+    try decoder.decode(out, encoded);
+    return out;
+}
+
 pub fn frameContainsFilter(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
@@ -141,6 +229,36 @@ test "frame contains filter uses the first bytes" {
     const filter = try frameContainsFilter(alloc, "Hello");
     defer alloc.free(filter);
     try std.testing.expectEqualStrings("frame contains 48:65:6c:6c:6f", filter);
+}
+
+const yaml_sample =
+    \\peers:
+    \\  - peer: 0
+    \\    host: 10.0.0.1
+    \\    port: 80
+    \\packets:
+    \\  - packet: 12
+    \\    peer: 0
+    \\    data: !!binary |
+    \\      SGVsbG8=
+    \\  - packet: 13
+    \\    peer: 1
+    \\    data: !!binary |
+    \\      V29ybGQ=
+;
+
+test "yaml follow records the frame number" {
+    const alloc = std.testing.allocator;
+    var sf = try parseYaml(alloc, yaml_sample);
+    defer sf.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), sf.chunks.len);
+    try std.testing.expectEqual(@as(?u32, 12), sf.chunks[0].frame);
+    try std.testing.expect(sf.chunks[0].direction == .client);
+    try std.testing.expectEqualSlices(u8, "Hello", sf.chunks[0].data);
+    try std.testing.expectEqual(@as(?u32, 13), sf.chunks[1].frame);
+    try std.testing.expect(sf.chunks[1].direction == .server);
+    try std.testing.expectEqualSlices(u8, "World", sf.chunks[1].data);
+    try std.testing.expectError(ParseError.InvalidStream, parseYaml(alloc, sample));
 }
 
 test "parse follow stream raw" {

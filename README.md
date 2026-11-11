@@ -43,7 +43,9 @@ Non-TTY stdout auto-forwards to `tshark` (`--pass-thru=auto`).
 | `?` | Help |
 | `\|` | Toggle layout |
 | `\` | Zoom focused pane |
-| `m` / `'` + letter | Set / jump local mark |
+| `m` / `'` + letter | Set / jump a mark |
+| `[` / `]` | Previous / next packet in this conversation |
+| `Ctrl-P` | Previous display filter |
 | `Ctrl-F` | Search focused pane |
 | `n` / `N` | Next / previous search hit |
 | `c` | Enter copy mode (`Ctrl-C` copies, `Esc` cancels) |
@@ -55,7 +57,7 @@ Non-TTY stdout auto-forwards to `tshark` (`--pass-thru=auto`).
 
 ### Commands
 
-`quit`, `help`, `filter`, `clear-filter`, `load`, `search`, `search-hex`, `streams`, `convs`, `capinfo`, `columns`, `set`, `profile`, `theme`, `recents`, `recent`, `marks`, `wormhole`, …
+`quit`, `help`, `filter`, `clear-filter`, `back`, `load`, `search`, `search-hex`, `search-regex`, `streams`, `convs`, `capinfo`, `columns`, `set`, `profile`, `theme`, `recents`, `recent`, `marks`, `mark`, `goto`, `expert`, `hierarchy`, `endpoints`, `iograph`, `dns`, `http`, `compare`, `export`, `decode-as`, `color`, `comment`, `lua`, `related`, `wormhole`. The full list is in [docs/user-guide.md](docs/user-guide.md) and `?` inside the TUI.
 
 ## Configuration
 

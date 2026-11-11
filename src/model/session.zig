@@ -36,6 +36,7 @@ pub const Session = struct {
     timestamp_format: []u8 = &.{},
     wireshark_profile: []u8 = &.{},
     tls_keylog_file: []u8 = &.{},
+    name_resolution: []u8 = &.{},
     packets: []packet.PacketSummary = &.{},
     packets_owned: bool = false,
     list_headers: [][]u8 = &.{},
@@ -66,6 +67,7 @@ pub const Session = struct {
         if (self.timestamp_format.len != 0) self.allocator.free(self.timestamp_format);
         if (self.wireshark_profile.len != 0) self.allocator.free(self.wireshark_profile);
         if (self.tls_keylog_file.len != 0) self.allocator.free(self.tls_keylog_file);
+        if (self.name_resolution.len != 0) self.allocator.free(self.name_resolution);
         self.marks.deinit();
         if (self.capture_path.len != 0) self.allocator.free(self.capture_path);
         if (self.source_path_owned.len != 0) self.allocator.free(self.source_path_owned);
@@ -223,6 +225,11 @@ pub const Session = struct {
     pub fn setTlsKeylog(self: *Session, value: []const u8) !void {
         if (self.tls_keylog_file.len != 0) self.allocator.free(self.tls_keylog_file);
         self.tls_keylog_file = if (value.len == 0) &.{} else try self.allocator.dupe(u8, value);
+    }
+
+    pub fn setNameResolution(self: *Session, value: []const u8) !void {
+        if (self.name_resolution.len != 0) self.allocator.free(self.name_resolution);
+        self.name_resolution = if (value.len == 0) &.{} else try self.allocator.dupe(u8, value);
     }
 
     pub fn setError(self: *Session, msg: []const u8) !void {

@@ -33,6 +33,37 @@ pub fn sendFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) Tran
     _ = allocator;
 }
 
+pub const SendOptions = struct {
+    code_length: u32 = 2,
+    relay_url: []const u8 = "",
+    transit_helper: []const u8 = "",
+};
+
+/// argv for `wormhole send`. Empty relay strings stay off the command line.
+pub fn sendArgv(allocator: std.mem.Allocator, path: []const u8, options: SendOptions) ![][]u8 {
+    var argv: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (argv.items) |arg| allocator.free(arg);
+        argv.deinit(allocator);
+    }
+    try argv.append(allocator, try allocator.dupe(u8, "wormhole"));
+    try argv.append(allocator, try allocator.dupe(u8, "send"));
+    if (options.code_length != 0) {
+        try argv.append(allocator, try allocator.dupe(u8, "--code-length"));
+        try argv.append(allocator, try std.fmt.allocPrint(allocator, "{d}", .{options.code_length}));
+    }
+    if (options.relay_url.len != 0) {
+        try argv.append(allocator, try allocator.dupe(u8, "--relay-url"));
+        try argv.append(allocator, try allocator.dupe(u8, options.relay_url));
+    }
+    if (options.transit_helper.len != 0) {
+        try argv.append(allocator, try allocator.dupe(u8, "--transit-helper"));
+        try argv.append(allocator, try allocator.dupe(u8, options.transit_helper));
+    }
+    try argv.append(allocator, try allocator.dupe(u8, path));
+    return argv.toOwnedSlice(allocator);
+}
+
 pub const Job = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -42,7 +73,22 @@ pub const Job = struct {
     thread: ?std.Thread = null,
 
     pub fn start(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !*Job {
-        return startNamed(allocator, io, "wormhole", path);
+        return startWith(allocator, io, path, .{});
+    }
+
+    pub fn startWith(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        path: []const u8,
+        options: SendOptions,
+    ) !*Job {
+        if (!commandAvailable(io, "wormhole")) return error.WormholeNotFound;
+        const argv = try sendArgv(allocator, path, options);
+        defer {
+            for (argv) |arg| allocator.free(arg);
+            allocator.free(argv);
+        }
+        return startArgv(allocator, io, argv);
     }
 
     fn startNamed(allocator: std.mem.Allocator, io: std.Io, tool: []const u8, path: []const u8) !*Job {
@@ -144,6 +190,28 @@ fn waitJob(job: *Job, io: std.Io) !void {
         if (spins > 200) return error.TimedOut;
         try std.Io.sleep(io, .fromMilliseconds(10), .awake);
     }
+}
+
+test "wormhole send argv carries the configured relays" {
+    const allocator = std.testing.allocator;
+    const argv = try sendArgv(allocator, "x.pcap", .{
+        .code_length = 4,
+        .relay_url = "ws://mailbox.example/v1",
+        .transit_helper = "tcp:relay.example:4001",
+    });
+    defer {
+        for (argv) |arg| allocator.free(arg);
+        allocator.free(argv);
+    }
+    try std.testing.expectEqualSlices(u8, "wormhole", argv[0]);
+    try std.testing.expectEqualSlices(u8, "send", argv[1]);
+    try std.testing.expectEqualSlices(u8, "--code-length", argv[2]);
+    try std.testing.expectEqualSlices(u8, "4", argv[3]);
+    try std.testing.expectEqualSlices(u8, "--relay-url", argv[4]);
+    try std.testing.expectEqualSlices(u8, "ws://mailbox.example/v1", argv[5]);
+    try std.testing.expectEqualSlices(u8, "--transit-helper", argv[6]);
+    try std.testing.expectEqualSlices(u8, "tcp:relay.example:4001", argv[7]);
+    try std.testing.expectEqualSlices(u8, "x.pcap", argv[8]);
 }
 
 test "wormhole reports a missing binary without using the network" {

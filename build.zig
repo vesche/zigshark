@@ -91,10 +91,29 @@ pub fn build(b: *std.Build) void {
     });
     const run_integration_tests = b.addRunArtifact(integration_tests);
 
+    const fake_tshark = b.addExecutable(.{
+        .name = "fake-tshark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fake_tshark.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const install_fake = b.addInstallArtifact(fake_tshark, .{});
+
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
-    test_step.dependOn(&run_parsers_tests.step);
-    test_step.dependOn(&run_integration_tests.step);
-    for (suite_steps) |step| test_step.dependOn(step);
+    const test_runs = [_]*std.Build.Step{
+        &run_mod_tests.step,
+        &run_exe_tests.step,
+        &run_parsers_tests.step,
+        &run_integration_tests.step,
+    };
+    for (test_runs) |step| {
+        step.dependOn(&install_fake.step);
+        test_step.dependOn(step);
+    }
+    for (suite_steps) |step| {
+        step.dependOn(&install_fake.step);
+        test_step.dependOn(step);
+    }
 }
