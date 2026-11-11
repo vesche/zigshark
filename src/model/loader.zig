@@ -331,7 +331,9 @@ pub const CaptureLoader = struct {
     }
 
     pub fn stopLiveCapture(self: *CaptureLoader, io: std.Io) void {
-        if (self.live_child) |*child| child.kill(io);
+        if (self.live_child) |*child| {
+            if (child.id != null) child.kill(io);
+        }
         self.live_child = null;
     }
 };

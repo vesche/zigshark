@@ -172,6 +172,27 @@ test "a cancelled capture does not start the process" {
     );
 }
 
+test "cancelling a live child does not panic when it has already exited" {
+    const io = std.testing.io;
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        var token = process.CancellationToken{};
+        const thread = try std.Thread.spawn(.{}, struct {
+            fn run(tok: *process.CancellationToken) void {
+                var output = process.runCaptureCancellable(
+                    std.testing.allocator,
+                    std.testing.io,
+                    &.{ "sleep", "2" },
+                    tok,
+                ) catch return;
+                output.deinit(std.testing.allocator);
+            }
+        }.run, .{&token});
+        token.cancel(io);
+        thread.join();
+    }
+}
+
 test "lru get refreshes a key and remove returns the value" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

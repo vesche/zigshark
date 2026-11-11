@@ -21,7 +21,7 @@ pub const CancellationToken = struct {
         self.cancelled.store(true, .release);
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        if (self.child) |child| child.kill(io);
+        if (self.child) |child| reap(child, io);
     }
 
     pub fn isCancelled(self: *const CancellationToken) bool {
@@ -36,15 +36,36 @@ pub const CancellationToken = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         self.child = child;
-        if (self.cancelled.load(.acquire)) child.kill(io);
+        if (self.cancelled.load(.acquire)) reap(child, io);
     }
 
-    fn unbind(self: *CancellationToken, io: std.Io, child: *std.process.Child) void {
+    /// The worker is done with this child. Reap it if another thread has not
+    /// already done so, then drop the binding.
+    fn release(self: *CancellationToken, io: std.Io, child: *std.process.Child) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         if (self.child == child) self.child = null;
+        reap(child, io);
+    }
+
+    fn waitUnlessCancelled(self: *CancellationToken, io: std.Io, child: *std.process.Child) !std.process.Child.Term {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.cancelled.load(.acquire) or child.id == null) {
+            reap(child, io);
+            return error.Cancelled;
+        }
+        return try child.wait(io);
     }
 };
+
+/// `Child.kill` panics in debug builds when the pid was already reaped
+/// (`ESRCH`). Every kill of a shared child goes through here, under the token
+/// mutex, and only while `id` is still set.
+fn reap(child: *std.process.Child, io: std.Io) void {
+    if (child.id == null) return;
+    child.kill(io);
+}
 
 pub const Source = union(enum) {
     file: []const u8,
@@ -119,8 +140,11 @@ fn runOnce(
         .stderr = .pipe,
     });
     if (token) |cancel| cancel.bind(io, &child);
-    defer if (token) |cancel| cancel.unbind(io, &child);
-    defer child.kill(io);
+    defer if (token) |cancel| {
+        cancel.release(io, &child);
+    } else if (child.id != null) {
+        child.kill(io);
+    };
 
     var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
     var multi_reader: std.Io.File.MultiReader = undefined;
@@ -129,10 +153,7 @@ fn runOnce(
 
     while (multi_reader.fill(4096, .none)) |_| {
         if (token) |cancel| {
-            if (cancel.isCancelled()) {
-                child.kill(io);
-                return error.Cancelled;
-            }
+            if (cancel.isCancelled()) return error.Cancelled;
         }
     } else |err| switch (err) {
         error.EndOfStream => {},
@@ -143,11 +164,10 @@ fn runOnce(
             return err;
         },
     }
-    if (token) |cancel| {
-        if (cancel.isCancelled()) return error.Cancelled;
-    }
-
-    const term = try child.wait(io);
+    const term = if (token) |cancel|
+        try cancel.waitUnlessCancelled(io, &child)
+    else
+        try child.wait(io);
     const stdout_slice = try multi_reader.toOwnedSlice(0);
     errdefer allocator.free(stdout_slice);
     const stderr_slice = try multi_reader.toOwnedSlice(1);
