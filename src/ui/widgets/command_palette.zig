@@ -14,6 +14,7 @@ pub const defaultCommands = [_]CommandDef{
     .{ .name = "quit", .description = "Exit zigshark" },
     .{ .name = "help", .description = "Show key bindings" },
     .{ .name = "filter", .description = "Focus display filter" },
+    .{ .name = "goto", .description = "Select a frame by number" },
     .{ .name = "decode-as", .description = "Add a tshark decode-as rule" },
     .{ .name = "timestamp", .description = "Set tshark timestamp format" },
     .{ .name = "search", .description = "Search packet list" },

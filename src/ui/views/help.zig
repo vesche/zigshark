@@ -8,6 +8,9 @@ pub const text =
     \\Tree ← / →        Collapse / expand (h / l)
     \\Hex click / hjkl  Select a byte; the tree jumps to that field
     \\/                 Focus display filter
+    \\Up / Down         Recall recent filters in the filter bar
+    \\=                 Field filter in the tree, conversation filter in the list
+    \\g / :goto         Go to a frame number
     \\:                 Command palette
     \\?                 This help
     \\|                 Toggle layout

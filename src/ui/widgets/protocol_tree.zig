@@ -8,6 +8,9 @@ const text_util = @import("text_util.zig");
 
 const FlatNode = struct {
     label: []const u8,
+    name: []const u8,
+    title: []const u8,
+    show: []const u8,
     depth: u8,
     expandable: bool,
     expanded: bool,
@@ -15,6 +18,34 @@ const FlatNode = struct {
     pos: usize,
     size: usize,
 };
+
+pub const TreeColumns = struct {
+    marker_at: u16,
+    name_at: u16,
+    name_width: u16,
+    value_at: u16,
+};
+
+/// Columns for one tree row. The label uses every column after the marker and
+/// is clipped at the pane edge, not at a fixed name width.
+pub fn treeColumns(width: u16, depth: u8) TreeColumns {
+    const indent: u16 = @as(u16, depth) * 2;
+    const marker_w: u16 = 4;
+    const name_at = indent + marker_w;
+    const name_width = width -| name_at;
+    return .{
+        .marker_at = indent,
+        .name_at = name_at,
+        .name_width = name_width,
+        .value_at = width,
+    };
+}
+
+pub fn visibleLabel(label: []const u8, budget: u16) []const u8 {
+    if (label.len <= budget) return label;
+    if (budget == 0) return "";
+    return label[0..budget];
+}
 
 pub const ProtocolTree = struct {
     root: ?*const packet.DetailNode = null,
@@ -60,6 +91,13 @@ pub const ProtocolTree = struct {
         if (self.selected >= self.flat.items.len) return .{ .pos = 0, .size = 0 };
         const n = self.flat.items[self.selected];
         return .{ .pos = n.pos, .size = n.size };
+    }
+
+    pub fn selectedField(self: *const ProtocolTree) ?struct { name: []const u8, show: []const u8 } {
+        if (self.selected >= self.flat.items.len) return null;
+        const node = self.flat.items[self.selected];
+        if (node.name.len == 0) return null;
+        return .{ .name = node.name, .show = node.show };
     }
 
     pub fn selectedText(self: *const ProtocolTree) []const u8 {
@@ -127,6 +165,15 @@ pub const ProtocolTree = struct {
         self.ensureVisible();
     }
 
+    fn fieldTitle(node: *const packet.DetailNode) []const u8 {
+        if (std.mem.indexOfScalar(u8, node.showname, ':')) |colon| {
+            const title = std.mem.trim(u8, node.showname[0..colon], " \t");
+            if (title.len != 0) return title;
+        }
+        if (node.showname.len != 0) return node.showname;
+        return node.name;
+    }
+
     fn visit(self: *ProtocolTree, node: *const packet.DetailNode, depth: u8) void {
         const idx = @intFromPtr(node);
         const expandable = node.children.len > 0;
@@ -134,6 +181,9 @@ pub const ProtocolTree = struct {
         const label = if (node.showname.len != 0) node.showname else if (node.show.len != 0) node.show else node.name;
         self.flat.append(self.allocator, .{
             .label = label,
+            .name = node.name,
+            .title = fieldTitle(node),
+            .show = node.show,
             .depth = depth,
             .expandable = expandable,
             .expanded = expanded,
@@ -393,10 +443,7 @@ pub const ProtocolTree = struct {
         const size = ctx.max.size();
         var surf = try vxfw.Surface.init(ctx.arena, self.widget(), size);
         const normal: vaxis.Style = .{ .fg = self.theme.fg, .bg = self.theme.bg };
-        const sel: vaxis.Style = if (self.focused)
-            .{ .fg = self.theme.selected_fg, .bg = self.theme.selected_bg }
-        else
-            .{ .fg = self.theme.fg, .bg = theme_mod.rgb(0, 50, 90) };
+        const sel = theme_mod.selectionStyle(self.theme, self.focused);
         const marker_fg = self.theme.accent;
         self.viewport_rows = size.height;
         self.ensureVisible();
@@ -405,7 +452,6 @@ pub const ProtocolTree = struct {
         while (i < self.flat.items.len) : (i += 1) {
             if (row >= size.height) break;
             const n = self.flat.items[i];
-            var col: u16 = 0;
             const style = if (i == self.selected) sel else normal;
             var fill_col: u16 = 0;
             while (fill_col < size.width) : (fill_col += 1) {
@@ -414,25 +460,34 @@ pub const ProtocolTree = struct {
                     .style = style,
                 });
             }
-            var indent: u8 = 0;
-            while (indent < n.depth and col < size.width) : ({
-                indent += 1;
-                col += 2;
-            }) {
-                surf.writeCell(col, row, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = style });
-            }
-            const prefix = if (n.expandable)
+            const columns = treeColumns(size.width, n.depth);
+            const marker = if (n.expandable)
                 if (n.expanded) "[-] " else "[+] "
             else
                 "    ";
             const marker_style: vaxis.Style = .{ .fg = marker_fg, .bg = style.bg, .bold = n.expandable };
-            col = text_util.writeText(&surf, ctx, col, row, prefix, marker_style, size.width);
-            _ = text_util.writeText(&surf, ctx, col, row, n.label, style, size.width);
+            _ = text_util.writeText(&surf, ctx, columns.marker_at, row, marker, marker_style, columns.name_at);
+            _ = text_util.writeText(&surf, ctx, columns.name_at, row, n.label, style, size.width);
             row += 1;
         }
         return surf;
     }
 };
+
+test "wide tree rows keep the full protocol name" {
+    const ip = "Internet Protocol Version 4, Src: 192.168.86.246, Dst: 52.20.230.126";
+    const tcp = "Transmission Control Protocol, Src Port: 42184, Dst Port: 443";
+    const wide = treeColumns(120, 0);
+    try std.testing.expect(wide.name_width >= ip.len);
+    try std.testing.expectEqualStrings(ip, visibleLabel(ip, wide.name_width));
+    try std.testing.expectEqualStrings(tcp, visibleLabel(tcp, wide.name_width));
+
+    const narrow = treeColumns(24, 0);
+    const shown = visibleLabel(ip, narrow.name_width);
+    try std.testing.expect(shown.len < ip.len);
+    try std.testing.expect(shown.len > 8);
+    try std.testing.expect(std.mem.startsWith(u8, ip, shown));
+}
 
 test "hex offset selects the tightest field and expands ancestors" {
     const allocator = std.testing.allocator;
@@ -477,6 +532,9 @@ test "hex offset selects the tightest field and expands ancestors" {
     tree.setRoot(&root);
     tree.selectCovering(12);
     try std.testing.expectEqualStrings("Type: IPv4", tree.selectedText());
+    const field = tree.selectedField() orelse return error.MissingField;
+    try std.testing.expectEqualStrings("eth.type", field.name);
+    try std.testing.expectEqualStrings("0x0800", field.show);
     try std.testing.expect(tree.flat.items.len >= 3);
     try std.testing.expect(tree.flat.items[0].expanded);
 }

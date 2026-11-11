@@ -76,6 +76,13 @@ pub fn resolve(dark_mode: bool) Theme {
     return if (dark_mode) dark() else light();
 }
 
+/// Focused selection is the bright theme color. Unfocused selection is a warm
+/// neutral so it stays readable and does not match a protocol tint.
+pub fn selectionStyle(theme: Theme, focused: bool) vaxis.Style {
+    if (focused) return .{ .fg = theme.selected_fg, .bg = theme.selected_bg };
+    return .{ .fg = theme.fg, .bg = rgb(72, 64, 58) };
+}
+
 pub fn parseToml(input: []const u8, base: Theme) Theme {
     var theme = base;
     var lines = std.mem.splitScalar(u8, input, '\n');
@@ -133,6 +140,19 @@ test "theme resolve dark and light" {
     const d = dark();
     const l = light();
     try std.testing.expect(d.bg.eql(l.bg) == false);
+}
+
+test "unfocused selection is not a protocol tint" {
+    const theme = dark();
+    const dim = selectionStyle(theme, false);
+    const bright = selectionStyle(theme, true);
+    try std.testing.expect(bright.bg.eql(theme.selected_bg));
+    try std.testing.expect(!dim.bg.eql(bright.bg));
+    try std.testing.expect(!dim.bg.eql(protocolStyle(theme, "TCP").bg));
+    try std.testing.expect(!dim.bg.eql(protocolStyle(theme, "UDP").bg));
+    try std.testing.expect(!dim.bg.eql(protocolStyle(theme, "TLS").bg));
+    try std.testing.expect(!dim.bg.eql(protocolStyle(theme, "ARP").bg));
+    try std.testing.expect(!dim.bg.eql(theme.bg));
 }
 
 test "protocol style tcp" {

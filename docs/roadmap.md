@@ -83,9 +83,9 @@ The three panes work. What still feels like a tool you have to already know is t
 
 | Item | Status | Notes |
 |------|--------|-------|
-| Apply or prepare a filter from the selected field | **now** | The missing daily gesture. On the protocol tree, a key (termshark used `=`) opens equals, not-equals, and, or, not, and contains, using the field name and the shown value. "Apply" reloads. "Prepare" only fills the bar. And/or appends to the current expression instead of replacing it. |
-| Filter from the packet list | **now** | Selected row: conversation filter (`ip.addr` pair, or tcp/udp with ports when the columns have them), and "set as time reference" once that exists. |
-| Recent filters on the filter bar | **now** | Up/Down recalls `:recent-filter` history while the bar is focused. Empty input shows the list. |
+| Apply or prepare a filter from the selected field | **done** | `=` on the protocol tree opens equals, not-equals, and, or, not, and contains. Apply reloads. Prepare only fills the bar. And/or appends to the current expression. |
+| Filter from the packet list | **done** | `=` on the selected row builds an `ip.addr` pair, or tcp/udp with ports when the columns have them. Apply reloads. Prepare only fills the bar. Time reference waits until that feature exists. |
+| Recent filters on the filter bar | **done** | Up/Down while the filter bar is focused recalls recent filters. An empty bar also lists them on the status line. |
 | Filter expression feedback | **next** | Empty is neutral, valid is one color, invalid is another, and a slow tshark check does not freeze typing. Show the tshark error line, not only a red bar. |
 | Saved filter library | **later** | Named filters in the profile, separate from the recent list. `:filters` to apply one. |
 | Display-filter macros in the bar | **later** | Expansion already happens before validation. Show the expanded expression somewhere visible before it is applied. |
@@ -94,19 +94,19 @@ The three panes work. What still feels like a tool you have to already know is t
 
 | Item | Status | Notes |
 |------|--------|-------|
-| Header menus match the commands that exist | **now** | Analysis should reach filter-from-field, go-to-frame, expert, hierarchy, endpoints, streams, conversations, and export. Misc should reach columns, theme, profile, marks, and tail. The palette is missing nothing important only if a new command is added there in the same change. |
-| Go to frame | **now** | `g` or `:goto 1234` selects that frame and loads its detail. Out-of-range is a message. |
+| Header menus match the commands that exist | **done** | Analysis reaches filter-from-field, go-to-frame, streams, conversations, and capture info. Expert, hierarchy, endpoints, and export are listed and say they are not built yet. Misc reaches columns, theme, profile, marks, and tail. `:goto` is in the palette. |
+| Go to frame | **done** | `g` opens `:goto`, and `:goto 1234` selects that frame and loads its detail. Out-of-range is a message. |
 | Command help on the palette row | **next** | The selected command shows its arguments (`:streams`, `:columns set`, `:decode-as`) so the palette is usable without memorizing the user guide. |
 | Field copy includes the filter form | **next** | Copy already walks the visible subtree. Also offer the display-filter atom (`tcp.port == 443`) and the raw value. |
-| User guide matches the binary | **next** | `docs/user-guide.md` still describes an earlier command set. Update it when the filter-from-field work lands, not before. |
+| User guide matches the binary | **next** | The filter, goto, and recent-filter gestures are in `docs/user-guide.md` and the in-app help. The rest of the guide still describes an earlier command set. |
 
 ### Beautification
 
 Keep the stacked list / tree / hex layout. Polish is in the details, not a new theme.
 
-- [ ] **now** — One selected row treatment. Focused pane is bright. Unfocused selection stays readable and is not the same color as a protocol tint
-- [ ] **now** — Tree guides that survive narrow terminals: marker, name, and value stay aligned when the value is truncated
-- [ ] **now** — Status line: frame `n/total`, display filter active, capture or tail state, and the current key hint. Drop duplicated text
+- [x] **now** — One selected row treatment. Focused pane is bright. Unfocused selection stays readable and is not the same color as a protocol tint
+- [x] **now** — Tree guides that survive narrow terminals: marker, name, and value stay aligned when the value is truncated
+- [x] **now** — Status line: frame `n/total`, display filter active, capture or tail state, and the current key hint. Drop duplicated text
 - [ ] **next** — Packet colors from tshark win over the protocol tint. The tint is only the fallback when `--color` did not paint the row
 - [ ] **next** — Hex: offset ruler, a gap at 8 bytes, and the selected field's range visible while the cursor byte stays distinct
 - [ ] **later** — User coloring rules (`name`, filter, fg, bg) stored in the profile, evaluated in order, with tshark's rules as the default layer

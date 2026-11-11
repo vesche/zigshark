@@ -36,6 +36,7 @@ const recents = @import("../features/recents.zig");
 const transfer = @import("../features/transfer.zig");
 const copy_feature = @import("../features/copy.zig");
 const macros_feature = @import("../features/macros.zig");
+const field_filter = @import("field_filter.zig");
 const profiles_feature = @import("../features/profiles.zig");
 const runtime_mod = @import("runtime.zig");
 
@@ -49,6 +50,9 @@ pub const OverlayKind = enum {
     streams,
     convs,
     capinfo,
+    menu,
+    field_filter,
+    conv_filter,
 };
 
 fn hexNeedleLength(value: []const u8) usize {
@@ -124,6 +128,10 @@ pub const AppModel = struct {
     tail_size: u64 = 0,
     tail_ticks: u8 = 0,
     hide_through_frame: u32 = 0,
+    filter_recall: ?usize = null,
+    history_note: [256]u8 = @splat(0),
+    history_note_len: usize = 0,
+    menu_analysis: bool = false,
     transfer_job: ?*transfer.Job = null,
     process_runner: ?process_mod.Runner = null,
 
@@ -202,6 +210,10 @@ pub const AppModel = struct {
         self.tail_size = 0;
         self.tail_ticks = 0;
         self.hide_through_frame = 0;
+        self.filter_recall = null;
+        self.history_note = @splat(0);
+        self.history_note_len = 0;
+        self.menu_analysis = false;
         self.transfer_job = null;
         self.process_runner = null;
 
@@ -227,6 +239,7 @@ pub const AppModel = struct {
         self.filter.userdata = self;
         self.filter.onSubmit = onFilterSubmit;
         self.filter.onRecent = onRecentFilters;
+        self.filter.onHistory = onFilterHistory;
         self.filter.onFocus = onFilterFocus;
         if (opts.cli.display_filter) |df| try self.filter.setText(df);
         self.status = .{ .theme = self.theme };
@@ -296,9 +309,12 @@ pub const AppModel = struct {
             self.packet_table.selected = idx;
         }
         self.status.packet_count = self.session.packets.len;
+        self.status.selected_index = self.session.selected_index;
         self.status.selected_frame = self.session.selectedFrame();
         self.status.loading = self.session.loading;
         self.status.filter = self.session.display_filter;
+        self.status.tailing = self.tailing;
+        self.status.live = self.live_capture;
         self.status.source = switch (self.session.source) {
             .file => |p| p,
             .fifo => |p| p,
@@ -371,6 +387,197 @@ pub const AppModel = struct {
         }
     }
 
+    pub fn gotoFrame(self: *AppModel, args: []const u8) !void {
+        const text = std.mem.trim(u8, args, " \t");
+        const frame = std.fmt.parseInt(u32, text, 10) catch {
+            try self.showMessage("Usage: :goto <frame>");
+            return;
+        };
+        if (self.selectFrame(frame)) {
+            self.syncFromSession();
+            try self.loadDetailForSelection();
+            return;
+        }
+        const message = try std.fmt.allocPrint(self.allocator, "Frame {d} is not in the list", .{frame});
+        defer self.allocator.free(message);
+        try self.showMessage(message);
+    }
+
+    pub fn commitFilter(self: *AppModel, text: []const u8, apply: bool) !void {
+        try self.filter.setText(text);
+        self.filter_recall = null;
+        if (!apply) {
+            self.focus = .filter;
+            self.status.mode = "prepared";
+            return;
+        }
+        try onFilterSubmit(self, text);
+    }
+
+    pub fn recallRecent(self: *AppModel, older: bool) !void {
+        const items = self.config.recent_filters.items;
+        if (items.len == 0) {
+            self.status.mode = "no recent filters";
+            return;
+        }
+        const current = try self.filter.copyText(self.allocator);
+        defer self.allocator.free(current);
+        const starting = current.len == 0 or self.filter_recall == null or
+            self.filter_recall.? >= items.len or
+            !std.mem.eql(u8, current, items[self.filter_recall.?]);
+        const index = if (starting) blk: {
+            break :blk if (older) @as(usize, 0) else items.len - 1;
+        } else if (older) blk: {
+            const current_index = self.filter_recall.?;
+            break :blk if (current_index + 1 < items.len) current_index + 1 else 0;
+        } else blk: {
+            const current_index = self.filter_recall.?;
+            break :blk if (current_index == 0) items.len - 1 else current_index - 1;
+        };
+        self.filter_recall = index;
+        try self.filter.setText(items[index]);
+        self.writeHistoryNote(index, starting and current.len == 0);
+    }
+
+    fn writeHistoryNote(self: *AppModel, index: usize, show_list: bool) void {
+        const items = self.config.recent_filters.items;
+        const head = std.fmt.bufPrint(self.history_note[0..], "recent {d}/{d}", .{
+            index + 1,
+            items.len,
+        }) catch {
+            self.history_note_len = 0;
+            self.status.mode = "";
+            return;
+        };
+        var end = head.len;
+        if (show_list) {
+            for (items, 0..) |item, item_index| {
+                const prefix: []const u8 = if (item_index == 0) "  " else " · ";
+                const piece = std.fmt.bufPrint(self.history_note[end..], "{s}{s}", .{ prefix, item }) catch break;
+                end += piece.len;
+            }
+        }
+        self.history_note_len = end;
+        self.status.mode = self.history_note[0..end];
+    }
+
+    fn openMenu(self: *AppModel, analysis: bool) !void {
+        self.menu_analysis = analysis;
+        const body = if (analysis)
+            \\Filter field
+            \\Go to frame
+            \\Streams
+            \\Conversations
+            \\Capture info
+            \\Expert
+            \\Protocol hierarchy
+            \\Endpoints
+            \\Export
+        else
+            \\Columns
+            \\Theme
+            \\Profile
+            \\Marks
+            \\Tail
+        ;
+        try self.showPick(if (analysis) "Analysis" else "Misc", body, .menu);
+    }
+
+    fn openFieldFilter(self: *AppModel) !void {
+        if (self.protocol_tree.selectedField() == null) {
+            try self.showMessage("Select a protocol field first");
+            return;
+        }
+        try self.showPick("Field filter",
+            \\Apply ==
+            \\Apply !=
+            \\Apply and
+            \\Apply or
+            \\Apply not
+            \\Apply contains
+            \\Prepare ==
+            \\Prepare !=
+            \\Prepare and
+            \\Prepare or
+            \\Prepare not
+            \\Prepare contains
+        , .field_filter);
+    }
+
+    fn openConversationFilter(self: *AppModel) !void {
+        const probe = self.conversationExpression() catch {
+            try self.showMessage("The selected row has no address pair");
+            return;
+        };
+        self.allocator.free(probe);
+        try self.showPick("Conversation filter",
+            \\Apply
+            \\Prepare
+        , .conv_filter);
+    }
+
+    fn conversationExpression(self: *AppModel) ![]u8 {
+        const index = self.session.selected_index orelse return error.NoAddress;
+        if (index >= self.session.packets.len) return error.NoAddress;
+        const row = self.session.packets[index];
+        return field_filter.conversation(
+            self.allocator,
+            self.listColumn(row, .proto),
+            self.listColumn(row, .source),
+            self.listColumn(row, .dest),
+        );
+    }
+
+    fn containsIgnore(haystack: []const u8, needle: []const u8) bool {
+        if (needle.len == 0 or needle.len > haystack.len) return false;
+        var index: usize = 0;
+        while (index + needle.len <= haystack.len) : (index += 1) {
+            if (std.ascii.eqlIgnoreCase(haystack[index..][0..needle.len], needle)) return true;
+        }
+        return false;
+    }
+
+    fn listColumn(self: *AppModel, row: packet.PacketSummary, which: enum { source, dest, proto }) []const u8 {
+        const headers = self.session.list_headers;
+        if (headers.len != 0) {
+            for (headers, 0..) |header, column| {
+                if (column >= row.columns.len) break;
+                const match = switch (which) {
+                    .source => containsIgnore(header, "source") or containsIgnore(header, "src"),
+                    .dest => containsIgnore(header, "dest") or containsIgnore(header, "dst"),
+                    .proto => containsIgnore(header, "proto"),
+                };
+                if (match) return row.columns[column];
+            }
+        }
+        const has_delta = row.columns.len >= 8;
+        const column: usize = switch (which) {
+            .source => if (has_delta) 3 else 2,
+            .dest => if (has_delta) 4 else 3,
+            .proto => if (has_delta) 5 else 4,
+        };
+        return if (column < row.columns.len) row.columns[column] else "";
+    }
+
+    pub fn chooseFieldFilter(self: *AppModel, index: usize) !void {
+        const field = self.protocol_tree.selectedField() orelse {
+            try self.showMessage("Select a protocol field first");
+            return;
+        };
+        const ops = [_]field_filter.Op{ .eq, .ne, .both, .either, .not_eq, .contains };
+        if (index >= ops.len * 2) return;
+        const text = try field_filter.expression(
+            self.allocator,
+            self.session.display_filter,
+            field.name,
+            field.show,
+            ops[index % ops.len],
+        );
+        defer self.allocator.free(text);
+        self.dismissOverlays();
+        try self.commitFilter(text, index < ops.len);
+    }
+
     fn runProcess(self: *AppModel, argv: []const []const u8) !process_mod.RunOutput {
         if (self.process_runner) |run| return run(self.allocator, self.io, argv);
         return process_mod.runCapture(self.allocator, self.io, argv);
@@ -379,21 +586,8 @@ pub const AppModel = struct {
     fn onHeaderMenu(userdata: ?*anyopaque, menu: header_bar.HeaderBar.Menu) void {
         const self: *AppModel = @ptrCast(@alignCast(userdata.?));
         switch (menu) {
-            .analysis => self.showMessage(
-                "Analysis\n\n" ++
-                    ":streams [tcp|udp] [index]\n" ++
-                    ":convs [tcp|udp|ip|ipv6|eth]\n" ++
-                    ":capinfo\n" ++
-                    "Ctrl-F search",
-            ) catch {},
-            .view => self.showMessage(
-                "View\n\n" ++
-                    "| toggle layout\n" ++
-                    "+/- resize packet list\n" ++
-                    "</> resize detail panes\n" ++
-                    ":columns\n" ++
-                    ":theme",
-            ) catch {},
+            .analysis => self.openMenu(true) catch {},
+            .misc => self.openMenu(false) catch {},
             .help => {
                 self.help_overlay.visible = true;
                 self.help_overlay.scroll_top = 0;
@@ -455,6 +649,7 @@ pub const AppModel = struct {
         self.filter.state = if (ok) .ok else .bad;
         if (!ok) return;
         try self.session.setFilter(expanded, null);
+        self.filter_recall = null;
         try recents.pushFilter(self.config, expanded);
         self.clearDetail();
         try self.loader.requestPsml(self.session);
@@ -464,6 +659,11 @@ pub const AppModel = struct {
     fn onRecentFilters(userdata: ?*anyopaque) anyerror!void {
         const self: *AppModel = @ptrCast(@alignCast(userdata.?));
         try self.showRecents();
+    }
+
+    fn onFilterHistory(userdata: ?*anyopaque, older: bool) anyerror!void {
+        const self: *AppModel = @ptrCast(@alignCast(userdata.?));
+        try self.recallRecent(older);
     }
 
     fn onCommand(userdata: ?*anyopaque, cmd: []const u8, args: []const u8) anyerror!void {
@@ -807,6 +1007,8 @@ pub const AppModel = struct {
             self.help_overlay.visible = true;
         } else if (std.mem.eql(u8, cmd, "filter")) {
             self.focus = .filter;
+        } else if (std.mem.eql(u8, cmd, "goto")) {
+            try self.gotoFrame(args);
         } else if (std.mem.eql(u8, cmd, "decode-as")) {
             if (args.len == 0) {
                 try self.showMessage("Usage: :decode-as layer==selector,protocol");
@@ -1446,6 +1648,55 @@ pub const AppModel = struct {
                 self.dismissOverlays();
                 try self.searchByDisplayFilter(filter);
             },
+            .field_filter => try self.chooseFieldFilter(self.help_overlay.selected),
+            .conv_filter => {
+                const text = self.conversationExpression() catch return;
+                defer self.allocator.free(text);
+                const apply = self.help_overlay.selected == 0;
+                self.dismissOverlays();
+                try self.commitFilter(text, apply);
+            },
+            .menu => try self.runMenuChoice(self.help_overlay.selected),
+            else => {},
+        }
+    }
+
+    fn runMenuChoice(self: *AppModel, index: usize) !void {
+        if (self.menu_analysis) {
+            switch (index) {
+                0 => try self.openFieldFilter(),
+                1 => {
+                    self.dismissOverlays();
+                    try self.command.setText("goto ");
+                    self.command.visible = true;
+                },
+                2 => {
+                    self.dismissOverlays();
+                    try self.runCommand("streams", "");
+                },
+                3 => {
+                    self.dismissOverlays();
+                    try self.runCommand("convs", "");
+                },
+                4 => {
+                    self.dismissOverlays();
+                    try self.runCommand("capinfo", "");
+                },
+                5 => try self.showMessage("Expert information is not built yet."),
+                6 => try self.showMessage("Protocol hierarchy is not built yet."),
+                7 => try self.showMessage("Endpoints are not built yet."),
+                8 => try self.showMessage("Export is not built yet."),
+                else => {},
+            }
+            return;
+        }
+        self.dismissOverlays();
+        switch (index) {
+            0 => try self.runCommand("columns", ""),
+            1 => try self.runCommand("theme", ""),
+            2 => try self.runCommand("profile", ""),
+            3 => try self.runCommand("marks", ""),
+            4 => try self.runCommand("tail", ""),
             else => {},
         }
     }
@@ -1754,6 +2005,8 @@ pub const AppModel = struct {
                     }
                     if (self.help_overlay.visible and self.help_overlay.pick and key.matches(vaxis.Key.enter, .{})) {
                         try self.activatePick();
+                        if (self.command.visible) try ctx.requestFocus(self.command.widget());
+                        if (self.focus == .filter) try ctx.requestFocus(self.filter.widget());
                         return ctx.consumeAndRedraw();
                     }
                     if (self.help_overlay.visible) {
@@ -1805,6 +2058,16 @@ pub const AppModel = struct {
                     return ctx.consumeEvent();
                 }
                 self.pending_z = false;
+                if (key.matches('=', .{})) {
+                    if (self.focus == .protocol) try self.openFieldFilter() else if (self.focus == .packets) try self.openConversationFilter();
+                    return ctx.consumeAndRedraw();
+                }
+                if (key.matches('g', .{}) and self.focus != .filter) {
+                    try self.command.setText("goto ");
+                    self.command.visible = true;
+                    try ctx.requestFocus(self.command.widget());
+                    return ctx.consumeAndRedraw();
+                }
                 if (key.matches('/', .{})) {
                     try self.ensureFieldCompletions();
                     self.focus = .filter;
@@ -1981,6 +2244,15 @@ pub const AppModel = struct {
             .hex => "hex",
             .filter => "filter",
         };
+        self.status.hint = switch (self.focus) {
+            .packets => "= conv   g goto",
+            .protocol => "= field filter",
+            .hex => "hjkl byte",
+            .filter => "Up recent   Tab name",
+        };
+        self.status.selected_index = self.session.selected_index;
+        self.status.tailing = self.tailing;
+        self.status.live = self.live_capture;
         const header_h: u16 = 1;
         const filter_h: u16 = 1;
         const status_h: u16 = 1;

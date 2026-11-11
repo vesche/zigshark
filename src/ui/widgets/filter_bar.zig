@@ -23,6 +23,7 @@ pub const FilterBar = struct {
     userdata: ?*anyopaque = null,
     onSubmit: ?*const fn (?*anyopaque, []const u8) anyerror!void = null,
     onRecent: ?*const fn (?*anyopaque) anyerror!void = null,
+    onHistory: ?*const fn (?*anyopaque, bool) anyerror!void = null,
     onFocus: ?*const fn (?*anyopaque) void = null,
     apply_col: u16 = 0,
     recent_col: u16 = 0,
@@ -69,6 +70,10 @@ pub const FilterBar = struct {
                 }
             },
             .key_press => |key| {
+                if (key.matches(vaxis.Key.up, .{}) or key.matches(vaxis.Key.down, .{})) {
+                    if (self.onHistory) |callback| try callback(self.userdata, key.matches(vaxis.Key.up, .{}));
+                    return ctx.consumeAndRedraw();
+                }
                 if (key.matches(vaxis.Key.enter, .{})) {
                     const text = try fieldText(ctx.alloc, &self.field);
                     defer ctx.alloc.free(text);

@@ -16,7 +16,6 @@ pub const PacketTable = struct {
     last_width: u16 = 0,
     sort_column: usize = 0,
     sort_ascending: bool = true,
-    pending_g: bool = false,
     focused: bool = false,
     userdata: ?*anyopaque = null,
     onSelect: ?*const fn (?*anyopaque, usize) void = null,
@@ -142,23 +141,16 @@ pub const PacketTable = struct {
                     self.ensureVisible(visible);
                     return ctx.consumeAndRedraw();
                 }
-                if (key.matches(vaxis.Key.home, .{}) or (key.matches('g', .{}) and self.pending_g)) {
+                if (key.matches(vaxis.Key.home, .{})) {
                     self.selectIndex(0);
                     self.scroll_top = 0;
-                    self.pending_g = false;
                     return ctx.consumeAndRedraw();
-                }
-                if (key.matches('g', .{})) {
-                    self.pending_g = true;
-                    return ctx.consumeEvent();
                 }
                 if (key.matches(vaxis.Key.end, .{}) or key.matches('G', .{ .shift = true })) {
                     if (self.rows.len > 0) self.selectIndex(self.rows.len - 1);
                     self.ensureVisible(visible);
-                    self.pending_g = false;
                     return ctx.consumeAndRedraw();
                 }
-                self.pending_g = false;
             },
             else => {},
         }
@@ -177,10 +169,7 @@ pub const PacketTable = struct {
             fillColumns(column_buf[0..7], size.width);
         const header_style: vaxis.Style = .{ .fg = self.theme.header_fg, .bg = self.theme.header_bg, .bold = true };
         const normal: vaxis.Style = .{ .fg = self.theme.fg, .bg = self.theme.bg };
-        const selected_style: vaxis.Style = if (self.focused)
-            .{ .fg = self.theme.selected_fg, .bg = self.theme.selected_bg }
-        else
-            .{ .fg = self.theme.fg, .bg = theme_mod.rgb(0, 50, 90) };
+        const selected_style = theme_mod.selectionStyle(self.theme, self.focused);
 
         fillRow(&surf, 0, size.width, header_style);
         const header_line = try formatRow(ctx.arena, columns, null);
@@ -265,7 +254,7 @@ pub fn columnAt(headers: []const []const u8, width: u16, clicked: u16) ?usize {
     for (columns) |column| {
         if (column.width == 0) continue;
         const end = col + column.width;
-        if (clicked >= col and clicked < end + 1) return if (headers.len > 0) column.index else @intFromEnum(column.semantic);
+        if (clicked >= col and clicked < end + 1) return if (headers.len > 0) column.index else @backingInt(column.semantic);
         col = end + 1;
     }
     return null;

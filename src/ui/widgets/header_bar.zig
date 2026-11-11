@@ -4,12 +4,26 @@ const vxfw = vaxis.vxfw;
 const theme_mod = @import("../theme.zig");
 const text_util = @import("text_util.zig");
 
+pub const menu_text = "[Analysis] [Misc] [Help]";
+
+pub fn menuAt(width: u16, col: u16) ?HeaderBar.Menu {
+    const total: u16 = @intCast(menu_text.len);
+    if (width <= total + 2 or col >= width) return null;
+    const start = width - total;
+    if (col < start) return null;
+    const relative = col - start;
+    if (relative < 11) return .analysis;
+    if (relative < 18) return .misc;
+    return .help;
+}
+
 pub const HeaderBar = struct {
-    pub const Menu = enum { analysis, view, help };
+    pub const Menu = enum { analysis, misc, help };
 
     theme: theme_mod.Theme,
     source: []const u8 = "",
     menu_start: u16 = 0,
+    last_width: u16 = 0,
     userdata: ?*anyopaque = null,
     onMenu: ?*const fn (?*anyopaque, Menu) void = null,
 
@@ -31,16 +45,9 @@ pub const HeaderBar = struct {
             .mouse => |mouse| {
                 if (mouse.row != 0 or mouse.col < 0) return;
                 const col: u16 = @intCast(mouse.col);
-                if (col < self.menu_start) return;
+                const menu = menuAt(self.last_width, col) orelse return;
                 try ctx.setMouseShape(.pointer);
                 if (mouse.type == .press and mouse.button == .left) {
-                    const relative = col - self.menu_start;
-                    const menu: Menu = if (relative < 10)
-                        .analysis
-                    else if (relative < 16)
-                        .view
-                    else
-                        .help;
                     if (self.onMenu) |callback| callback(self.userdata, menu);
                     return ctx.consumeAndRedraw();
                 }
@@ -85,14 +92,22 @@ pub const HeaderBar = struct {
             _ = text_util.writeText(&surface, ctx, cursor, 0, filename, style, size.width);
         }
 
-        const menu = "[Analysis]  [Misc]";
-        const menu_width: u16 = @intCast(@min(ctx.stringWidth(menu), size.width));
+        self.last_width = size.width;
+        const menu_width: u16 = @intCast(@min(menu_text.len, size.width));
         if (size.width > menu_width + 2) {
             self.menu_start = size.width - menu_width;
-            _ = text_util.writeText(&surface, ctx, self.menu_start, 0, menu, style, size.width);
+            _ = text_util.writeText(&surface, ctx, self.menu_start, 0, menu_text, style, size.width);
         } else {
             self.menu_start = size.width;
         }
         return surface;
     }
 };
+
+test "header menus sit on the right edge" {
+    try std.testing.expect(menuAt(40, 10) == null);
+    const start: u16 = 80 - @as(u16, @intCast(menu_text.len));
+    try std.testing.expectEqual(HeaderBar.Menu.analysis, menuAt(80, start).?);
+    try std.testing.expectEqual(HeaderBar.Menu.misc, menuAt(80, start + 11).?);
+    try std.testing.expectEqual(HeaderBar.Menu.help, menuAt(80, start + 18).?);
+}

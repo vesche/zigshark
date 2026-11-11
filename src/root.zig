@@ -70,7 +70,9 @@ pub const ui = struct {
         pub const filter_bar = @import("ui/widgets/filter_bar.zig");
         pub const status_bar = @import("ui/widgets/status_bar.zig");
         pub const text_util = @import("ui/widgets/text_util.zig");
+        pub const header_bar = @import("ui/widgets/header_bar.zig");
     };
+    pub const field_filter = @import("ui/field_filter.zig");
 };
 
 comptime {
@@ -99,6 +101,9 @@ comptime {
     _ = ui.widgets.packet_table;
     _ = ui.widgets.protocol_tree;
     _ = ui.widgets.hex_view;
+    _ = ui.widgets.status_bar;
+    _ = ui.widgets.header_bar;
+    _ = ui.field_filter;
     _ = features.macros;
     _ = features.recents;
     _ = platform.clipboard;

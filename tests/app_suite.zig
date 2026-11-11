@@ -555,6 +555,55 @@ test "set rejects a bad value and an unknown key without rewriting the file" {
     try std.testing.expectEqualStrings("Option updated", h.app.msg_overlay.body);
 }
 
+test "goto selects a frame and reports a miss" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    try h.setFrames(&.{ 1, 4, 9 });
+
+    try h.app.runCommand("goto", "4");
+    try std.testing.expectEqual(@as(?u32, 4), h.app.session.selectedFrame());
+
+    try h.app.runCommand("goto", "99");
+    try std.testing.expect(std.mem.indexOf(u8, h.app.msg_overlay.body, "not in the list") != null);
+    try std.testing.expectEqual(@as(?u32, 4), h.app.session.selectedFrame());
+}
+
+test "field filter can prepare without reloading and apply when asked" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    const children = try h.allocator.alloc(zigshark.model.packet.DetailNode, 1);
+    children[0] = try leaf(h.allocator, "tcp.srcport", "Source Port: 443", "443", 0, 2);
+    try installDetail(&h, children, "abcd");
+
+    try h.app.chooseFieldFilter(6);
+    try h.expectBar("tcp.srcport == 443");
+    try std.testing.expectEqual(@as(usize, 0), h.app.session.display_filter.len);
+
+    try h.app.session.setFilter("dns", null);
+    try h.app.chooseFieldFilter(2);
+    try std.testing.expectEqualStrings("dns and (tcp.srcport == 443)", h.app.session.display_filter);
+}
+
+test "filter bar recalls recent filters and an empty bar shows the list" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    try h.cfg.addRecentFilter("tcp");
+    try h.cfg.addRecentFilter("udp");
+
+    try h.app.filter.setText("");
+    try h.app.recallRecent(true);
+    try h.expectBar("udp");
+    try std.testing.expect(std.mem.indexOf(u8, h.app.status.mode, "recent 1/2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h.app.status.mode, "tcp") != null);
+
+    try h.app.recallRecent(true);
+    try h.expectBar("tcp");
+    try std.testing.expect(std.mem.indexOf(u8, h.app.status.mode, "recent 2/2") != null);
+}
+
 test "theme load falls back from the config directory to themes/" {
     var h: Harness = undefined;
     try h.setup();

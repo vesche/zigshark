@@ -35,6 +35,10 @@ zigshark capture -i eth0 -f 'port 53' -w /tmp/out.pcap
 ## Filters
 
 - Display filter: `/` then enter a Wireshark display filter; Enter applies it.
+- Up/Down in the filter bar recalls recent filters. An empty bar lists them.
+- `=` on a protocol field opens equals, not-equals, and, or, not, and contains. Apply reloads. Prepare only fills the bar. And/or appends to the current expression.
+- `=` on the packet list builds a conversation filter from the address pair, including tcp/udp ports when the columns have them.
+- `g` or `:goto 1234` selects that frame. A missing frame is a message.
 - Capture filter: `-f` on the CLI for live capture.
 - Validation uses `tshark -Y … -r empty.pcap`.
 
