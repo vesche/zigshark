@@ -78,11 +78,15 @@ comptime {
     _ = shark.tools;
     _ = shark.process;
     _ = shark.filter;
+    _ = shark.psml;
+    _ = shark.pdml;
+    _ = shark.hexdump;
     _ = shark.columns;
     _ = shark.fields;
     _ = shark.convs;
     _ = shark.streams;
     _ = shark.capinfo;
+    _ = xml_util;
     _ = model.packet;
     _ = model.session;
     _ = model.marks;
@@ -92,6 +96,11 @@ comptime {
     _ = config;
     _ = ui.theme;
     _ = ui.widgets.command_palette;
+    _ = ui.widgets.packet_table;
+    _ = ui.widgets.protocol_tree;
+    _ = ui.widgets.hex_view;
     _ = features.macros;
+    _ = features.recents;
     _ = platform.clipboard;
+    _ = platform.paths;
 }

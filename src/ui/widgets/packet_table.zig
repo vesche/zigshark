@@ -258,7 +258,7 @@ fn fillColumns(buf: []Column, total_width: u16) []const Column {
     return buf[0..7];
 }
 
-fn columnAt(headers: []const []const u8, width: u16, clicked: u16) ?usize {
+pub fn columnAt(headers: []const []const u8, width: u16, clicked: u16) ?usize {
     var buf: [12]Column = undefined;
     const columns = if (headers.len > 0) layoutHeaders(headers, width, &buf) else fillColumns(buf[0..7], width);
     var col: u16 = 0;
@@ -301,7 +301,7 @@ fn isNumericTitle(title: []const u8) bool {
 fn protocolCell(headers: []const []const u8, row: packet.PacketSummary) []const u8 {
     if (headers.len == 0) return cellFor(row, .protocol);
     for (headers, 0..) |header, index| {
-        if (std.ascii.indexOfIgnoreCase(header, "proto") != null and index < row.columns.len) {
+        if (std.ascii.findIgnoreCase(header, "proto") != null and index < row.columns.len) {
             return row.columns[index];
         }
     }

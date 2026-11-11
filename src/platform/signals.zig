@@ -36,7 +36,7 @@ pub fn suspendJob() void {
     if (builtin.os.tag == .windows) return;
     const tty = &(vaxis.tty.global_tty orelse return);
     const fd = tty.fd.handle;
-    _ = std.posix.write(fd, vaxis.ctlseqs.rmcup) catch {};
+    writeRaw(fd, vaxis.ctlseqs.rmcup);
     restoreTermios(fd, tty.termios);
     const previous = std.posix.Sigaction{
         .handler = .{ .handler = std.posix.SIG.DFL },
@@ -47,8 +47,13 @@ pub fn suspendJob() void {
     std.posix.sigaction(std.posix.SIG.TSTP, &previous, &saved);
     std.posix.raise(std.posix.SIG.TSTP) catch {};
     _ = vaxis.tty.Tty.makeRaw(fd) catch {};
-    _ = std.posix.write(fd, vaxis.ctlseqs.smcup) catch {};
+    writeRaw(fd, vaxis.ctlseqs.smcup);
     std.posix.sigaction(std.posix.SIG.TSTP, &saved, null);
+}
+
+fn writeRaw(fd: std.posix.fd_t, bytes: []const u8) void {
+    if (bytes.len == 0) return;
+    _ = std.posix.system.write(fd, bytes.ptr, bytes.len);
 }
 
 fn restoreTermios(fd: std.posix.fd_t, termios: std.posix.termios) void {

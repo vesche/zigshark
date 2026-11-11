@@ -48,4 +48,43 @@ test "live tshark follow/convs/capinfos against fixture" {
         defer info.deinit(allocator);
         try std.testing.expect(info.packetCount() != null);
     }
+
+    {
+        var argv = try zigshark.shark.process.argvPsmlLoad(allocator, discovered.tshark, .{ .file = pcap }, null, null);
+        defer argv.deinit(allocator);
+        var out = try zigshark.shark.process.runCapture(allocator, io, argv.slice());
+        defer out.deinit(allocator);
+        try std.testing.expect(out.term.success());
+        var table = try zigshark.model.packet.parsePsml(allocator, out.stdout);
+        defer table.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 18), table.packets.len);
+        try std.testing.expect(table.headers.len >= 7);
+    }
+
+    {
+        var argv = try zigshark.shark.process.argvPdmlBundle(allocator, discovered.tshark, pcap, null, 1, 1);
+        defer argv.deinit(allocator);
+        var out = try zigshark.shark.process.runCapture(allocator, io, argv.slice());
+        defer out.deinit(allocator);
+        try std.testing.expect(out.term.success());
+        var detail = try zigshark.model.packet.parsePdmlPacket(allocator, out.stdout, 1);
+        defer detail.deinit(allocator);
+        try std.testing.expect(detail.root.children.len >= 3);
+        try std.testing.expectEqual(@as(u32, 1), detail.frame);
+    }
+
+    try std.testing.expect(try zigshark.shark.filter.validateDisplayFilter(
+        allocator,
+        io,
+        discovered.tshark,
+        "tests/fixtures/empty.pcap",
+        "tcp.port == 443",
+    ));
+    try std.testing.expect(!try zigshark.shark.filter.validateDisplayFilter(
+        allocator,
+        io,
+        discovered.tshark,
+        "tests/fixtures/empty.pcap",
+        "this is not a filter",
+    ));
 }

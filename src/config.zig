@@ -264,6 +264,7 @@ pub const Config = struct {
     pub fn formatSettings(self: *const Config, allocator: std.mem.Allocator) ![]u8 {
         var writer: std.Io.Writer.Allocating = .init(allocator);
         errdefer writer.deinit();
+        // Zig 0.17 allows at most 32 format arguments per print call.
         try writer.writer.print(
             \\Settings (:set <key> <value>)
             \\tshark = {s}
@@ -298,10 +299,6 @@ pub const Config = struct {
             \\copy-command-timeout = {d}
             \\browse-command = {s}
             \\pager = {s}
-            \\wormhole-length = {d}
-            \\wormhole-rendezvous-url = {s}
-            \\wormhole-transit-relay = {s}
-            \\wireshark-profile = {s}
             \\
         , .{
             self.tshark,
@@ -336,6 +333,14 @@ pub const Config = struct {
             self.copy_command_timeout,
             self.browse_command,
             self.pager,
+        });
+        try writer.writer.print(
+            \\wormhole-length = {d}
+            \\wormhole-rendezvous-url = {s}
+            \\wormhole-transit-relay = {s}
+            \\wireshark-profile = {s}
+            \\
+        , .{
             self.wormhole_length,
             self.wormhole_rendezvous_url,
             self.wormhole_transit_relay,

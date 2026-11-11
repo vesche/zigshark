@@ -295,12 +295,10 @@ fn spoolStdinToCapture(
     return path;
 }
 
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa);
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
+test "version line is non-empty" {
+    const line = zigshark.version.versionLine();
+    try std.testing.expect(line.len > 8);
+    try std.testing.expect(std.mem.indexOf(u8, line, "zigshark") != null);
 }
 
 test "pass-through strips zigshark flags and translates file shorthand" {
