@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const RunOutput = struct {
     stdout: []u8,
@@ -78,6 +79,36 @@ pub fn runCaptureCancellable(
     argv: []const []const u8,
     token: ?*CancellationToken,
 ) !RunOutput {
+    var first = try runOnce(allocator, io, argv, token);
+    if (builtin.os.tag != .linux or first.term.success()) return first;
+    const path_index = deniedCaptureArg(argv, first.stderr) orelse return first;
+
+    const copied = copyCaptureToTmp(allocator, io, argv[path_index]) catch return first;
+    defer allocator.free(copied);
+    defer std.Io.Dir.cwd().deleteFile(io, copied) catch {};
+
+    const replaced = allocator.alloc([]const u8, argv.len) catch |err| {
+        first.deinit(allocator);
+        return err;
+    };
+    defer allocator.free(replaced);
+    @memcpy(replaced, argv);
+    replaced[path_index] = copied;
+
+    const second = runOnce(allocator, io, replaced, token) catch |err| {
+        first.deinit(allocator);
+        return err;
+    };
+    first.deinit(allocator);
+    return second;
+}
+
+fn runOnce(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    token: ?*CancellationToken,
+) !RunOutput {
     if (token) |cancel| {
         if (cancel.isCancelled()) return error.Cancelled;
     }
@@ -125,6 +156,65 @@ pub fn runCaptureCancellable(
         .stderr = stderr_slice,
         .term = term,
     };
+}
+
+/// Ubuntu 26 confines tshark with AppArmor so it can read captures under `/tmp`
+/// and almost nowhere else. The kernel reports that as EACCES.
+fn deniedCaptureArg(argv: []const []const u8, stderr: []const u8) ?usize {
+    if (std.mem.indexOf(u8, stderr, "don't have permission to read the file") == null) return null;
+    var i: usize = 0;
+    while (i + 1 < argv.len) : (i += 1) {
+        if (!std.mem.eql(u8, argv[i], "-r")) continue;
+        if (stderrQuotes(stderr, argv[i + 1])) return i + 1;
+    }
+    var j = argv.len;
+    while (j > 1) {
+        j -= 1;
+        if (stderrQuotes(stderr, argv[j])) return j;
+    }
+    return null;
+}
+
+fn stderrQuotes(stderr: []const u8, path: []const u8) bool {
+    if (path.len == 0 or std.mem.eql(u8, path, "-")) return false;
+    if (path.len + 2 > 4096) return false;
+    var buf: [4096]u8 = undefined;
+    const quoted = std.fmt.bufPrint(buf[0 .. path.len + 2], "\"{s}\"", .{path}) catch return false;
+    return std.mem.indexOf(u8, stderr, quoted) != null;
+}
+
+var temp_capture_seq: std.atomic.Value(u64) = .init(0);
+
+fn copyCaptureToTmp(allocator: std.mem.Allocator, io: std.Io, src: []const u8) ![]u8 {
+    var nonce: [8]u8 = undefined;
+    io.random(&nonce);
+    const seq = temp_capture_seq.fetchAdd(1, .monotonic);
+    const hex = std.fmt.bytesToHex(&nonce, .lower);
+    const dest = try std.fmt.allocPrint(allocator, "/tmp/zigshark-{d}-{s}.pcap", .{ seq, hex[0..] });
+    errdefer allocator.free(dest);
+    const cwd = std.Io.Dir.cwd();
+    errdefer cwd.deleteFile(io, dest) catch {};
+
+    const in_file = try cwd.openFile(io, src, .{});
+    defer in_file.close(io);
+    const out_file = try cwd.createFile(io, dest, .{
+        .truncate = true,
+        .permissions = @enumFromInt(0o600),
+    });
+    errdefer out_file.close(io);
+
+    var buf: [64 * 1024]u8 = undefined;
+    var iov: [1][]u8 = .{&buf};
+    while (true) {
+        const n = in_file.readStreaming(io, &iov) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => |e| return e,
+        };
+        if (n == 0) break;
+        try out_file.writeStreamingAll(io, buf[0..n]);
+    }
+    out_file.close(io);
+    return dest;
 }
 
 pub const Argv = struct {
@@ -391,4 +481,17 @@ test "argv builders produce expected heads" {
     var validate = try argvFilterValidate(allocator, "tshark", "tests/fixtures/empty.pcap", "tcp");
     defer validate.deinit(allocator);
     try std.testing.expect(std.mem.eql(u8, validate.list.items[validate.list.items.len - 1], "tcp"));
+}
+
+test "read denial selects the capture path" {
+    const stderr = "tshark: You don't have permission to read the file \"tests/fixtures/1.pcap\".\n";
+    const tshark_argv = [_][]const u8{ "tshark", "-r", "tests/fixtures/1.pcap", "-T", "psml" };
+    try std.testing.expectEqual(@as(?usize, 2), deniedCaptureArg(&tshark_argv, stderr));
+    try std.testing.expect(deniedCaptureArg(&tshark_argv, "tshark: syntax error\n") == null);
+
+    const capinfos_argv = [_][]const u8{ "capinfos", "tests/fixtures/1.pcap" };
+    try std.testing.expectEqual(@as(?usize, 1), deniedCaptureArg(&capinfos_argv, stderr));
+    const stdin_argv = [_][]const u8{ "tshark", "-r", "-", "-T", "psml" };
+    const stdin_err = "tshark: You don't have permission to read the file \"-\".\n";
+    try std.testing.expect(deniedCaptureArg(&stdin_argv, stdin_err) == null);
 }

@@ -547,8 +547,10 @@ test "parse toml config" {
     try std.testing.expectEqual(@as(u32, 32), cfg.disk_cache_size_mb);
 
     const io = std.testing.io;
-    const path = "/tmp/zigshark-settings-test.toml";
-    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/settings.toml", .{tmp.sub_path[0..]});
+    defer allocator.free(path);
     try cfg.save(io, path);
     var loaded = try Config.loadOrDefault(allocator, io, path);
     defer loaded.deinit();

@@ -1,8 +1,8 @@
 # zigshark
 
-A terminal UI for [tshark](https://www.wireshark.org/), rewritten in [Zig](https://ziglang.org/) with [libvaxis](https://github.com/rockorager/libvaxis).
+A terminal UI for [tshark](https://www.wireshark.org/), written in [Zig](https://ziglang.org/) with [libvaxis](https://github.com/rockorager/libvaxis).
 
-zigshark is an active clean-room rewrite of [termshark](https://github.com/gcla/termshark). The offline analysis path is usable today: aligned packet list, nested protocol tree, highlighted hex view, filters, search, marks, streams, conversations, profiles, and live-capture orchestration. Some advanced termshark workflows are still being ported; [docs/parity.md](docs/parity.md) tracks them without treating parser-only or stub code as complete.
+zigshark is an active clean-room rewrite of [termshark](https://github.com/gcla/termshark). The offline analysis path is usable today: aligned packet list, nested protocol tree, highlighted hex view, filters, search, marks, streams, conversations, profiles, and live-capture orchestration. [docs/parity.md](docs/parity.md) is the termshark baseline. [docs/roadmap.md](docs/roadmap.md) is what to build next.
 
 ## Requirements
 
@@ -61,7 +61,7 @@ Non-TTY stdout auto-forwards to `tshark` (`--pass-thru=auto`).
 
 Default path: `$XDG_CONFIG_HOME/zigshark/config.toml` (or `~/.config/zigshark/config.toml`).
 
-See [docs/user-guide.md](docs/user-guide.md) and [docs/parity.md](docs/parity.md).
+See [docs/user-guide.md](docs/user-guide.md), [docs/parity.md](docs/parity.md), and [docs/roadmap.md](docs/roadmap.md).
 
 ## Architecture
 

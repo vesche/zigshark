@@ -19,8 +19,10 @@ test "settings round-trip through toml" {
     try cfg.applySetting("pcap-bundle-size", "250");
     try cfg.applySetting("wormhole-length", "4");
 
-    const path = "/tmp/zigshark-suite-config.toml";
-    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/config.toml", .{tmp.sub_path[0..]});
+    defer allocator.free(path);
     try cfg.save(io, path);
 
     var loaded = try config.Config.loadOrDefault(allocator, io, path);
@@ -90,12 +92,22 @@ test "macros expand a known name and leave an unknown dollar sign" {
 test "profiles can be created, listed, and deleted" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const config_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "home" });
+    defer allocator.free(config_dir);
+    const cache_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "cache" });
+    defer allocator.free(cache_dir);
+    const data_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "data" });
+    defer allocator.free(data_dir);
+    const log_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "zigshark.log" });
+    defer allocator.free(log_path);
     var paths = zigshark.platform.paths.Paths{
         .allocator = allocator,
-        .config_dir = try allocator.dupe(u8, "/tmp/zigshark-suite-home"),
-        .cache_dir = try allocator.dupe(u8, "/tmp/zigshark-suite-cache"),
-        .data_dir = try allocator.dupe(u8, "/tmp/zigshark-suite-data"),
-        .log_path = try allocator.dupe(u8, "/tmp/zigshark-suite.log"),
+        .config_dir = try allocator.dupe(u8, config_dir),
+        .cache_dir = try allocator.dupe(u8, cache_dir),
+        .data_dir = try allocator.dupe(u8, data_dir),
+        .log_path = try allocator.dupe(u8, log_path),
     };
     defer paths.deinit();
 

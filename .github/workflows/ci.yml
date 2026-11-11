@@ -24,7 +24,16 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y tshark || sudo apt-get install -y wireshark-common
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y wireshark-common
+          # Ubuntu 26 AppArmor confines tshark to /tmp. Drop that profile so file
+          # reads in the checkout are tested directly; the process runner also
+          # retries from /tmp when the profile is still loaded.
+          if [ -f /etc/apparmor.d/tshark ]; then
+            sudo apparmor_parser -R /etc/apparmor.d/tshark || true
+          fi
+          if [ -f /etc/apparmor.d/usr.bin.tshark ]; then
+            sudo apparmor_parser -R /etc/apparmor.d/usr.bin.tshark || true
+          fi
 
       - name: Install tshark (macOS)
         if: runner.os == 'macOS'

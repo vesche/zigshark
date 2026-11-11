@@ -135,13 +135,25 @@ fn ensureEmptyPcap(io: std.Io, cache_dir: []const u8) !void {
 }
 
 test "resolve creates expected layout" {
+    const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var map = std.process.Environ.Map.init(std.testing.allocator);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "home" });
+    defer allocator.free(home);
+    const config_home = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "config" });
+    defer allocator.free(config_home);
+    const cache_home = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "cache" });
+    defer allocator.free(cache_home);
+    const data_home = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "data" });
+    defer allocator.free(data_home);
+
+    var map = std.process.Environ.Map.init(allocator);
     defer map.deinit();
-    try map.put("HOME", "/tmp/zigshark-test-home");
-    try map.put("XDG_CONFIG_HOME", "/tmp/zigshark-test-config");
-    try map.put("XDG_CACHE_HOME", "/tmp/zigshark-test-cache");
-    try map.put("XDG_DATA_HOME", "/tmp/zigshark-test-data");
+    try map.put("HOME", home);
+    try map.put("XDG_CONFIG_HOME", config_home);
+    try map.put("XDG_CACHE_HOME", cache_home);
+    try map.put("XDG_DATA_HOME", data_home);
 
     var paths = try resolve(std.testing.allocator, io, &map);
     defer paths.deinit();
