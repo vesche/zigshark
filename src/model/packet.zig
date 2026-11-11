@@ -123,6 +123,8 @@ pub const PsmlTable = struct {
     packets: []PacketSummary = &.{},
     /// A later chunk of the same tshark run. The caller appends instead of replacing.
     append: bool = false,
+    /// Which `requestPsml` produced this table. Zero means the caller did not tag it.
+    generation: u64 = 0,
 
     pub fn deinit(self: *PsmlTable, allocator: std.mem.Allocator) void {
         for (self.headers) |header| allocator.free(header);

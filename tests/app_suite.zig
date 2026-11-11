@@ -38,6 +38,21 @@ const follow_text =
     \\1
     \\00000000  57 6f 72 6c 64
 ;
+const hierarchy_text =
+    \\frame                                    frames:4 bytes:40
+    \\  eth                                    frames:4 bytes:40
+    \\    ip                                   frames:4 bytes:40
+    \\      tcp                                frames:4 bytes:40
+    \\        tls                              frames:2 bytes:20
+;
+const endpoint_text =
+    \\TCP Endpoints
+    \\10.0.0.9                  443            4   900 bytes           2      400 bytes            2      500 bytes
+    \\10.0.0.1                  80             2   100 bytes           1      40 bytes             1      60 bytes
+;
+const protocol_text = "Hypertext Transfer Protocol\tHTTP\thttp\tT\tT\tT\n" ++
+    "Transport Layer Security\tTLS\ttls\tT\tT\tT\n" ++
+    "Domain Name System\tDNS\tdns\tT\tT\tT\n";
 
 const Script = struct {
     allocator: std.mem.Allocator,
@@ -98,6 +113,9 @@ fn replyFor(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
             return allocator.dupe(u8, tcp_conversation);
         }
         if (std.mem.startsWith(u8, arg, "follow,")) return allocator.dupe(u8, follow_text);
+        if (std.mem.eql(u8, arg, "io,phs")) return allocator.dupe(u8, hierarchy_text);
+        if (std.mem.startsWith(u8, arg, "endpoints,")) return allocator.dupe(u8, endpoint_text);
+        if (std.mem.eql(u8, arg, "protocols")) return allocator.dupe(u8, protocol_text);
         if (std.mem.eql(u8, arg, "frame.number")) return allocator.dupe(u8, "1\n4\n9\n");
     }
     return allocator.dupe(u8, "");
@@ -608,6 +626,29 @@ test "filter bar recalls recent filters and an empty bar shows the list" {
     try std.testing.expect(std.mem.indexOf(u8, h.app.status.mode, "recent 2/2") != null);
 }
 
+test "a recent filter can be selected and clear restores the full list" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    try h.cfg.addRecentFilter("dns");
+    try h.cfg.addRecentFilter("tcp.port == 443");
+
+    try h.app.openRecentFilters();
+    try std.testing.expect(h.app.help_overlay.visible);
+    try std.testing.expect(h.app.help_overlay.pick);
+    try std.testing.expect(std.mem.indexOf(u8, h.app.help_overlay.body, "tcp.port == 443") != null);
+    h.app.help_overlay.selected = 0;
+    try h.app.activatePick();
+    try std.testing.expectEqualStrings("tcp.port == 443", h.app.session.display_filter);
+    try h.expectBar("tcp.port == 443");
+    try std.testing.expect(!h.app.help_overlay.visible);
+
+    try h.app.clearDisplayFilter();
+    try h.expectBar("");
+    try std.testing.expectEqual(@as(usize, 0), h.app.session.display_filter.len);
+    try std.testing.expect(h.app.filter.state == .neutral);
+}
+
 test "saved filters apply by name and macros show before submit" {
     var h: Harness = undefined;
     try h.setup();
@@ -648,6 +689,37 @@ test "filter feedback waits for a pause and shows the tshark error" {
     h.app.pollFilterFeedback();
     try std.testing.expect(h.app.filter.state == .neutral);
     try std.testing.expectEqual(@as(usize, 0), h.app.status.filter_error.len);
+    try std.testing.expectEqual(@as(usize, 0), h.app.session.display_filter.len);
+}
+
+test "a settled display filter reloads the packet list" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    h.app.filter_check_sync = true;
+
+    try h.app.filter.setText("tcp.port == 443");
+    var i: usize = 0;
+    while (i < 4) : (i += 1) h.app.pollFilterFeedback();
+    try std.testing.expect(h.app.filter.state == .ok);
+    try std.testing.expectEqualStrings("tcp.port == 443", h.app.session.display_filter);
+    var saw_filter = false;
+    const argv = h.loader.psml_argv.slice();
+    for (argv, 0..) |arg, index| {
+        if (std.mem.eql(u8, arg, "-Y") and index + 1 < argv.len) {
+            try std.testing.expectEqualStrings("tcp.port == 443", argv[index + 1]);
+            saw_filter = true;
+        }
+    }
+    try std.testing.expect(saw_filter);
+
+    try h.app.filter.setText("");
+    i = 0;
+    while (i < 4) : (i += 1) h.app.pollFilterFeedback();
+    try std.testing.expectEqual(@as(usize, 0), h.app.session.display_filter.len);
+    for (h.loader.psml_argv.slice()) |arg| {
+        try std.testing.expect(!std.mem.eql(u8, arg, "-Y"));
+    }
 }
 
 test "theme load falls back from the config directory to themes/" {
@@ -775,4 +847,153 @@ test "conversation and stream views stop at the row cap" {
     try h.app.runCommand("streams", "tcp 0");
     try std.testing.expectEqual(process.view_row_cap, h.app.stream_chunks.len);
     try std.testing.expect(std.mem.indexOf(u8, h.app.help_overlay.body, "Stopped after 200 rows") != null);
+}
+
+test "expert info comes from the open packet and time zero is local" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+
+    const chat = try leaf(h.allocator, "_ws.expert", "Expert Info (Chat/Sequence): hello", "", 0, 0);
+    const warning = try leaf(h.allocator, "_ws.expert", "Expert Info (Warning/Malformed): bad", "", 0, 0);
+    const children = try h.allocator.alloc(packet.DetailNode, 2);
+    children[0] = chat;
+    children[1] = warning;
+    try installDetail(&h, children, "");
+    try h.app.runCommand("expert", "");
+    try std.testing.expectEqual(@as(usize, 2), h.app.expert_items.len);
+    try std.testing.expect(std.mem.startsWith(u8, h.app.help_overlay.body, "warning"));
+    try h.app.activatePick();
+    const selected = h.app.protocol_tree.selectedField() orelse return error.MissingField;
+    try std.testing.expectEqualStrings("_ws.expert", selected.name);
+
+    const headers = try h.allocator.alloc([]u8, 2);
+    headers[0] = try h.allocator.dupe(u8, "No.");
+    headers[1] = try h.allocator.dupe(u8, "Time");
+    h.app.session.setListHeaders(headers);
+    const packets = try h.allocator.alloc(packet.PacketSummary, 2);
+    packets[0] = try timedRow(h.allocator, 1, "1.000000");
+    packets[1] = try timedRow(h.allocator, 2, "1.250000");
+    h.app.session.setPackets(packets);
+    try std.testing.expect(h.app.session.select(0));
+    try h.app.toggleTimeReference();
+    try std.testing.expectEqual(@as(?f64, 1), h.app.packet_table.time_base);
+    try std.testing.expect(h.app.session.select(1));
+    try h.app.toggleTimeReference();
+    try std.testing.expectEqual(@as(?u32, 2), h.app.time_reference_frame);
+    try h.app.toggleTimeReference();
+    try std.testing.expect(h.app.time_reference_frame == null);
+}
+
+fn timedRow(allocator: std.mem.Allocator, frame: u32, time: []const u8) !packet.PacketSummary {
+    const columns = try allocator.alloc([]const u8, 2);
+    columns[0] = try std.fmt.allocPrint(allocator, "{d}", .{frame});
+    columns[1] = try allocator.dupe(u8, time);
+    return .{ .frame = frame, .columns = columns };
+}
+
+test "a field becomes a column and a tls key log reaches tshark" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    const field = try leaf(h.allocator, "tls.handshake.extensions_server_name", "Server Name: example", "example", 0, 1);
+    const children = try h.allocator.alloc(packet.DetailNode, 1);
+    children[0] = field;
+    try installDetail(&h, children, "");
+    try std.testing.expect(h.app.protocol_tree.selectNamed("tls.handshake.extensions_server_name", 0));
+    try h.app.runCommand("columns", "add");
+    try std.testing.expect(std.mem.indexOf(u8, h.columnFormat(), "%Cus:tls.handshake.extensions_server_name") != null);
+    try h.app.runCommand("columns", "drop tls.handshake.extensions_server_name");
+    try std.testing.expect(std.mem.indexOf(u8, h.columnFormat(), "%Cus:") == null);
+
+    try h.app.runCommand("set", "tls-keylog-file /tmp/keys.log");
+    try std.testing.expectEqualStrings("/tmp/keys.log", h.app.session.tls_keylog_file);
+    var saw = false;
+    for (h.loader.psml_argv.slice()) |arg| {
+        if (std.mem.indexOf(u8, arg, "tls.keylog_file:/tmp/keys.log") != null) saw = true;
+    }
+    try std.testing.expect(saw);
+}
+
+test "hierarchy and endpoints apply a filter from the selected row" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    try h.app.session.setFilter("dns", null);
+    try h.app.runCommand("hierarchy", "");
+    try std.testing.expect(h.script.saw("io,phs"));
+    try std.testing.expect(std.mem.indexOf(u8, h.app.help_overlay.body, "tls") != null);
+    h.app.help_overlay.selected = 4;
+    try h.app.activatePick();
+    try std.testing.expectEqualStrings("(dns) and tls", h.app.session.display_filter);
+
+    try h.app.runCommand("endpoints", "tcp");
+    try std.testing.expect(h.script.saw("endpoints,tcp"));
+    try h.app.activatePick();
+    try std.testing.expect(std.mem.indexOf(u8, h.app.session.display_filter, "ip.addr == 10.0.0.9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h.app.session.display_filter, "tcp.port == 443") != null);
+}
+
+test "export writes displayed rows and confirms before replacing a file" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    const headers = try h.allocator.alloc([]u8, 2);
+    headers[0] = try h.allocator.dupe(u8, "No.");
+    headers[1] = try h.allocator.dupe(u8, "Info");
+    h.app.session.setListHeaders(headers);
+    const packets = try h.allocator.alloc(packet.PacketSummary, 1);
+    const columns = try h.allocator.alloc([]const u8, 2);
+    columns[0] = try h.allocator.dupe(u8, "1");
+    columns[1] = try h.allocator.dupe(u8, "hello");
+    packets[0] = .{ .frame = 1, .columns = columns };
+    h.app.session.setPackets(packets);
+    try std.testing.expect(h.app.session.select(0));
+
+    const json_path = try std.fmt.allocPrint(h.allocator, ".zig-cache/tmp/{s}/rows.json", .{h.tmp.sub_path[0..]});
+    defer h.allocator.free(json_path);
+    const json_args = try std.fmt.allocPrint(h.allocator, "json {s}", .{json_path});
+    defer h.allocator.free(json_args);
+    try h.app.runCommand("export", json_args);
+    const json = try readFile(h.allocator, h.io, json_path);
+    defer h.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"Info\":\"hello\"") != null);
+
+    const pcap_path = try std.fmt.allocPrint(h.allocator, ".zig-cache/tmp/{s}/out.pcapng", .{h.tmp.sub_path[0..]});
+    defer h.allocator.free(pcap_path);
+    try std.Io.Dir.cwd().writeFile(h.io, .{ .sub_path = pcap_path, .data = "exists" });
+    const pcap_args = try std.fmt.allocPrint(h.allocator, "packets {s}", .{pcap_path});
+    defer h.allocator.free(pcap_args);
+    try h.app.runCommand("export", pcap_args);
+    try std.testing.expect(!h.script.saw("-w"));
+    try std.testing.expect(h.app.export_confirm);
+    try h.app.acceptExport();
+    try std.testing.expect(h.script.saw("-F"));
+    try std.testing.expect(h.script.saw("pcapng"));
+    try std.testing.expect(h.script.saw(pcap_path));
+
+    const objects = try std.fmt.allocPrint(h.allocator, ".zig-cache/tmp/{s}/objects", .{h.tmp.sub_path[0..]});
+    defer h.allocator.free(objects);
+    const object_args = try std.fmt.allocPrint(h.allocator, "objects http {s}", .{objects});
+    defer h.allocator.free(object_args);
+    try h.app.runCommand("export", object_args);
+    try std.testing.expect(h.script.saw("--export-objects"));
+    try std.testing.expect(h.script.saw(objects));
+}
+
+test "decode-as offers the selected packet's port and a short protocol list" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    const port = try leaf(h.allocator, "tcp.dstport", "Destination Port: 443", "443", 0, 2);
+    const children = try h.allocator.alloc(packet.DetailNode, 1);
+    children[0] = port;
+    try installDetail(&h, children, "");
+    try h.app.runCommand("decode-as", "");
+    try std.testing.expect(std.mem.indexOf(u8, h.app.help_overlay.body, "tcp.port==443") != null);
+    try h.app.activatePick();
+    try std.testing.expect(std.mem.indexOf(u8, h.app.help_overlay.body, "http") != null);
+    try h.app.activatePick();
+    try std.testing.expectEqual(@as(usize, 1), h.app.session.decode_as_args.items.len);
+    try std.testing.expectEqualStrings("tcp.port==443,http", h.app.session.decode_as_args.items[0]);
 }

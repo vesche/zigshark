@@ -14,9 +14,12 @@ pub const CommandDef = struct {
 pub const defaultCommands = [_]CommandDef{
     .{ .name = "quit", .description = "Exit zigshark", .usage = ":quit" },
     .{ .name = "help", .description = "Show key bindings", .usage = ":help" },
-    .{ .name = "filter", .description = "Focus display filter", .usage = ":filter" },
+    .{ .name = "filter", .description = "Apply a display filter", .usage = ":filter [expression]" },
     .{ .name = "goto", .description = "Select a frame by number", .usage = ":goto <frame>" },
-    .{ .name = "decode-as", .description = "Add a tshark decode-as rule", .usage = ":decode-as layer==selector,protocol" },
+    .{ .name = "decode-as", .description = "Decode the selected packet, or add a raw rule", .usage = ":decode-as [layer==selector,protocol]" },
+    .{ .name = "hierarchy", .description = "Protocol hierarchy; Enter filters", .usage = ":hierarchy" },
+    .{ .name = "endpoints", .description = "Loudest addresses; Enter filters", .usage = ":endpoints [tcp|udp|ip|ipv6|eth]" },
+    .{ .name = "export", .description = "Write packets, one packet, json, csv, or objects", .usage = ":export packets|packet|json|csv <path> | objects http|smb <dir>" },
     .{ .name = "timestamp", .description = "Set tshark timestamp format", .usage = ":timestamp a|ad|adoy|d|dd|e|r|u|ud|udoy" },
     .{ .name = "search", .description = "Search packet list", .usage = ":search <text>" },
     .{ .name = "search-regex", .description = "Search with . * + ? [] ^ $", .usage = ":search-regex <pattern>" },
@@ -28,7 +31,9 @@ pub const defaultCommands = [_]CommandDef{
     .{ .name = "streams", .description = "Follow the current TCP/UDP stream", .usage = ":streams [tcp|udp] [index] [ascii|hex|raw]" },
     .{ .name = "convs", .description = "List conversations; Enter filters", .usage = ":convs [tcp|udp|ip|ipv6|eth]" },
     .{ .name = "capinfo", .description = "Capture file info", .usage = ":capinfo" },
-    .{ .name = "columns", .description = "Choose the packet-list columns", .usage = ":columns [default|delta|absolute|set <format>]" },
+    .{ .name = "columns", .description = "Choose the packet-list columns", .usage = ":columns [default|delta|absolute|set <format>|add <field>|drop <field>]" },
+    .{ .name = "expert", .description = "Expert info on the open packet", .usage = ":expert" },
+    .{ .name = "time-ref", .description = "Set or clear time zero on the selected frame", .usage = ":time-ref" },
     .{ .name = "tail", .description = "Follow a growing capture", .usage = ":tail" },
     .{ .name = "config", .description = "Show active configuration", .usage = ":config" },
     .{ .name = "logs", .description = "Show log file location", .usage = ":logs" },
@@ -166,11 +171,34 @@ pub const CommandPalette = struct {
             return .{ .size = .{}, .widget = self.widget(), .buffer = &.{}, .children = &.{} };
         }
         var surf = try vxfw.Surface.init(ctx.arena, self.widget(), size);
-        const style: vaxis.Style = .{ .fg = self.theme.fg, .bg = self.theme.bg };
+        const style: vaxis.Style = .{ .fg = self.theme.fg, .bg = self.theme.header_bg };
+        var row_fill: u16 = 0;
+        while (row_fill < size.height) : (row_fill += 1) {
+            var col_fill: u16 = 0;
+            while (col_fill < size.width) : (col_fill += 1) {
+                surf.writeCell(col_fill, row_fill, .{
+                    .char = .{ .grapheme = " ", .width = 1 },
+                    .style = style,
+                });
+            }
+        }
         surf.writeCell(0, 0, .{ .char = .{ .grapheme = ":", .width = 1 }, .style = style });
         self.field.style = style;
         const field_ctx = ctx.withConstraints(.{}, .{ .width = size.width -| 1, .height = 1 });
-        const field_surf = try self.field.draw(field_ctx);
+        var field_surf = try self.field.draw(field_ctx);
+        if (field_surf.cursor) |cursor| {
+            const mark_at: usize = @min(cursor.col, field_surf.size.width -| 1);
+            var cell = field_surf.readCell(mark_at, 0);
+            cell.style.fg = self.theme.selected_fg;
+            cell.style.bg = self.theme.selected_bg;
+            if (cell.char.grapheme.len == 0) cell.char = .{ .grapheme = " ", .width = 1 };
+            field_surf.writeCell(@intCast(mark_at), 0, cell);
+            surf.cursor = .{
+                .col = 1 + @as(u16, @intCast(mark_at)),
+                .row = 0,
+                .shape = .block,
+            };
+        }
         const matches = try self.matching(ctx.arena);
         if (self.selected >= matches.len and matches.len > 0) self.selected = matches.len - 1;
         var row: u16 = 1;
@@ -209,7 +237,7 @@ test "fuzzy match" {
 test "selected commands show their arguments" {
     try std.testing.expectEqualStrings(":streams [tcp|udp] [index] [ascii|hex|raw]", commandUsage("streams"));
     try std.testing.expect(std.mem.indexOf(u8, commandUsage("columns"), "set <format>") != null);
-    try std.testing.expectEqualStrings(":decode-as layer==selector,protocol", commandUsage("decode-as"));
+    try std.testing.expectEqualStrings(":decode-as [layer==selector,protocol]", commandUsage("decode-as"));
 }
 
 test "parse command line" {

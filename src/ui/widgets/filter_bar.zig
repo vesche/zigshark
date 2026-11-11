@@ -18,14 +18,17 @@ pub fn fieldText(alloc: std.mem.Allocator, field: *vxfw.TextField) ![]const u8 {
 pub const FilterBar = struct {
     field: vxfw.TextField,
     theme: theme_mod.Theme,
-    label: []const u8 = "Filter:",
+    label: []const u8 = "Filter: ",
     state: FilterState = .neutral,
+    focused: bool = false,
     userdata: ?*anyopaque = null,
     onSubmit: ?*const fn (?*anyopaque, []const u8) anyerror!void = null,
+    onClear: ?*const fn (?*anyopaque) anyerror!void = null,
     onRecent: ?*const fn (?*anyopaque) anyerror!void = null,
     onHistory: ?*const fn (?*anyopaque, bool) anyerror!void = null,
     onFocus: ?*const fn (?*anyopaque) void = null,
     apply_col: u16 = 0,
+    clear_col: u16 = 0,
     recent_col: u16 = 0,
 
     pub fn init(alloc: std.mem.Allocator, theme: theme_mod.Theme) FilterBar {
@@ -57,11 +60,15 @@ pub const FilterBar = struct {
                 }
                 if (mouse.type == .press and mouse.button == .left and mouse.row == 0 and mouse.col >= 0) {
                     const col: u16 = @intCast(mouse.col);
-                    if (col >= self.recent_col and self.recent_col > 0) {
+                    if (self.recent_col > 0 and col >= self.recent_col) {
                         if (self.onRecent) |callback| try callback(self.userdata);
                         return ctx.consumeAndRedraw();
                     }
-                    if (col >= self.apply_col and self.apply_col > 0) {
+                    if (self.clear_col > 0 and col >= self.clear_col and col < self.recent_col) {
+                        if (self.onClear) |callback| try callback(self.userdata);
+                        return ctx.consumeAndRedraw();
+                    }
+                    if (self.apply_col > 0 and col >= self.apply_col and col < self.clear_col) {
                         const text = try fieldText(ctx.alloc, &self.field);
                         defer ctx.alloc.free(text);
                         if (self.onSubmit) |callback| try callback(self.userdata, text);
@@ -120,11 +127,12 @@ pub const FilterBar = struct {
         self.field.style = .{ .fg = fg, .bg = row_bg };
         const label_style: vaxis.Style = .{ .fg = self.theme.filter_fg, .bg = row_bg, .bold = true };
         const col = text_util.writeText(&surf, ctx, 0, 0, self.label, label_style, size.width);
-        const buttons = "<Apply>  <Recent>";
+        const buttons = "<Apply>  <Clear>  <Recent>";
         const button_width: u16 = @intCast(@min(ctx.stringWidth(buttons), size.width));
         const buttons_col = if (size.width > button_width) size.width - button_width else size.width;
         self.apply_col = buttons_col;
-        self.recent_col = @min(size.width, buttons_col + 9);
+        self.clear_col = buttons_col + 9;
+        self.recent_col = buttons_col + 18;
         if (buttons_col < size.width) {
             _ = text_util.writeText(
                 &surf,
@@ -140,7 +148,16 @@ pub const FilterBar = struct {
             .width = buttons_col -| col,
             .height = size.height,
         });
-        const field_surf = try self.field.draw(child_ctx);
+        var field_surf = try self.field.draw(child_ctx);
+        if (self.focused) if (field_surf.cursor) |cursor| {
+            const mark_at: usize = @min(cursor.col, field_surf.size.width -| 1);
+            var cell = field_surf.readCell(mark_at, 0);
+            cell.style.fg = self.theme.selected_fg;
+            cell.style.bg = self.theme.selected_bg;
+            if (cell.char.grapheme.len == 0) cell.char = .{ .grapheme = " ", .width = 1 };
+            field_surf.writeCell(@intCast(mark_at), 0, cell);
+            surf.cursor = .{ .col = col + @as(u16, @intCast(mark_at)), .row = 0, .shape = .block };
+        };
         const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
         children[0] = .{ .origin = .{ .row = 0, .col = col }, .surface = field_surf };
         surf.children = children;

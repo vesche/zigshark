@@ -256,6 +256,40 @@ pub const ProtocolTree = struct {
         self.notifySelect();
     }
 
+    /// Expand the path to the nth field with this filter name and select it.
+    pub fn selectNamed(self: *ProtocolTree, name: []const u8, occurrence: usize) bool {
+        const root = self.root orelse return false;
+        var seen: usize = 0;
+        if (!self.markPath(root, name, occurrence, &seen)) return false;
+        self.rebuildFlat();
+        var nth: usize = 0;
+        for (self.flat.items, 0..) |node, index| {
+            if (!std.mem.eql(u8, node.name, name)) continue;
+            if (nth == occurrence) {
+                self.selected = index;
+                self.ensureVisible();
+                self.notifySelect();
+                return true;
+            }
+            nth += 1;
+        }
+        return false;
+    }
+
+    fn markPath(self: *ProtocolTree, node: *const packet.DetailNode, name: []const u8, occurrence: usize, seen: *usize) bool {
+        if (std.mem.eql(u8, node.name, name)) {
+            if (seen.* == occurrence) return true;
+            seen.* += 1;
+        }
+        for (node.children) |*child| {
+            if (self.markPath(child, name, occurrence, seen)) {
+                self.expanded.put(@intFromPtr(node), {}) catch {};
+                return true;
+            }
+        }
+        return false;
+    }
+
     pub fn handleEvent(self: *ProtocolTree, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
         switch (event) {
             .mouse => |mouse| {

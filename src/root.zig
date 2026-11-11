@@ -31,6 +31,7 @@ pub const shark = struct {
     pub const streams = @import("shark/streams.zig");
     pub const convs = @import("shark/convs.zig");
     pub const capinfo = @import("shark/capinfo.zig");
+    pub const stats = @import("shark/stats.zig");
 };
 
 pub const model = struct {
@@ -74,6 +75,8 @@ pub const ui = struct {
     };
     pub const field_filter = @import("ui/field_filter.zig");
     pub const color_rules = @import("ui/color_rules.zig");
+    pub const expert = @import("ui/expert.zig");
+    pub const time_ref = @import("ui/time_ref.zig");
 };
 
 comptime {
@@ -89,6 +92,7 @@ comptime {
     _ = shark.convs;
     _ = shark.streams;
     _ = shark.capinfo;
+    _ = shark.stats;
     _ = xml_util;
     _ = model.packet;
     _ = model.session;
@@ -106,6 +110,8 @@ comptime {
     _ = ui.widgets.header_bar;
     _ = ui.field_filter;
     _ = ui.color_rules;
+    _ = ui.expert;
+    _ = ui.time_ref;
     _ = features.macros;
     _ = features.recents;
     _ = platform.clipboard;

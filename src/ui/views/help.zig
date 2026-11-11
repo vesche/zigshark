@@ -7,10 +7,19 @@ pub const text =
     \\Tree +/- Enter    Expand or collapse the selected field
     \\Tree ← / →        Collapse / expand (h / l)
     \\Hex click / hjkl  Select a byte; the tree jumps to that field
-    \\/                 Focus display filter
+    \\/                 Display filter. A valid expression reloads the list
+    \\<Clear>           Remove the display filter
+    \\<Recent>          Pick a recent filter. Enter applies it
     \\Up / Down         Recall recent filters in the filter bar
     \\=                 Field filter in the tree, conversation filter in the list
     \\g / :goto         Go to a frame number
+    \\Ctrl-T / :time-ref  Time zero on this frame. Press again to clear
+    \\:expert           Expert info on this packet. Enter opens the field
+    \\:hierarchy        Protocol hierarchy. Enter filters that protocol
+    \\:endpoints        Loudest addresses. Enter filters that address
+    \\:export           packets, packet, json, csv, or objects http|smb
+    \\:decode-as        Selectors from this packet, then a protocol
+    \\:columns add      Add the selected field as a column
     \\:                 Command palette
     \\?                 This help
     \\|                 Toggle layout
@@ -31,7 +40,7 @@ pub const text =
     \\c                  Enter/leave copy mode
     \\Ctrl-C             Copy. A field copy includes its filter and value
     \\:filters          Saved filters. :filters save <name> stores the current one
-    \\Filter bar         Empty is neutral, valid is green, invalid shows tshark's error
+    \\Filter bar         Valid turns green and reloads the list. Invalid shows tshark's error
     \\q / ZZ            Quit (confirm / immediate)
     \\Ctrl-Z            Suspend to the shell; fg resumes
     \\:columns          default, delta, absolute, or a tshark column format

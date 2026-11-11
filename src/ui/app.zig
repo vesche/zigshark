@@ -37,6 +37,10 @@ const transfer = @import("../features/transfer.zig");
 const copy_feature = @import("../features/copy.zig");
 const macros_feature = @import("../features/macros.zig");
 const field_filter = @import("field_filter.zig");
+const expert_mod = @import("expert.zig");
+const time_ref = @import("time_ref.zig");
+const columns_mod = @import("../shark/columns.zig");
+const stats_mod = @import("../shark/stats.zig");
 const profiles_feature = @import("../features/profiles.zig");
 const runtime_mod = @import("runtime.zig");
 
@@ -60,6 +64,12 @@ pub const OverlayKind = enum {
     field_filter,
     conv_filter,
     saved_filters,
+    recent_filters,
+    expert,
+    hierarchy,
+    endpoints,
+    decode_selector,
+    decode_protocol,
 };
 
 fn hexNeedleLength(value: []const u8) usize {
@@ -136,6 +146,8 @@ pub const AppModel = struct {
     tail_ticks: u8 = 0,
     hide_through_frame: u32 = 0,
     filter_recall: ?usize = null,
+    /// List generation whose `.done` event has been applied. A matching filter does not reload again.
+    list_settled_generation: u64 = 0,
     filter_seen: []u8 = &.{},
     filter_checked: []u8 = &.{},
     filter_seen_ticks: u8 = 0,
@@ -145,6 +157,33 @@ pub const AppModel = struct {
     filter_check_box: ?FilterVerdictBox = null,
     filter_error_text: []u8 = &.{},
     macro_preview: []u8 = &.{},
+    expert_items: []expert_mod.Item = &.{},
+    time_reference_frame: ?u32 = null,
+    time_reference_seconds: ?f64 = null,
+    hierarchy_names: [][]u8 = &.{},
+    endpoint_filters: [][]u8 = &.{},
+    decode_choices: [][]u8 = &.{},
+    decode_selector: []u8 = &.{},
+    export_request: []u8 = &.{},
+    export_confirm: bool = false,
+    dropdown: overlay_mod.Dropdown = .{},
+    header_menu: ?header_bar.HeaderBar.Menu = null,
+    dropdown_col: u16 = 0,
+    dropdown_width: u16 = 0,
+    dropdown_height: u16 = 0,
+    dialog_row: u16 = 0,
+    dialog_col: u16 = 0,
+    dialog_w: u16 = 0,
+    dialog_h: u16 = 0,
+    palette_row: u16 = 0,
+    palette_col: u16 = 0,
+    palette_w: u16 = 0,
+    palette_h: u16 = 0,
+    goto_prompt: bool = false,
+    goto_buf: [24]u8 = undefined,
+    goto_len: usize = 0,
+    goto_line: [48]u8 = undefined,
+    goto_line_len: usize = 0,
     /// Tests run the display-filter check on the caller thread.
     filter_check_sync: bool = false,
     history_note: [256]u8 = @splat(0),
@@ -229,6 +268,7 @@ pub const AppModel = struct {
         self.tail_ticks = 0;
         self.hide_through_frame = 0;
         self.filter_recall = null;
+        self.list_settled_generation = 0;
         self.filter_seen = &.{};
         self.filter_checked = &.{};
         self.filter_seen_ticks = 0;
@@ -238,6 +278,18 @@ pub const AppModel = struct {
         self.filter_check_box = null;
         self.filter_error_text = &.{};
         self.macro_preview = &.{};
+        self.expert_items = &.{};
+        self.time_reference_frame = null;
+        self.time_reference_seconds = null;
+        self.hierarchy_names = &.{};
+        self.endpoint_filters = &.{};
+        self.decode_choices = &.{};
+        self.decode_selector = &.{};
+        self.export_request = &.{};
+        self.export_confirm = false;
+        self.header_menu = null;
+        self.goto_prompt = false;
+        self.goto_len = 0;
         self.filter_check_sync = false;
         self.history_note = @splat(0);
         self.history_note_len = 0;
@@ -266,6 +318,7 @@ pub const AppModel = struct {
         self.filter = filter_bar.FilterBar.init(allocator, self.theme);
         self.filter.userdata = self;
         self.filter.onSubmit = onFilterSubmit;
+        self.filter.onClear = onFilterClear;
         self.filter.onRecent = onRecentFilters;
         self.filter.onHistory = onFilterHistory;
         self.filter.onFocus = onFilterFocus;
@@ -280,6 +333,15 @@ pub const AppModel = struct {
         self.command.userdata = self;
         self.command.onRun = onCommand;
         self.help_overlay = .{ .title = "Help", .body = help_view.text, .theme = self.theme };
+        self.help_overlay.userdata = self;
+        self.help_overlay.on_activate = onHelpActivate;
+        self.help_overlay.on_dismiss = onHelpDismiss;
+        self.dropdown = .{
+            .theme = self.theme,
+            .userdata = self,
+            .on_activate = onHeaderItem,
+        };
+        self.header_menu = null;
         self.msg_overlay = .{ .title = "Message", .body = "", .theme = self.theme };
         const divider_style: vaxis.Style = .{
             .fg = self.theme.pane_border,
@@ -323,6 +385,12 @@ pub const AppModel = struct {
         if (self.filter_checked.len != 0) self.allocator.free(self.filter_checked);
         if (self.filter_error_text.len != 0) self.allocator.free(self.filter_error_text);
         if (self.macro_preview.len != 0) self.allocator.free(self.macro_preview);
+        self.clearExpert();
+        self.freeStringList(&self.hierarchy_names);
+        self.freeStringList(&self.endpoint_filters);
+        self.freeStringList(&self.decode_choices);
+        if (self.decode_selector.len != 0) self.allocator.free(self.decode_selector);
+        if (self.export_request.len != 0) self.allocator.free(self.export_request);
         for (self.fields) |field| self.allocator.free(field);
         if (self.fields.len != 0) self.allocator.free(self.fields);
         if (self.fields_tshark_path.len != 0) self.allocator.free(self.fields_tshark_path);
@@ -441,14 +509,14 @@ pub const AppModel = struct {
     }
 
     pub fn commitFilter(self: *AppModel, text: []const u8, apply: bool) !void {
-        try self.filter.setText(text);
         self.filter_recall = null;
         if (!apply) {
+            try self.armFilterText(text);
             self.focus = .filter;
             self.status.mode = "prepared";
             return;
         }
-        try onFilterSubmit(self, text);
+        try self.reloadDisplayFilter(text);
     }
 
     pub fn recallRecent(self: *AppModel, older: bool) !void {
@@ -472,7 +540,8 @@ pub const AppModel = struct {
             break :blk if (current_index == 0) items.len - 1 else current_index - 1;
         };
         self.filter_recall = index;
-        try self.filter.setText(items[index]);
+        try self.reloadDisplayFilter(items[index]);
+        self.filter_recall = index;
         self.writeHistoryNote(index, starting and current.len == 0);
     }
 
@@ -498,26 +567,116 @@ pub const AppModel = struct {
         self.status.mode = self.history_note[0..end];
     }
 
-    fn openMenu(self: *AppModel, analysis: bool) !void {
-        self.menu_analysis = analysis;
-        const body = if (analysis)
-            \\Filter field
-            \\Go to frame
-            \\Streams
-            \\Conversations
-            \\Capture info
-            \\Expert
-            \\Protocol hierarchy
-            \\Endpoints
-            \\Export
-        else
-            \\Columns
-            \\Theme
-            \\Profile
-            \\Marks
-            \\Tail
-        ;
-        try self.showPick(if (analysis) "Analysis" else "Misc", body, .menu);
+    fn openHeaderMenu(self: *AppModel, menu: header_bar.HeaderBar.Menu) void {
+        if (self.header_menu == menu) {
+            self.closeHeaderMenu();
+            return;
+        }
+        self.header_menu = menu;
+        self.header.open_menu = menu;
+        self.menu_analysis = menu == .analysis;
+        self.dropdown.body = switch (menu) {
+            .analysis => header_bar.analysis_menu,
+            .misc => header_bar.misc_menu,
+            .help => header_bar.help_menu,
+        };
+        self.dropdown.selected = 0;
+        self.dropdown.line_count = overlay_mod.Dropdown.measure(self.dropdown.body).lines;
+        self.dropdown.theme = self.theme;
+    }
+
+    fn closeHeaderMenu(self: *AppModel) void {
+        self.header_menu = null;
+        self.header.open_menu = null;
+        self.dropdown.body = "";
+        self.dropdown.line_count = 0;
+    }
+
+    fn activateHeaderItem(self: *AppModel, index: usize) void {
+        const menu = self.header_menu orelse return;
+        self.closeHeaderMenu();
+        switch (menu) {
+            .analysis, .misc => self.runMenuChoice(index) catch {},
+            .help => self.openHelp() catch {},
+        }
+    }
+
+    fn openHelp(self: *AppModel) !void {
+        self.goto_prompt = false;
+        self.overlay = .help;
+        self.help_overlay.title = "Help";
+        self.help_overlay.body = help_view.text;
+        self.help_overlay.pick = false;
+        self.help_overlay.scroll_top = 0;
+        self.help_overlay.selected = 0;
+        self.help_overlay.visible = true;
+    }
+
+    fn openGoto(self: *AppModel) void {
+        self.goto_prompt = true;
+        self.goto_len = 0;
+        self.refreshGotoLine();
+        self.overlay = .message;
+        self.help_overlay.title = "Go to frame";
+        self.help_overlay.body = self.goto_line[0..self.goto_line_len];
+        self.help_overlay.pick = false;
+        self.help_overlay.scroll_top = 0;
+        self.help_overlay.visible = true;
+        self.msg_overlay.visible = false;
+    }
+
+    fn refreshGotoLine(self: *AppModel) void {
+        const typed = self.goto_buf[0..self.goto_len];
+        const line = std.fmt.bufPrint(&self.goto_line, "Frame number: {s}_", .{typed}) catch {
+            self.help_overlay.body = "Frame number: _";
+            return;
+        };
+        self.goto_line_len = line.len;
+        self.help_overlay.body = self.goto_line[0..self.goto_line_len];
+    }
+
+    fn handleGotoKey(self: *AppModel, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
+        if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
+            self.goto_prompt = false;
+            self.dismissOverlays();
+            return ctx.consumeAndRedraw();
+        }
+        if (key.matches(vaxis.Key.enter, .{})) {
+            var text: [24]u8 = undefined;
+            const len = @min(self.goto_len, text.len);
+            @memcpy(text[0..len], self.goto_buf[0..len]);
+            self.goto_prompt = false;
+            self.dismissOverlays();
+            try self.gotoFrame(text[0..len]);
+            return ctx.consumeAndRedraw();
+        }
+        if (key.matches(vaxis.Key.backspace, .{})) {
+            self.goto_len -|= 1;
+            self.refreshGotoLine();
+            return ctx.consumeAndRedraw();
+        }
+        if (key.codepoint >= '0' and key.codepoint <= '9' and self.goto_len < self.goto_buf.len) {
+            self.goto_buf[self.goto_len] = @intCast(key.codepoint);
+            self.goto_len += 1;
+            self.refreshGotoLine();
+            return ctx.consumeAndRedraw();
+        }
+        return ctx.consumeAndRedraw();
+    }
+
+    fn onHeaderItem(userdata: ?*anyopaque, index: usize) void {
+        const self: *AppModel = @ptrCast(@alignCast(userdata.?));
+        self.activateHeaderItem(index);
+    }
+
+    fn onHelpActivate(userdata: ?*anyopaque) void {
+        const self: *AppModel = @ptrCast(@alignCast(userdata.?));
+        self.activatePick() catch {};
+    }
+
+    fn onHelpDismiss(userdata: ?*anyopaque) void {
+        const self: *AppModel = @ptrCast(@alignCast(userdata.?));
+        self.dismissOverlays();
     }
 
     fn openFieldFilter(self: *AppModel) !void {
@@ -690,15 +849,7 @@ pub const AppModel = struct {
 
     fn onHeaderMenu(userdata: ?*anyopaque, menu: header_bar.HeaderBar.Menu) void {
         const self: *AppModel = @ptrCast(@alignCast(userdata.?));
-        switch (menu) {
-            .analysis => self.openMenu(true) catch {},
-            .misc => self.openMenu(false) catch {},
-            .help => {
-                self.help_overlay.visible = true;
-                self.help_overlay.scroll_top = 0;
-                self.overlay = .help;
-            },
-        }
+        self.openHeaderMenu(menu);
     }
 
     fn onPacketFocus(userdata: ?*anyopaque) void {
@@ -742,35 +893,101 @@ pub const AppModel = struct {
         const self: *AppModel = @ptrCast(@alignCast(userdata.?));
         const expanded = try macros_feature.expand(self.allocator, self.config, text);
         defer self.allocator.free(expanded);
-        if (std.mem.eql(u8, expanded, self.session.display_filter) and
-            self.session.loading != .error_state and
-            self.loader.list_generation.load(.acquire) != 0)
-        {
-            self.filter.state = .ok;
+        if (expanded.len != 0) {
+            const ok = try filter_mod.validateDisplayFilterRun(
+                self.allocator,
+                self.io,
+                self.tools.tshark,
+                self.empty_pcap,
+                expanded,
+                self.process_runner,
+            );
+            self.filter.state = if (ok) .ok else .bad;
+            if (!ok) return;
+        }
+        try self.reloadDisplayFilter(text);
+    }
+
+    /// Remember the bar text so a stale validation cannot apply a previous expression.
+    fn armFilterText(self: *AppModel, raw: []const u8) !void {
+        try self.filter.setText(raw);
+        const seen = try self.allocator.dupe(u8, raw);
+        errdefer self.allocator.free(seen);
+        const checked = try self.allocator.dupe(u8, raw);
+        if (self.filter_seen.len != 0) self.allocator.free(self.filter_seen);
+        if (self.filter_checked.len != 0) self.allocator.free(self.filter_checked);
+        self.filter_seen = seen;
+        self.filter_checked = checked;
+        self.filter_seen_ticks = 0;
+        self.dropFilterVerdict();
+        self.updateMacroPreview(raw);
+    }
+
+    fn dropFilterVerdict(self: *AppModel) void {
+        self.filter_check_mutex.lockUncancelable(self.io);
+        defer self.filter_check_mutex.unlock(self.io);
+        if (self.filter_check_box) |*box| {
+            self.allocator.free(box.text);
+            self.allocator.free(box.detail);
+            self.filter_check_box = null;
+        }
+    }
+
+    /// Put `raw` in the bar and reload the packet list for its expansion.
+    /// An empty expression clears the display filter. The same expression does
+    /// not start another load while that load is running or already on screen.
+    fn reloadDisplayFilter(self: *AppModel, raw: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, raw);
+        defer self.allocator.free(owned);
+        try self.armFilterText(owned);
+        const expanded = try macros_feature.expand(self.allocator, self.config, owned);
+        defer self.allocator.free(expanded);
+        self.filter.state = if (expanded.len == 0) .neutral else .ok;
+        self.setFilterError("");
+        const same = std.mem.eql(u8, expanded, self.session.display_filter);
+        const generation = self.loader.list_generation.load(.acquire);
+        const settled = generation != 0 and generation == self.list_settled_generation and self.session.loading != .error_state;
+        if (same and (self.session.loading == .loading_list or settled)) {
+            self.syncFromSession();
             return;
         }
-        self.filter.state = .neutral;
-        const ok = try filter_mod.validateDisplayFilterRun(
-            self.allocator,
-            self.io,
-            self.tools.tshark,
-            self.empty_pcap,
-            expanded,
-            self.process_runner,
-        );
-        self.filter.state = if (ok) .ok else .bad;
-        if (!ok) return;
         try self.session.setFilter(expanded, null);
         self.filter_recall = null;
-        try recents.pushFilter(self.config, expanded);
+        if (expanded.len != 0) try recents.pushFilter(self.config, expanded);
         self.clearDetail();
         try self.loader.requestPsml(self.session);
         self.syncFromSession();
     }
 
+    fn onFilterClear(userdata: ?*anyopaque) anyerror!void {
+        const self: *AppModel = @ptrCast(@alignCast(userdata.?));
+        try self.clearDisplayFilter();
+    }
+
+    pub fn clearDisplayFilter(self: *AppModel) !void {
+        try self.reloadDisplayFilter("");
+    }
+
     fn onRecentFilters(userdata: ?*anyopaque) anyerror!void {
         const self: *AppModel = @ptrCast(@alignCast(userdata.?));
-        try self.showRecents();
+        try self.openRecentFilters();
+    }
+
+    pub fn openRecentFilters(self: *AppModel) !void {
+        const items = self.config.recent_filters.items;
+        if (items.len == 0) {
+            try self.showMessage("No recent filters yet. Apply one and it will be listed here.");
+            return;
+        }
+        var text: std.Io.Writer.Allocating = .init(self.allocator);
+        defer text.deinit();
+        for (items, 0..) |filter, index| {
+            if (index != 0) try text.writer.writeByte('\n');
+            try text.writer.writeAll(filter);
+        }
+        const owned = try text.toOwnedSlice();
+        defer self.allocator.free(owned);
+        try self.showPick("Recent filters  Enter applies", owned, .recent_filters);
     }
 
     fn onFilterHistory(userdata: ?*anyopaque, older: bool) anyerror!void {
@@ -784,6 +1001,7 @@ pub const AppModel = struct {
     }
 
     fn loadDetailForSelection(self: *AppModel) !void {
+        if (self.session.loading == .loading_list) return;
         const frame = self.session.selectedFrame() orelse return;
         if (self.detail_frame == frame or self.detail_requested_frame == frame) return;
         self.detail_requested_frame = frame;
@@ -971,6 +1189,7 @@ pub const AppModel = struct {
         for (events) |*ev| {
             switch (ev.*) {
                 .packets_loaded => |*table| {
+                    if (table.generation == 0 or table.generation == self.loader.list_generation.load(.acquire)) {
                     const follow_live = self.live_capture and self.config.auto_scroll;
                     const previous = if (follow_live) null else self.session.selectedFrame();
                     if (table.headers.len != 0) {
@@ -1008,6 +1227,7 @@ pub const AppModel = struct {
                     self.session.loading = if (self.live_capture) .capturing else .loading_list;
                     self.syncFromSession();
                     ev.* = .done;
+                    }
                 },
                 .detail_loaded => |*bundle| {
                     if (self.detail_bundle) |*old| old.deinit(self.allocator);
@@ -1032,6 +1252,7 @@ pub const AppModel = struct {
                 },
                 .capture_progress => {},
                 .done => if (self.session.loading == .loading_list and !self.live_capture) {
+                    self.list_settled_generation = self.loader.list_generation.load(.acquire);
                     self.session.loading = .idle;
                     self.syncFromSession();
                 },
@@ -1129,18 +1350,33 @@ pub const AppModel = struct {
             self.help_overlay.pick = false;
             self.help_overlay.visible = true;
         } else if (std.mem.eql(u8, cmd, "filter")) {
-            self.focus = .filter;
+            const expression = std.mem.trim(u8, args, " \t");
+            if (expression.len == 0) {
+                self.focus = .filter;
+            } else {
+                try self.commitFilter(expression, true);
+            }
+        } else if (std.mem.eql(u8, cmd, "expert")) {
+            try self.showExpert();
+        } else if (std.mem.eql(u8, cmd, "time-ref")) {
+            try self.toggleTimeReference();
         } else if (std.mem.eql(u8, cmd, "goto")) {
             try self.gotoFrame(args);
         } else if (std.mem.eql(u8, cmd, "decode-as")) {
             if (args.len == 0) {
-                try self.showMessage("Usage: :decode-as layer==selector,protocol");
+                try self.showDecodeSelectors();
                 return;
             }
             try self.session.addDecodeAs(args);
             self.clearDetail();
             self.loader.clearDetailCache(self.io);
             try self.loader.requestPsml(self.session);
+        } else if (std.mem.eql(u8, cmd, "hierarchy")) {
+            try self.showHierarchy();
+        } else if (std.mem.eql(u8, cmd, "endpoints")) {
+            try self.showEndpoints(args);
+        } else if (std.mem.eql(u8, cmd, "export")) {
+            try self.runExport(args, false);
         } else if (std.mem.eql(u8, cmd, "timestamp")) {
             if (args.len == 0) {
                 try self.showMessage("Usage: :timestamp a|ad|adoy|d|dd|e|r|u|ud|udoy");
@@ -1195,12 +1431,7 @@ pub const AppModel = struct {
             }
             try self.searchByDisplayFilter(args);
         } else if (std.mem.eql(u8, cmd, "clear-filter")) {
-            try self.filter.setText("");
-            try self.session.setFilter("", null);
-            self.filter.state = .ok;
-            self.clearDetail();
-            try self.loader.requestPsml(self.session);
-            self.syncFromSession();
+            try self.clearDisplayFilter();
         } else if (std.mem.eql(u8, cmd, "clear-packets")) {
             var newest: u32 = self.hide_through_frame;
             for (self.session.packets) |summary| newest = @max(newest, summary.frame);
@@ -1560,9 +1791,419 @@ pub const AppModel = struct {
             self.loader.setCacheSize(self.config.pcap_cache_size);
         } else if (std.mem.eql(u8, name, "search-case-sensitive")) {
             self.search.case_sensitive = self.config.search_case_sensitive;
+        } else if (std.mem.eql(u8, name, "tls-keylog-file")) {
+            try self.session.setTlsKeylog(self.config.tls_keylog_file);
+            self.clearDetail();
+            self.loader.clearDetailCache(self.io);
+            try self.loader.requestPsml(self.session);
         }
         self.persistConfig();
         try self.showMessage("Option updated");
+    }
+
+    fn selectedColumnField(self: *AppModel) ?[]const u8 {
+        const field = self.protocol_tree.selectedField() orelse return null;
+        if (field.name.len == 0 or std.mem.eql(u8, field.name, "__packet_root")) return null;
+        return field.name;
+    }
+
+    fn clearExpert(self: *AppModel) void {
+        for (self.expert_items) |*item| item.deinit(self.allocator);
+        if (self.expert_items.len != 0) self.allocator.free(self.expert_items);
+        self.expert_items = &.{};
+    }
+
+    fn showExpert(self: *AppModel) !void {
+        const bundle = self.detail_bundle orelse {
+            try self.showMessage("Select a packet to see its expert info");
+            return;
+        };
+        self.clearExpert();
+        self.expert_items = try expert_mod.collect(self.allocator, &bundle.pdml.root);
+        if (self.expert_items.len == 0) {
+            try self.showMessage("This packet has no expert info");
+            return;
+        }
+        var text: std.Io.Writer.Allocating = .init(self.allocator);
+        defer text.deinit();
+        for (self.expert_items, 0..) |item, index| {
+            if (index != 0) try text.writer.writeByte('\n');
+            try text.writer.print("{s}  {s}  {s}", .{ expert_mod.label(item.severity), item.group, item.message });
+        }
+        const owned = try text.toOwnedSlice();
+        defer self.allocator.free(owned);
+        try self.showPick("Expert  Enter opens the field", owned, .expert);
+    }
+
+    pub fn toggleTimeReference(self: *AppModel) !void {
+        const frame = self.session.selectedFrame() orelse {
+            try self.showMessage("Select a packet first");
+            return;
+        };
+        if (self.time_reference_frame) |current| if (current == frame) {
+            self.time_reference_frame = null;
+            self.time_reference_seconds = null;
+            self.packet_table.time_base = null;
+            return;
+        };
+        const index = self.session.selected_index orelse return;
+        const cell = time_ref.timeText(self.session.list_headers, self.session.packets[index].columns) orelse {
+            try self.showMessage("This list has no time column");
+            return;
+        };
+        const seconds = time_ref.parseSeconds(cell) orelse {
+            try self.showMessage("The time column is not a number of seconds");
+            return;
+        };
+        self.time_reference_frame = frame;
+        self.time_reference_seconds = seconds;
+        self.packet_table.time_base = seconds;
+    }
+
+    fn freeStringList(self: *AppModel, list: *[][]u8) void {
+        for (list.*) |item| self.allocator.free(item);
+        if (list.len != 0) self.allocator.free(list.*);
+        list.* = &.{};
+    }
+
+    fn showHierarchy(self: *AppModel) !void {
+        const path = self.capturePath() orelse {
+            try self.showMessage("No capture file loaded");
+            return;
+        };
+        var argv = try process_mod.argvHierarchy(self.allocator, self.tools.tshark, path);
+        defer argv.deinit(self.allocator);
+        var out = try self.runProcessLimited(argv.slice(), process_mod.view_stdout_cap);
+        defer out.deinit(self.allocator);
+        if (!out.term.success() and out.stdout.len == 0) {
+            try self.showMessage(if (out.stderr.len != 0) out.stderr else "Protocol hierarchy failed");
+            return;
+        }
+        const rows = try stats_mod.parseHierarchy(self.allocator, out.stdout);
+        defer {
+            for (rows) |*row| {
+                var copy = row.*;
+                copy.deinit(self.allocator);
+            }
+            self.allocator.free(rows);
+        }
+        self.freeStringList(&self.hierarchy_names);
+        const names = try self.allocator.alloc([]u8, rows.len);
+        var filled: usize = 0;
+        errdefer {
+            for (names[0..filled]) |name| self.allocator.free(name);
+            self.allocator.free(names);
+        }
+        var text: std.Io.Writer.Allocating = .init(self.allocator);
+        defer text.deinit();
+        if (rows.len == 0) try text.writer.writeAll("No protocol hierarchy");
+        for (rows, 0..) |row, index| {
+            names[index] = try self.allocator.dupe(u8, row.name);
+            filled += 1;
+            if (index != 0) try text.writer.writeByte('\n');
+            try text.writer.print("{s}  {d} frames  {d} bytes", .{ row.name, row.frames, row.bytes });
+        }
+        self.hierarchy_names = names;
+        const owned = try text.toOwnedSlice();
+        defer self.allocator.free(owned);
+        try self.showPick("Hierarchy  Enter filters that protocol", owned, .hierarchy);
+    }
+
+    fn showEndpoints(self: *AppModel, args: []const u8) !void {
+        const kind_name = if (args.len == 0) "tcp" else std.mem.trim(u8, args, " \t");
+        const kind = std.meta.stringToEnum(stats_mod.Kind, kind_name) orelse {
+            try self.showMessage("Usage: :endpoints [tcp|udp|ip|ipv6|eth]");
+            return;
+        };
+        const path = self.capturePath() orelse {
+            try self.showMessage("No capture file loaded");
+            return;
+        };
+        var argv = try process_mod.argvEndpoints(self.allocator, self.tools.tshark, path, kind_name);
+        defer argv.deinit(self.allocator);
+        var out = try self.runProcessLimited(argv.slice(), process_mod.view_stdout_cap);
+        defer out.deinit(self.allocator);
+        if (!out.term.success() and out.stdout.len == 0) {
+            try self.showMessage(if (out.stderr.len != 0) out.stderr else "Endpoints failed");
+            return;
+        }
+        const rows = try stats_mod.parseEndpoints(self.allocator, out.stdout, kind);
+        defer {
+            for (rows) |*row| {
+                var copy = row.*;
+                copy.deinit(self.allocator);
+            }
+            self.allocator.free(rows);
+        }
+        const shown = @min(rows.len, process_mod.view_row_cap);
+        self.freeStringList(&self.endpoint_filters);
+        const filters = try self.allocator.alloc([]u8, shown);
+        var filled: usize = 0;
+        errdefer {
+            for (filters[0..filled]) |filter| self.allocator.free(filter);
+            self.allocator.free(filters);
+        }
+        var text: std.Io.Writer.Allocating = .init(self.allocator);
+        defer text.deinit();
+        if (shown == 0) try text.writer.print("No {s} endpoints", .{kind_name});
+        for (rows[0..shown], 0..) |row, index| {
+            filters[index] = try stats_mod.endpointFilter(self.allocator, kind, row);
+            filled += 1;
+            if (index != 0) try text.writer.writeByte('\n');
+            try text.writer.print("{s}", .{row.address});
+            if (row.port) |port| try text.writer.print(":{d}", .{port});
+            try text.writer.print("  {d} packets  {d} bytes", .{ row.packets, row.bytes });
+        }
+        self.endpoint_filters = filters;
+        try writeCapNote(&text.writer, out.truncated, shown < rows.len);
+        const owned = try text.toOwnedSlice();
+        defer self.allocator.free(owned);
+        try self.showPick("Endpoints  Enter filters that address", owned, .endpoints);
+    }
+
+    fn appendDisplayFilter(self: *AppModel, atom: []const u8) !void {
+        if (self.session.display_filter.len == 0) {
+            try self.commitFilter(atom, true);
+            return;
+        }
+        const next = try std.fmt.allocPrint(self.allocator, "({s}) and {s}", .{ self.session.display_filter, atom });
+        defer self.allocator.free(next);
+        try self.commitFilter(next, true);
+    }
+
+    fn showDecodeSelectors(self: *AppModel) !void {
+        const bundle = self.detail_bundle orelse {
+            try self.showMessage("Select a packet before decode-as");
+            return;
+        };
+        self.freeStringList(&self.decode_choices);
+        var choices: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (choices.items) |item| self.allocator.free(item);
+            choices.deinit(self.allocator);
+        }
+        try collectDecodeSelectors(self.allocator, &bundle.pdml.root, &choices);
+        if (choices.items.len == 0) {
+            try self.showMessage("This packet has no tcp port, udp port, or ethertype. :decode-as layer==selector,protocol still works.");
+            return;
+        }
+        self.decode_choices = try choices.toOwnedSlice(self.allocator);
+        var text: std.Io.Writer.Allocating = .init(self.allocator);
+        defer text.deinit();
+        for (self.decode_choices, 0..) |choice, index| {
+            if (index != 0) try text.writer.writeByte('\n');
+            try text.writer.writeAll(choice);
+        }
+        const owned = try text.toOwnedSlice();
+        defer self.allocator.free(owned);
+        try self.showPick("Decode as  choose a selector", owned, .decode_selector);
+    }
+
+    fn showDecodeProtocols(self: *AppModel) !void {
+        var argv = try process_mod.argvProtocolList(self.allocator, self.tools.tshark);
+        defer argv.deinit(self.allocator);
+        var out = try self.runProcess(argv.slice());
+        defer out.deinit(self.allocator);
+        const names = try stats_mod.listedProtocols(self.allocator, out.stdout, &decode_protocol_names);
+        if (names.len == 0) {
+            try self.showMessage("tshark did not list a usable protocol");
+            return;
+        }
+        self.freeStringList(&self.decode_choices);
+        self.decode_choices = names;
+        var text: std.Io.Writer.Allocating = .init(self.allocator);
+        defer text.deinit();
+        for (names, 0..) |name, index| {
+            if (index != 0) try text.writer.writeByte('\n');
+            try text.writer.writeAll(name);
+        }
+        const owned = try text.toOwnedSlice();
+        defer self.allocator.free(owned);
+        try self.showPick("Decode as  choose a protocol", owned, .decode_protocol);
+    }
+
+    pub fn acceptExport(self: *AppModel) !void {
+        const args = self.export_request;
+        self.export_request = &.{};
+        self.export_confirm = false;
+        self.dismissOverlays();
+        defer self.allocator.free(args);
+        try self.runExport(args, true);
+    }
+
+    fn clearExportConfirm(self: *AppModel) void {
+        self.export_confirm = false;
+        if (self.export_request.len != 0) self.allocator.free(self.export_request);
+        self.export_request = &.{};
+    }
+
+    fn runExport(self: *AppModel, args: []const u8, force: bool) !void {
+        const trimmed = std.mem.trim(u8, args, " \t");
+        if (trimmed.len == 0) {
+            try self.showMessage("Usage: :export packets|packet|json|csv <path>    or    :export objects http|smb <dir>");
+            return;
+        }
+        var parts = std.mem.tokenizeAny(u8, trimmed, " \t");
+        const command = parts.next() orelse return;
+        if (std.mem.eql(u8, command, "objects")) {
+            const protocol = parts.next() orelse {
+                try self.showMessage("Usage: :export objects http|smb <dir>");
+                return;
+            };
+            const directory = parts.next() orelse {
+                try self.showMessage("Usage: :export objects http|smb <dir>");
+                return;
+            };
+            if (!std.mem.eql(u8, protocol, "http") and !std.mem.eql(u8, protocol, "smb")) {
+                try self.showMessage("Object export supports http or smb");
+                return;
+            }
+            try self.exportObjects(protocol, directory);
+            return;
+        }
+        const out_path = parts.next() orelse {
+            try self.showMessage("Usage: :export packets|packet|json|csv <path>");
+            return;
+        };
+        if (!force and try self.pathExists(out_path)) {
+            try self.askOverwrite(trimmed);
+            return;
+        }
+        if (std.mem.eql(u8, command, "json")) {
+            try self.writeDisplayed(out_path, true);
+        } else if (std.mem.eql(u8, command, "csv")) {
+            try self.writeDisplayed(out_path, false);
+        } else if (std.mem.eql(u8, command, "packets")) {
+            try self.exportPcap(out_path, null);
+        } else if (std.mem.eql(u8, command, "packet")) {
+            const frame = self.session.selectedFrame() orelse {
+                try self.showMessage("Select a packet first");
+                return;
+            };
+            try self.exportPcap(out_path, frame);
+        } else {
+            try self.showMessage("Usage: :export packets|packet|json|csv <path>    or    :export objects http|smb <dir>");
+        }
+    }
+
+    fn askOverwrite(self: *AppModel, args: []const u8) !void {
+        if (self.export_request.len != 0) self.allocator.free(self.export_request);
+        self.export_request = try self.allocator.dupe(u8, args);
+        self.export_confirm = true;
+        const message = try std.fmt.allocPrint(self.allocator, "That file already exists.\nPress y to overwrite it, n to cancel.", .{});
+        defer self.allocator.free(message);
+        if (self.overlay_body_owned.len != 0) self.allocator.free(self.overlay_body_owned);
+        self.overlay_body_owned = try self.allocator.dupe(u8, message);
+        self.help_overlay.title = "Overwrite?";
+        self.help_overlay.body = self.overlay_body_owned;
+        self.help_overlay.visible = true;
+        self.help_overlay.pick = false;
+        self.msg_overlay.visible = false;
+        self.overlay = .message;
+    }
+
+    fn pathExists(self: *AppModel, path: []const u8) !bool {
+        const cwd = std.Io.Dir.cwd();
+        if (cwd.access(self.io, path, .{})) |_| return true else |_| return false;
+    }
+
+    fn exportPcap(self: *AppModel, out_path: []const u8, frame: ?u32) !void {
+        const path = self.capturePath() orelse {
+            try self.showMessage("No capture file loaded");
+            return;
+        };
+        var argv = try process_mod.argvExportPcap(
+            self.allocator,
+            self.tools.tshark,
+            path,
+            self.session.display_filter,
+            out_path,
+            frame,
+        );
+        defer argv.deinit(self.allocator);
+        var out = try self.runProcess(argv.slice());
+        defer out.deinit(self.allocator);
+        if (!out.term.success()) {
+            try self.showMessage(if (out.stderr.len != 0) out.stderr else "Export failed");
+            return;
+        }
+        const message = try std.fmt.allocPrint(self.allocator, "Wrote {s}", .{out_path});
+        defer self.allocator.free(message);
+        try self.showMessage(message);
+    }
+
+    fn exportObjects(self: *AppModel, protocol: []const u8, directory: []const u8) !void {
+        const path = self.capturePath() orelse {
+            try self.showMessage("No capture file loaded");
+            return;
+        };
+        std.Io.Dir.cwd().createDirPath(self.io, directory) catch {
+            try self.showMessage("Could not create that directory");
+            return;
+        };
+        var argv = try process_mod.argvExportObjects(
+            self.allocator,
+            self.tools.tshark,
+            path,
+            self.session.display_filter,
+            protocol,
+            directory,
+        );
+        defer argv.deinit(self.allocator);
+        var out = try self.runProcess(argv.slice());
+        defer out.deinit(self.allocator);
+        if (!out.term.success()) {
+            try self.showMessage(if (out.stderr.len != 0) out.stderr else "Export failed");
+            return;
+        }
+        const message = try std.fmt.allocPrint(self.allocator, "Exported {s} objects to {s}", .{ protocol, directory });
+        defer self.allocator.free(message);
+        try self.showMessage(message);
+    }
+
+    fn writeDisplayed(self: *AppModel, path: []const u8, json: bool) !void {
+        var text: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer text.deinit();
+        const headers = self.session.list_headers;
+        const packets = self.session.packets;
+        if (json) {
+            try text.writer.writeByte('[');
+            for (packets, 0..) |row, row_index| {
+                if (row_index != 0) try text.writer.writeByte(',');
+                try text.writer.writeByte('{');
+                for (row.columns, 0..) |column, column_index| {
+                    if (column_index != 0) try text.writer.writeByte(',');
+                    const key = if (column_index < headers.len) headers[column_index] else "column";
+                    try writeJsonString(&text.writer, key);
+                    try text.writer.writeByte(':');
+                    try writeJsonString(&text.writer, column);
+                }
+                try text.writer.writeByte('}');
+            }
+            try text.writer.writeByte(']');
+        } else {
+            const width = if (packets.len == 0) headers.len else packets[0].columns.len;
+            var column_index: usize = 0;
+            while (column_index < width) : (column_index += 1) {
+                if (column_index != 0) try text.writer.writeByte(',');
+                const key = if (column_index < headers.len) headers[column_index] else "column";
+                try writeCsvField(&text.writer, key);
+            }
+            if (width != 0) try text.writer.writeByte('\n');
+            for (packets) |row| {
+                for (row.columns, 0..) |column, index| {
+                    if (index != 0) try text.writer.writeByte(',');
+                    try writeCsvField(&text.writer, column);
+                }
+                try text.writer.writeByte('\n');
+            }
+        }
+        const bytes = try text.toOwnedSlice();
+        defer self.allocator.free(bytes);
+        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = bytes });
+        const message = try std.fmt.allocPrint(self.allocator, "Wrote {s}", .{path});
+        defer self.allocator.free(message);
+        try self.showMessage(message);
     }
 
     fn applyColumns(self: *AppModel, args: []const u8) !void {
@@ -1586,8 +2227,41 @@ pub const AppModel = struct {
             try self.config.setColumnFormat(process_mod.absolute_column_format);
         } else if (std.mem.startsWith(u8, trimmed, "set ")) {
             try self.config.setColumnFormat(std.mem.trim(u8, trimmed["set ".len..], " \t"));
+        } else if (std.mem.eql(u8, trimmed, "add") or std.mem.startsWith(u8, trimmed, "add ")) {
+            const named = if (std.mem.startsWith(u8, trimmed, "add ")) std.mem.trim(u8, trimmed["add ".len..], " \t") else "";
+            const field = if (named.len != 0) named else self.selectedColumnField() orelse {
+                try self.showMessage("Select a protocol field, or :columns add <field>");
+                return;
+            };
+            const base = if (self.config.column_format.len != 0) self.config.column_format else process_mod.default_column_format;
+            const next = columns_mod.addCustomColumn(self.allocator, base, field) catch {
+                try self.showMessage("That field name cannot be a column");
+                return;
+            };
+            defer self.allocator.free(next);
+            if (std.mem.eql(u8, next, base)) {
+                try self.showMessage("That field is already a column");
+                return;
+            }
+            try self.config.setColumnFormat(next);
+        } else if (std.mem.eql(u8, trimmed, "drop") or std.mem.startsWith(u8, trimmed, "drop ")) {
+            const named = if (std.mem.startsWith(u8, trimmed, "drop ")) std.mem.trim(u8, trimmed["drop ".len..], " \t") else "";
+            const field = if (named.len != 0) named else self.selectedColumnField() orelse {
+                try self.showMessage("Select a protocol field, or :columns drop <field>");
+                return;
+            };
+            const base = if (self.config.column_format.len != 0) self.config.column_format else process_mod.default_column_format;
+            const next = columns_mod.dropCustomColumn(self.allocator, base, field) catch {
+                try self.showMessage("That field name cannot be a column");
+                return;
+            } orelse {
+                try self.showMessage("That field is not a custom column");
+                return;
+            };
+            defer self.allocator.free(next);
+            try self.config.setColumnFormat(next);
         } else {
-            try self.showMessage("Usage: :columns [default|delta|absolute|set <gui.column.format:...>]");
+            try self.showMessage("Usage: :columns [default|delta|absolute|set <format>|add <field>|drop <field>]");
             return;
         }
         self.loader.config.column_format = self.config.column_format;
@@ -1643,6 +2317,9 @@ pub const AppModel = struct {
             self.setFilterError("");
             if (self.filter_checked.len != 0) self.allocator.free(self.filter_checked);
             self.filter_checked = &.{};
+            self.reloadDisplayFilter("") catch |err| {
+                log_mod.err("filter", "clear failed: {s}", .{@errorName(err)});
+            };
             return;
         }
 
@@ -1667,12 +2344,17 @@ pub const AppModel = struct {
     fn runFilterCheck(self: *AppModel, text: []u8) void {
         defer self.filter_check_inflight.store(false, .release);
         const started = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
+        const expanded = macros_feature.expand(self.allocator, self.config, text) catch {
+            self.allocator.free(text);
+            return;
+        };
+        defer self.allocator.free(expanded);
         const verdict = filter_mod.explainDisplayFilter(
             self.allocator,
             self.io,
             self.tools.tshark,
             self.empty_pcap,
-            text,
+            expanded,
             self.process_runner,
         ) catch {
             self.allocator.free(text);
@@ -1712,6 +2394,11 @@ pub const AppModel = struct {
         if (self.filter_checked.len != 0) self.allocator.free(self.filter_checked);
         self.filter_checked = box.text;
         self.allocator.free(box.detail);
+        if (box.ok) {
+            self.reloadDisplayFilter(self.filter_checked) catch |err| {
+                log_mod.err("filter", "apply failed: {s}", .{@errorName(err)});
+            };
+        }
     }
 
     fn updateMacroPreview(self: *AppModel, text: []const u8) void {
@@ -1962,6 +2649,61 @@ pub const AppModel = struct {
                 self.dismissOverlays();
                 try self.commitFilter(value, true);
             },
+            .recent_filters => {
+                const index = self.help_overlay.selected;
+                if (index >= self.config.recent_filters.items.len) return;
+                const value = try self.allocator.dupe(u8, self.config.recent_filters.items[index]);
+                defer self.allocator.free(value);
+                self.dismissOverlays();
+                try self.commitFilter(value, true);
+            },
+            .expert => {
+                const index = self.help_overlay.selected;
+                if (index >= self.expert_items.len) return;
+                const occurrence = self.expert_items[index].occurrence;
+                self.dismissOverlays();
+                self.focus = .protocol;
+                if (!self.protocol_tree.selectNamed("_ws.expert", occurrence)) {
+                    try self.showMessage("That expert field is not in the open packet");
+                }
+            },
+            .hierarchy => {
+                const index = self.help_overlay.selected;
+                if (index >= self.hierarchy_names.len) return;
+                const name = try self.allocator.dupe(u8, self.hierarchy_names[index]);
+                defer self.allocator.free(name);
+                self.dismissOverlays();
+                try self.appendDisplayFilter(name);
+            },
+            .endpoints => {
+                const index = self.help_overlay.selected;
+                if (index >= self.endpoint_filters.len) return;
+                const filter = try self.allocator.dupe(u8, self.endpoint_filters[index]);
+                defer self.allocator.free(filter);
+                self.dismissOverlays();
+                try self.commitFilter(filter, true);
+            },
+            .decode_selector => {
+                const index = self.help_overlay.selected;
+                if (index >= self.decode_choices.len) return;
+                if (self.decode_selector.len != 0) self.allocator.free(self.decode_selector);
+                self.decode_selector = try self.allocator.dupe(u8, self.decode_choices[index]);
+                try self.showDecodeProtocols();
+            },
+            .decode_protocol => {
+                const index = self.help_overlay.selected;
+                if (index >= self.decode_choices.len or self.decode_selector.len == 0) return;
+                const rule = try std.fmt.allocPrint(self.allocator, "{s},{s}", .{
+                    self.decode_selector,
+                    self.decode_choices[index],
+                });
+                defer self.allocator.free(rule);
+                self.dismissOverlays();
+                try self.session.addDecodeAs(rule);
+                self.clearDetail();
+                self.loader.clearDetailCache(self.io);
+                try self.loader.requestPsml(self.session);
+            },
             .menu => try self.runMenuChoice(self.help_overlay.selected),
             else => {},
         }
@@ -1971,11 +2713,7 @@ pub const AppModel = struct {
         if (self.menu_analysis) {
             switch (index) {
                 0 => try self.openFieldFilter(),
-                1 => {
-                    self.dismissOverlays();
-                    try self.command.setText("goto ");
-                    self.command.visible = true;
-                },
+                1 => self.openGoto(),
                 2 => {
                     self.dismissOverlays();
                     try self.runCommand("streams", "");
@@ -1988,10 +2726,23 @@ pub const AppModel = struct {
                     self.dismissOverlays();
                     try self.runCommand("capinfo", "");
                 },
-                5 => try self.showMessage("Expert information is not built yet."),
-                6 => try self.showMessage("Protocol hierarchy is not built yet."),
-                7 => try self.showMessage("Endpoints are not built yet."),
-                8 => try self.showMessage("Export is not built yet."),
+                5 => {
+                    self.dismissOverlays();
+                    try self.runCommand("expert", "");
+                },
+                6 => {
+                    self.dismissOverlays();
+                    try self.runCommand("hierarchy", "");
+                },
+                7 => {
+                    self.dismissOverlays();
+                    try self.runCommand("endpoints", "");
+                },
+                8 => {
+                    self.dismissOverlays();
+                    try self.command.setText("export ");
+                    self.command.visible = true;
+                },
                 else => {},
             }
             return;
@@ -2119,6 +2870,7 @@ pub const AppModel = struct {
         self.command.theme = theme;
         self.help_overlay.theme = theme;
         self.msg_overlay.theme = theme;
+        self.dropdown.theme = theme;
     }
 
     fn loadConfiguredTheme(self: *AppModel) !theme_mod.Theme {
@@ -2246,14 +2998,134 @@ pub const AppModel = struct {
         self.command.visible = false;
         self.overlay = .none;
         self.quit_confirm = false;
+        self.goto_prompt = false;
+        self.closeHeaderMenu();
     }
 
     pub fn widget(self: *AppModel) vxfw.Widget {
         return .{
             .userdata = self,
             .eventHandler = AppModel.typeErasedEventHandler,
+            .captureHandler = AppModel.typeErasedCapture,
             .drawFn = AppModel.typeErasedDrawFn,
         };
+    }
+
+    fn typeErasedCapture(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
+        const self: *AppModel = @ptrCast(@alignCast(ptr));
+        switch (event) {
+            .key_press => |key| {
+                if (self.quit_confirm or self.export_confirm) return;
+                if (key.matches('c', .{ .ctrl = true }) and !self.copy_mode) {
+                    ctx.quit = true;
+                    return ctx.consumeEvent();
+                }
+                if (self.command.visible) {
+                    try ctx.requestFocus(self.command.widget());
+                    try self.command.widget().handleEvent(ctx, event);
+                    return ctx.consumeAndRedraw();
+                }
+                if (self.goto_prompt) {
+                    try self.handleGotoKey(ctx, key);
+                    return;
+                }
+                if (self.header_menu != null) {
+                    try self.handleHeaderMenuKey(ctx, key);
+                    return;
+                }
+                if (self.help_overlay.visible or self.msg_overlay.visible) {
+                    if (key.matches('q', .{}) or key.matches(vaxis.Key.escape, .{})) {
+                        self.dismissOverlays();
+                        return ctx.consumeAndRedraw();
+                    }
+                    if (self.help_overlay.visible and self.help_overlay.pick and key.matches(vaxis.Key.enter, .{})) {
+                        try self.activatePick();
+                        return ctx.consumeAndRedraw();
+                    }
+                    if (self.help_overlay.visible) {
+                        try self.help_overlay.widget().handleEvent(ctx, event);
+                    } else {
+                        try self.msg_overlay.widget().handleEvent(ctx, event);
+                    }
+                    return ctx.consumeAndRedraw();
+                }
+            },
+            .mouse => |mouse| {
+                if (mouse.type != .press or mouse.button != .left) return;
+                if (self.header_menu != null) {
+                    if (mouse.row == 0 and mouse.col >= 0) {
+                        if (header_bar.menuAt(self.header.last_width, @intCast(mouse.col)) != null) return;
+                    }
+                    if (!self.dropdownContains(mouse.col, mouse.row)) {
+                        self.closeHeaderMenu();
+                        return ctx.consumeAndRedraw();
+                    }
+                    return;
+                }
+                if (self.command.visible and !self.boxContains(mouse.col, mouse.row, self.palette_col, self.palette_row, self.palette_w, self.palette_h)) {
+                    self.command.visible = false;
+                    return ctx.consumeAndRedraw();
+                }
+                if ((self.help_overlay.visible or self.msg_overlay.visible) and !self.boxContains(mouse.col, mouse.row, self.dialog_col, self.dialog_row, self.dialog_w, self.dialog_h)) {
+                    self.dismissOverlays();
+                    return ctx.consumeAndRedraw();
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn handleHeaderMenuKey(self: *AppModel, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
+        if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
+            self.closeHeaderMenu();
+            return ctx.consumeAndRedraw();
+        }
+        if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+            if (self.dropdown.line_count > 0 and self.dropdown.selected + 1 < self.dropdown.line_count) {
+                self.dropdown.selected += 1;
+            }
+            return ctx.consumeAndRedraw();
+        }
+        if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
+            self.dropdown.selected -|= 1;
+            return ctx.consumeAndRedraw();
+        }
+        if (key.matches('l', .{}) or key.matches(vaxis.Key.right, .{})) {
+            self.cycleHeaderMenu(true);
+            return ctx.consumeAndRedraw();
+        }
+        if (key.matches('h', .{}) or key.matches(vaxis.Key.left, .{})) {
+            self.cycleHeaderMenu(false);
+            return ctx.consumeAndRedraw();
+        }
+        if (key.matches(vaxis.Key.enter, .{})) {
+            self.activateHeaderItem(self.dropdown.selected);
+            return ctx.consumeAndRedraw();
+        }
+        return ctx.consumeAndRedraw();
+    }
+
+    fn cycleHeaderMenu(self: *AppModel, next: bool) void {
+        const order = [_]header_bar.HeaderBar.Menu{ .analysis, .misc, .help };
+        const current = self.header_menu orelse return;
+        var index: usize = 0;
+        for (order, 0..) |menu, item| if (menu == current) {
+            index = item;
+        };
+        const step: usize = if (next) 1 else order.len - 1;
+        self.openHeaderMenu(order[(index + step) % order.len]);
+    }
+
+    fn dropdownContains(self: *const AppModel, col: i16, row: i16) bool {
+        return self.boxContains(col, row, self.dropdown_col, 1, self.dropdown_width, self.dropdown_height);
+    }
+
+    fn boxContains(self: *const AppModel, col: i16, row: i16, origin_col: u16, origin_row: u16, width: u16, height: u16) bool {
+        _ = self;
+        if (col < 0 or row < 0 or width == 0 or height == 0) return false;
+        const point_col: u16 = @intCast(col);
+        const point_row: u16 = @intCast(row);
+        return point_col >= origin_col and point_col < origin_col + width and point_row >= origin_row and point_row < origin_row + height;
     }
 
     fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
@@ -2307,8 +3179,17 @@ pub const AppModel = struct {
                         return ctx.consumeAndRedraw();
                     }
                 }
-                if (self.command.visible) {
-                    return;
+                if (self.export_confirm) {
+                    if (key.matches('y', .{}) or key.matches('Y', .{})) {
+                        try self.acceptExport();
+                        return ctx.consumeAndRedraw();
+                    }
+                    if (key.matches('n', .{}) or key.matches(vaxis.Key.escape, .{})) {
+                        self.clearExportConfirm();
+                        self.dismissOverlays();
+                        return ctx.consumeAndRedraw();
+                    }
+                    return ctx.consumeAndRedraw();
                 }
                 if (self.help_overlay.visible or self.msg_overlay.visible) {
                     if (key.matches('q', .{}) or key.matches(vaxis.Key.escape, .{})) {
@@ -2378,6 +3259,10 @@ pub const AppModel = struct {
                     try self.command.setText("goto ");
                     self.command.visible = true;
                     try ctx.requestFocus(self.command.widget());
+                    return ctx.consumeAndRedraw();
+                }
+                if (key.matches('t', .{ .ctrl = true })) {
+                    try self.toggleTimeReference();
                     return ctx.consumeAndRedraw();
                 }
                 if (key.matches('/', .{})) {
@@ -2548,6 +3433,7 @@ pub const AppModel = struct {
     pub fn draw(self: *AppModel, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const size = ctx.max.size();
         self.packet_table.focused = self.focus == .packets;
+        self.filter.focused = self.focus == .filter;
         self.protocol_tree.focused = self.focus == .protocol;
         self.hex.focused = self.focus == .hex;
         self.status.pane = switch (self.focus) {
@@ -2560,14 +3446,19 @@ pub const AppModel = struct {
             .packets => "= conv   g goto",
             .protocol => "= field filter",
             .hex => "hjkl byte",
-            .filter => "Up recent   Tab name",
+            .filter => "Enter applies   Up recent   Tab name",
         };
+        if (self.header_menu != null) self.status.hint = "j/k move   Enter   Esc";
         self.status.selected_index = self.session.selected_index;
         self.status.tailing = self.tailing;
         self.status.live = self.live_capture;
         self.status.filter_error = self.filter_error_text;
         self.status.expansion = self.macro_preview;
+        self.status.expert_count = if (self.detail_bundle) |*bundle| expert_mod.count(&bundle.pdml.root) else 0;
+        self.status.tls_keys = self.session.tls_keylog_file.len != 0;
+        self.status.time_zero = self.time_reference_frame;
         self.packet_table.color_rules = self.config.color_rules.items;
+        self.packet_table.time_base = self.time_reference_seconds;
         const header_h: u16 = 1;
         const filter_h: u16 = 1;
         const status_h: u16 = 1;
@@ -2602,17 +3493,58 @@ pub const AppModel = struct {
 
         if (self.help_overlay.visible) {
             const ov = try self.help_overlay.draw(ctx);
-            self.children_buf[idx] = .{ .origin = .{ .row = 0, .col = 0 }, .surface = ov, .z_index = 10 };
+            const dialog_row = (size.height -| ov.size.height) / 2;
+            const dialog_col = (size.width -| ov.size.width) / 2;
+            self.dialog_row = dialog_row;
+            self.dialog_col = dialog_col;
+            self.dialog_h = ov.size.height;
+            self.dialog_w = ov.size.width;
+            self.children_buf[idx] = .{ .origin = .{ .row = dialog_row, .col = dialog_col }, .surface = ov, .z_index = 10 };
             idx += 1;
         }
         if (self.msg_overlay.visible) {
             const ov = try self.msg_overlay.draw(ctx);
-            self.children_buf[idx] = .{ .origin = .{ .row = 0, .col = 0 }, .surface = ov, .z_index = 11 };
+            const dialog_row = (size.height -| ov.size.height) / 2;
+            const dialog_col = (size.width -| ov.size.width) / 2;
+            self.dialog_row = dialog_row;
+            self.dialog_col = dialog_col;
+            self.dialog_h = ov.size.height;
+            self.dialog_w = ov.size.width;
+            self.children_buf[idx] = .{ .origin = .{ .row = dialog_row, .col = dialog_col }, .surface = ov, .z_index = 11 };
             idx += 1;
         }
         if (self.command.visible) {
-            const pal = try self.command.draw(ctx);
-            self.children_buf[idx] = .{ .origin = .{ .row = 0, .col = 0 }, .surface = pal, .z_index = 12 };
+            const box_w: u16 = @min(size.width -| 4, 64);
+            const box_h: u16 = @min(size.height -| 4, 14);
+            const pal = try self.command.draw(ctx.withConstraints(
+                .{ .width = box_w, .height = box_h },
+                .{ .width = box_w, .height = box_h },
+            ));
+            const pal_row: u16 = 2;
+            const pal_col = (size.width -| pal.size.width) / 2;
+            self.palette_row = pal_row;
+            self.palette_col = pal_col;
+            self.palette_h = pal.size.height;
+            self.palette_w = pal.size.width;
+            self.children_buf[idx] = .{ .origin = .{ .row = pal_row, .col = pal_col }, .surface = pal, .z_index = 12 };
+            idx += 1;
+        }
+        if (self.header_menu) |menu| {
+            const measured = overlay_mod.Dropdown.measure(self.dropdown.body);
+            var col = header_bar.menuAnchor(size.width, menu);
+            if (col + measured.width > size.width) col = size.width -| measured.width;
+            self.dropdown_col = col;
+            self.dropdown_width = measured.width;
+            self.dropdown_height = measured.height;
+            const menu_surf = try self.dropdown.draw(ctx.withConstraints(
+                .{ .width = measured.width, .height = measured.height },
+                .{ .width = measured.width, .height = measured.height },
+            ));
+            self.children_buf[idx] = .{
+                .origin = .{ .row = 1, .col = col },
+                .surface = menu_surf,
+                .z_index = 20,
+            };
             idx += 1;
         }
 
@@ -2793,4 +3725,54 @@ fn drawDivider(ctx: vxfw.DrawContext, width: u16, theme: theme_mod.Theme) std.me
         });
     }
     return surf;
+}
+
+const decode_protocol_names = [_][]const u8{ "http", "tls", "dns", "quic", "dhcp", "ntp", "ssh", "smb" };
+
+fn collectDecodeSelectors(
+    allocator: std.mem.Allocator,
+    node: *const packet.DetailNode,
+    choices: *std.ArrayList([]u8),
+) !void {
+    const layer: ?[]const u8 = if (std.mem.eql(u8, node.name, "tcp.srcport") or std.mem.eql(u8, node.name, "tcp.dstport"))
+        "tcp.port"
+    else if (std.mem.eql(u8, node.name, "udp.srcport") or std.mem.eql(u8, node.name, "udp.dstport"))
+        "udp.port"
+    else if (std.mem.eql(u8, node.name, "eth.type"))
+        "ethertype"
+    else
+        null;
+    if (layer) |name| {
+        const value = std.mem.trim(u8, node.show, " \t");
+        if (value.len != 0) {
+            const spec = try std.fmt.allocPrint(allocator, "{s}=={s}", .{ name, value });
+            var seen = false;
+            for (choices.items) |existing| {
+                if (std.mem.eql(u8, existing, spec)) seen = true;
+            }
+            if (seen) allocator.free(spec) else try choices.append(allocator, spec);
+        }
+    }
+    for (node.children) |*child| try collectDecodeSelectors(allocator, child, choices);
+}
+
+fn writeJsonString(writer: *std.Io.Writer, text: []const u8) !void {
+    try writer.writeByte('"');
+    for (text) |char| switch (char) {
+        '"' => try writer.writeAll("\\\""),
+        '\\' => try writer.writeAll("\\\\"),
+        '\n' => try writer.writeAll("\\n"),
+        '\r' => try writer.writeAll("\\r"),
+        else => try writer.writeByte(char),
+    };
+    try writer.writeByte('"');
+}
+
+fn writeCsvField(writer: *std.Io.Writer, text: []const u8) !void {
+    try writer.writeByte('"');
+    for (text) |char| {
+        if (char == '"') try writer.writeByte('"');
+        try writer.writeByte(char);
+    }
+    try writer.writeByte('"');
 }

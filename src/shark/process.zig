@@ -587,6 +587,100 @@ pub fn argvConversations(allocator: std.mem.Allocator, tshark: []const u8, path:
     return a;
 }
 
+pub fn argvHierarchy(allocator: std.mem.Allocator, tshark: []const u8, path: []const u8) !Argv {
+    var a: Argv = .{};
+    errdefer a.deinit(allocator);
+    try a.append(allocator, tshark);
+    try a.append(allocator, "-r");
+    try a.append(allocator, path);
+    try a.append(allocator, "-q");
+    try a.append(allocator, "-z");
+    try a.append(allocator, "io,phs");
+    return a;
+}
+
+pub fn argvEndpoints(allocator: std.mem.Allocator, tshark: []const u8, path: []const u8, kind: []const u8) !Argv {
+    var a: Argv = .{};
+    errdefer a.deinit(allocator);
+    try a.append(allocator, tshark);
+    try a.append(allocator, "-r");
+    try a.append(allocator, path);
+    try a.append(allocator, "-q");
+    try a.append(allocator, "-z");
+    const spec = try std.fmt.allocPrint(allocator, "endpoints,{s}", .{kind});
+    defer allocator.free(spec);
+    try a.append(allocator, spec);
+    return a;
+}
+
+pub fn argvProtocolList(allocator: std.mem.Allocator, tshark: []const u8) !Argv {
+    var a: Argv = .{};
+    errdefer a.deinit(allocator);
+    try a.append(allocator, tshark);
+    try a.append(allocator, "-G");
+    try a.append(allocator, "protocols");
+    return a;
+}
+
+pub fn argvExportPcap(
+    allocator: std.mem.Allocator,
+    tshark: []const u8,
+    path: []const u8,
+    display_filter: []const u8,
+    out_path: []const u8,
+    frame: ?u32,
+) !Argv {
+    var a: Argv = .{};
+    errdefer a.deinit(allocator);
+    try a.append(allocator, tshark);
+    try a.append(allocator, "-r");
+    try a.append(allocator, path);
+    const filter = try exportFilter(allocator, display_filter, frame);
+    defer allocator.free(filter);
+    if (filter.len != 0) {
+        try a.append(allocator, "-Y");
+        try a.append(allocator, filter);
+    }
+    try a.append(allocator, "-F");
+    try a.append(allocator, "pcapng");
+    try a.append(allocator, "-w");
+    try a.append(allocator, out_path);
+    return a;
+}
+
+pub fn argvExportObjects(
+    allocator: std.mem.Allocator,
+    tshark: []const u8,
+    path: []const u8,
+    display_filter: []const u8,
+    protocol: []const u8,
+    directory: []const u8,
+) !Argv {
+    var a: Argv = .{};
+    errdefer a.deinit(allocator);
+    try a.append(allocator, tshark);
+    try a.append(allocator, "-r");
+    try a.append(allocator, path);
+    try a.append(allocator, "-q");
+    if (display_filter.len != 0) {
+        try a.append(allocator, "-Y");
+        try a.append(allocator, display_filter);
+    }
+    const spec = try std.fmt.allocPrint(allocator, "{s},{s}", .{ protocol, directory });
+    defer allocator.free(spec);
+    try a.append(allocator, "--export-objects");
+    try a.append(allocator, spec);
+    return a;
+}
+
+fn exportFilter(allocator: std.mem.Allocator, display_filter: []const u8, frame: ?u32) ![]u8 {
+    if (frame) |number| {
+        if (display_filter.len == 0) return std.fmt.allocPrint(allocator, "frame.number == {d}", .{number});
+        return std.fmt.allocPrint(allocator, "({s}) and frame.number == {d}", .{ display_filter, number });
+    }
+    return allocator.dupe(u8, display_filter);
+}
+
 pub fn argvCapinfos(allocator: std.mem.Allocator, capinfos: []const u8, path: []const u8) !Argv {
     var a: Argv = .{};
     errdefer a.deinit(allocator);

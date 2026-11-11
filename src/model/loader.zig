@@ -57,6 +57,8 @@ pub const CaptureLoader = struct {
     workers: std.ArrayList(std.Thread) = .empty,
     list_generation: std.atomic.Value(u64) = .init(0),
     detail_generation: std.atomic.Value(u64) = .init(0),
+    /// Packet-list reloads and detail loads must not cancel each other.
+    list_cancel: process.CancellationToken = .{},
     cancel_token: process.CancellationToken = .{},
     live_child: ?std.process.Child = null,
     /// Headless tests record the PSML argv and skip worker threads.
@@ -88,6 +90,7 @@ pub const CaptureLoader = struct {
     }
 
     pub fn deinit(self: *CaptureLoader, io: std.Io) void {
+        self.list_cancel.cancel(io);
         self.cancel_token.cancel(io);
         if (self.has_psml_argv) self.psml_argv.deinit(self.allocator);
         if (self.live_child) |*child| child.kill(io);
@@ -121,9 +124,9 @@ pub const CaptureLoader = struct {
 
     pub fn requestPsml(self: *CaptureLoader, session: *session_mod.Session) !void {
         session.loading = .loading_list;
-        self.cancel_token.cancel(self.io);
+        self.list_cancel.cancel(self.io);
         const generation = self.list_generation.fetchAdd(1, .acq_rel) + 1;
-        self.cancel_token.reset();
+        self.list_cancel.reset();
         var argv = try process.argvPsmlLoad(
             self.allocator,
             self.tools.tshark,
@@ -343,6 +346,7 @@ pub const CaptureLoader = struct {
     }
 
     pub fn cancel(self: *CaptureLoader, io: std.Io) void {
+        self.list_cancel.cancel(io);
         self.cancel_token.cancel(io);
         self.stopLiveCapture(io);
     }
@@ -369,7 +373,7 @@ fn runPsmlWorker(task: *PsmlTask) void {
         loader.allocator,
         loader.io,
         task.argv.slice(),
-        &loader.cancel_token,
+        &loader.list_cancel,
         &feed,
         PsmlFeed.onChunk,
         &saw_stdout,
@@ -379,7 +383,7 @@ fn runPsmlWorker(task: *PsmlTask) void {
         return;
     };
     defer output.deinit(loader.allocator);
-    if (task.generation != loader.list_generation.load(.acquire) or loader.cancel_token.isCancelled()) return;
+    if (task.generation != loader.list_generation.load(.acquire) or loader.list_cancel.isCancelled()) return;
 
     feed.finish() catch |err| {
         if (err == error.Cancelled or task.generation != loader.list_generation.load(.acquire)) return;
@@ -477,6 +481,7 @@ const PsmlFeed = struct {
             .headers = headers,
             .packets = packets,
             .append = !self.replace_next,
+            .generation = self.generation,
         };
         self.replace_next = false;
         self.emitted_rows += table.packets.len;
@@ -658,6 +663,12 @@ fn appendDissectionOptions(
     for (session.decode_as_args.items) |decode_as| {
         try argv.append(allocator, "-d");
         try argv.append(allocator, decode_as);
+    }
+    if (session.tls_keylog_file.len != 0) {
+        const option = try std.fmt.allocPrint(allocator, "tls.keylog_file:{s}", .{session.tls_keylog_file});
+        defer allocator.free(option);
+        try argv.append(allocator, "-o");
+        try argv.append(allocator, option);
     }
     var extra = std.mem.tokenizeAny(u8, configured_args, " \t\r\n");
     while (extra.next()) |arg| try argv.append(allocator, arg);
@@ -939,6 +950,49 @@ test "stale psml generation is dropped and a second request cancels the first ch
         else => return error.UnexpectedEvent,
     }
     try std.testing.expect(events[1] == .done);
+}
+
+test "a detail load does not cancel the packet list" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const script_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/tshark", .{tmp.sub_path[0..]});
+    defer allocator.free(script_path);
+    const hold_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/hold.pcap", .{tmp.sub_path[0..]});
+    defer allocator.free(hold_path);
+    try writeExecutable(io, script_path, fake_tshark);
+
+    var tools = try testingTools(allocator, script_path);
+    defer tools.deinit();
+    var loader = CaptureLoader.init(allocator, io, &tools, .{});
+    defer {
+        joinWorkers(&loader);
+        loader.deinit(io);
+    }
+
+    var session = session_mod.Session.init(allocator, .{ .file = hold_path });
+    defer session.deinit();
+    try loader.requestPsml(&session);
+    const started = try std.fmt.allocPrint(allocator, "{s}.started", .{hold_path});
+    defer allocator.free(started);
+    try waitForPath(io, started);
+    try loader.requestDetail(&session, 1);
+    const release = try std.fmt.allocPrint(allocator, "{s}.release", .{hold_path});
+    defer allocator.free(release);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = release, .data = "go\n" });
+    joinWorkers(&loader);
+
+    const events = try loader.drainEvents();
+    defer {
+        for (events) |*event| event.deinit(allocator);
+        allocator.free(events);
+    }
+    var saw_packets = false;
+    for (events) |event| {
+        if (event == .packets_loaded) saw_packets = true;
+    }
+    try std.testing.expect(saw_packets);
 }
 
 test "detail cache eviction frees the bundle" {

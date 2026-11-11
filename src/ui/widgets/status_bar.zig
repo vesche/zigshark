@@ -20,6 +20,9 @@ pub const StatusBar = struct {
     expansion: []const u8 = "",
     tailing: bool = false,
     live: bool = false,
+    expert_count: usize = 0,
+    tls_keys: bool = false,
+    time_zero: ?u32 = null,
 
     pub fn format(self: *const StatusBar, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         var writer: std.Io.Writer.Allocating = .init(allocator);
@@ -37,6 +40,9 @@ pub const StatusBar = struct {
         if (self.filter.len != 0) try print(out, "  {s}", .{self.filter});
         const state = self.stateLabel();
         if (state.len != 0) try print(out, "  {s}", .{state});
+        if (self.expert_count != 0) try print(out, "  expert {d}", .{self.expert_count});
+        if (self.time_zero) |frame| try print(out, "  t0 {d}", .{frame});
+        if (self.tls_keys) try writeAll(out, "  tls-keys");
         if (self.hint.len != 0) try print(out, "  {s}", .{self.hint});
         if (self.filter_error.len != 0) try print(out, "  {s}", .{self.filter_error});
         if (self.expansion.len != 0) try print(out, "  → {s}", .{self.expansion});

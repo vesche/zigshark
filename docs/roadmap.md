@@ -85,8 +85,8 @@ The three panes work. What still feels like a tool you have to already know is t
 |------|--------|-------|
 | Apply or prepare a filter from the selected field | **done** | `=` on the protocol tree opens equals, not-equals, and, or, not, and contains. Apply reloads. Prepare only fills the bar. And/or appends to the current expression. |
 | Filter from the packet list | **done** | `=` on the selected row builds an `ip.addr` pair, or tcp/udp with ports when the columns have them. Apply reloads. Prepare only fills the bar. Time reference waits until that feature exists. |
-| Recent filters on the filter bar | **done** | Up/Down while the filter bar is focused recalls recent filters. An empty bar also lists them on the status line. |
-| Filter expression feedback | **done** | Empty is neutral, a valid filter is green, and an invalid one is red. The check runs after a short pause. The tshark error line is on the status line. |
+| Recent filters on the filter bar | **done** | Up/Down while the filter bar is focused recalls recent filters. `<Recent>` opens a list and Enter applies the selected one. `<Clear>` removes the display filter. |
+| Filter expression feedback | **done** | Empty is neutral, a valid filter is green, and an invalid one is red. The check runs after a short pause. A valid expression reloads the packet list; Enter applies it immediately. The tshark error line is on the status line. |
 | Saved filter library | **done** | Named filters live in the profile `[filters]` section, separate from the recent list. `:filters` lists them, Enter or `:filters <name>` applies one, and `:filters save <name>` stores the current expression. |
 | Display-filter macros in the bar | **done** | `$name` still expands before validation. The status line shows the expanded expression while the bar still contains the macro, before Enter applies it. |
 
@@ -139,39 +139,19 @@ These are the Wireshark workflows that still make people leave a terminal. They 
 
 **Field filters.** Covered in section 3. This is the feature. Wireshark's "Apply as Filter" is why the GUI is faster than a typed display filter for almost every investigation.
 
-**Expert information.** tshark already emits expert severity inside PDML (`_ws.expert`, severity, group, message). Add `:expert` with the same selectable overlay as conversations.
+**Expert information.** **done** for the open packet. `:expert` reads `_ws.expert` from the packet already loaded, groups error, warning, note, and chat, and Enter selects that field. The status line shows `expert N` when the packet has any. A full-file `tshark -z expert` index is still a follow-up.
 
-- Group by error, warning, note, chat
-- Enter jumps to that frame and opens the field
-- Counts in the status line when the open packet itself has expert items
-- Do not scrape this out of a second full-file pass if the loaded packet's PDML already has it. A full-file expert index can be a follow-up via `tshark -z expert` once the per-packet view works
+**Go to frame and time reference.** **done.** `:goto N` and `g` select a frame. `Ctrl-T` or `:time-ref` sets that frame as time zero and clears it on a second press. The Time column shows seconds since that frame without a tshark reload. `:columns delta` stays the previous-packet preset.
 
-**Go to frame and time reference.**
+**Apply field as column.** **done.** `:columns add` uses the selected tree field, or `:columns add <field>`, and reloads PSML with `%Cus:<field>`. `:columns drop` removes that custom column.
 
-- `:goto N` and `g`
-- `Ctrl-T` sets the selected frame as time zero and clears it on a second press
-- The time column can show seconds since that frame without a tshark reload: store the reference timestamp and format the delta locally
-- `:columns delta` stays the tshark "delta from previous" preset. Do not overload it
+**Protocol hierarchy and endpoints.** **done.** `:hierarchy` reads `tshark -z io,phs` and Enter appends that protocol to the display filter. `:endpoints [tcp|udp|ip|ipv6|eth]` lists addresses sorted by bytes. Enter filters to that address; a tcp or udp row also includes its port. The list stops at 200 rows.
 
-**Protocol hierarchy and endpoints.** Text tables, same overlay as `:convs`.
+**Export.** **done.** `:export packets <path>` writes the displayed packets as pcapng. `:export packet <path>` writes the selected frame. `:export json <path>` and `:export csv <path>` write the rows on screen. `:export objects http|smb <dir>` uses `--export-objects`. An existing file asks for `y` before it is replaced. A tshark failure shows its stderr.
 
-- `:hierarchy` from `tshark -z io,phs`. Enter appends a protocol filter (`tcp`, `tls`, `dns`)
-- `:endpoints [tcp|udp|ip|ipv6|eth]`. Enter filters to that address. Conversations stay the pair view; endpoints are the "who is loud" view
-- Show packets and bytes. Sorting by bytes is the default
+**Decode As on the selection.** **done.** `:decode-as layer==selector,protocol` still adds a raw rule. With no arguments it lists the open packet's tcp ports, udp ports, and ethertype, then a short list of protocols that `tshark -G protocols` actually has (http, tls, dns, and a few others). Enter reloads.
 
-**Apply field as column.** From the selected tree field, add a custom column (`%Cus:<field>`) and reload PSML. `:columns` already accepts a raw format string, so this is a builder on top of it, plus a way to remove the column you just added.
-
-**Export.**
-
-- `:export packets <path>` writes the displayed packets (`tshark -Y` plus the current file) as pcapng
-- `:export packet <path>` writes the selected frame
-- `:export json <path>` and `:export csv <path>` for the displayed rows
-- `:export objects http <dir>` (and smb when tshark supports it) via `--export-objects`
-- Confirm before overwriting. The command fails with the tshark stderr in the message overlay
-
-**Decode As on the selection.** `:decode-as` exists as a raw `layer==selector,protocol` string. Offer the selectors the current packet actually has (tcp port, udp port, ethertype) and a short protocol list from `tshark -G protocols`, then reload.
-
-**TLS key log.** One setting, `tls-keylog-file`, passed through as `-o tls.keylog_file:...` on summary and detail. A status-line marker when it is set, so a still-encrypted handshake is obvious. This single option is why a lot of HTTPS captures get opened in Wireshark.
+**TLS key log.** **done.** `:set tls-keylog-file <path>` is passed as `-o tls.keylog_file:...` on summary and detail, and the status line shows `tls-keys` while it is set. Clear it with an empty value. The list and the open packet reload so a still-encrypted handshake is obvious.
 
 ### Next — depth on what is already there
 

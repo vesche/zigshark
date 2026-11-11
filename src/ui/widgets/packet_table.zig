@@ -3,6 +3,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const packet = @import("../../model/packet.zig");
 const theme_mod = @import("../theme.zig");
+const time_ref = @import("../time_ref.zig");
 const color_rules = @import("../color_rules.zig");
 const config_mod = @import("../../config.zig");
 const text_util = @import("text_util.zig");
@@ -13,6 +14,8 @@ pub const PacketTable = struct {
     theme: theme_mod.Theme,
     packet_colors: bool = true,
     color_rules: []const config_mod.Config.ColorRule = &.{},
+    /// When set, the Time column shows seconds since this value. The stored cell is unchanged.
+    time_base: ?f64 = null,
     selected: usize = 0,
     scroll_top: usize = 0,
     viewport_rows: usize = 1,
@@ -89,7 +92,7 @@ pub const PacketTable = struct {
                     if (self.onFocus) |cb| cb(self.userdata);
                     try ctx.requestFocus(self.widget());
                 }
-                if (m.button == .left and m.row >= 0 and m.col >= 0) {
+                if (m.type == .press and m.button == .left and m.row >= 0 and m.col >= 0) {
                     const row: usize = @intCast(m.row);
                     if (row == 0) {
                         if (columnAt(self.headers, self.last_width, @intCast(m.col))) |column| {
@@ -174,7 +177,7 @@ pub const PacketTable = struct {
         const selected_style = theme_mod.selectionStyle(self.theme, self.focused);
 
         fillRow(&surf, 0, size.width, header_style);
-        const header_line = try formatRow(ctx.arena, columns, null);
+        const header_line = try formatRow(ctx.arena, columns, null, null);
         _ = text_util.writeText(&surf, ctx, 0, 0, header_line, header_style, size.width);
 
         const body_h = size.height -| 1;
@@ -206,7 +209,7 @@ pub const PacketTable = struct {
                 }
             }
             fillRow(&surf, line, size.width, style);
-            const text = try formatRow(ctx.arena, columns, row);
+            const text = try formatRow(ctx.arena, columns, row, self.time_base);
             _ = text_util.writeText(&surf, ctx, 0, line, text, style, size.width);
         }
         return surf;
@@ -349,7 +352,7 @@ fn cellFor(row: packet.PacketSummary, semantic: Semantic) []const u8 {
     return if (index < row.columns.len) row.columns[index] else "";
 }
 
-fn formatRow(arena: std.mem.Allocator, columns: []const Column, row: ?packet.PacketSummary) ![]const u8 {
+fn formatRow(arena: std.mem.Allocator, columns: []const Column, row: ?packet.PacketSummary, time_base: ?f64) ![]const u8 {
     var list: std.ArrayList(u8) = .empty;
     for (columns, 0..) |column, i| {
         if (column.width == 0) continue;
@@ -361,7 +364,14 @@ fn formatRow(arena: std.mem.Allocator, columns: []const Column, row: ?packet.Pac
                 cellFor(packet_row, column.semantic)
         else
             column.title;
-        const clipped = clipAscii(raw, column.width);
+        var delta_buf: [32]u8 = undefined;
+        const shown = if (row != null and time_base != null and isTimeColumn(column)) blk: {
+            if (time_ref.parseSeconds(raw)) |seconds| {
+                break :blk time_ref.formatDelta(&delta_buf, seconds - time_base.?);
+            }
+            break :blk raw;
+        } else raw;
+        const clipped = clipAscii(shown, column.width);
         const right = column.semantic == .number or column.semantic == .length or (column.from_header and isNumericTitle(column.title));
         if (right and clipped.len < column.width) {
             var pad: usize = 0;
@@ -374,6 +384,12 @@ fn formatRow(arena: std.mem.Allocator, columns: []const Column, row: ?packet.Pac
         }
     }
     return try list.toOwnedSlice(arena);
+}
+
+fn isTimeColumn(column: Column) bool {
+    if (!column.from_header) return column.semantic == .time;
+    if (std.ascii.findIgnoreCase(column.title, "delta") != null) return false;
+    return std.ascii.findIgnoreCase(column.title, "time") != null;
 }
 
 fn clipAscii(text: []const u8, width: u16) []const u8 {
@@ -406,9 +422,39 @@ test "format row pads columns" {
     const allocator = std.testing.allocator;
     var buf: [7]Column = undefined;
     const cols = fillColumns(&buf, 120);
-    const line = try formatRow(allocator, cols, null);
+    const line = try formatRow(allocator, cols, null, null);
     defer allocator.free(line);
     try std.testing.expect(std.mem.indexOf(u8, line, "No.") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "Source") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "No.Time") == null);
+}
+
+test "each header press reverses that column and the release does not" {
+    var table: PacketTable = .{ .theme = theme_mod.dark(), .last_width = 120 };
+    var ctx: vxfw.EventContext = .{
+        .io = std.testing.io,
+        .alloc = std.testing.allocator,
+        .cmds = .empty,
+    };
+    defer ctx.cmds.deinit(std.testing.allocator);
+    const press: vxfw.Event = .{ .mouse = .{
+        .col = 1,
+        .row = 0,
+        .button = .left,
+        .type = .press,
+        .mods = .{},
+    } };
+    const release: vxfw.Event = .{ .mouse = .{
+        .col = 1,
+        .row = 0,
+        .button = .left,
+        .type = .release,
+        .mods = .{},
+    } };
+    try table.handleEvent(&ctx, press);
+    try std.testing.expect(!table.sort_ascending);
+    try table.handleEvent(&ctx, release);
+    try std.testing.expect(!table.sort_ascending);
+    try table.handleEvent(&ctx, press);
+    try std.testing.expect(table.sort_ascending);
 }

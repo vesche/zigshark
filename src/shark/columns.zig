@@ -76,6 +76,47 @@ test "two tab-separated fields (modern tshark)" {
     try std.testing.expect(cols[0].field == null);
 }
 
+test "a custom column is appended and removed by field name" {
+    const alloc = std.testing.allocator;
+    const base = "gui.column.format:\"No.\",\"%m\",\"Time\",\"%t\"";
+    const added = try addCustomColumn(alloc, base, "tls.handshake.extensions_server_name");
+    defer alloc.free(added);
+    try std.testing.expect(std.mem.indexOf(u8, added, "%Cus:tls.handshake.extensions_server_name") != null);
+    const again = try addCustomColumn(alloc, added, "tls.handshake.extensions_server_name");
+    defer alloc.free(again);
+    try std.testing.expectEqualStrings(added, again);
+    const dropped = (try dropCustomColumn(alloc, added, "tls.handshake.extensions_server_name")).?;
+    defer alloc.free(dropped);
+    try std.testing.expectEqualStrings(base, dropped);
+    try std.testing.expect((try dropCustomColumn(alloc, base, "ip.src")) == null);
+    try std.testing.expectError(error.InvalidField, addCustomColumn(alloc, base, "tcp src"));
+}
+
+pub fn addCustomColumn(allocator: std.mem.Allocator, format: []const u8, field: []const u8) ![]u8 {
+    if (!validField(field)) return error.InvalidField;
+    const marker = try std.fmt.allocPrint(allocator, "%Cus:{s}", .{field});
+    defer allocator.free(marker);
+    if (std.mem.indexOf(u8, format, marker) != null) return allocator.dupe(u8, format);
+    return std.fmt.allocPrint(allocator, "{s},\"{s}\",\"{s}\"", .{ format, field, marker });
+}
+
+pub fn dropCustomColumn(allocator: std.mem.Allocator, format: []const u8, field: []const u8) !?[]u8 {
+    if (!validField(field)) return error.InvalidField;
+    const piece = try std.fmt.allocPrint(allocator, ",\"{s}\",\"%Cus:{s}\"", .{ field, field });
+    defer allocator.free(piece);
+    const at = std.mem.indexOf(u8, format, piece) orelse return null;
+    const text = try std.fmt.allocPrint(allocator, "{s}{s}", .{ format[0..at], format[at + piece.len ..] });
+    return text;
+}
+
+fn validField(field: []const u8) bool {
+    if (field.len == 0) return false;
+    for (field) |char| {
+        if (char == '"' or char == ',' or char == ' ' or char == '\t') return false;
+    }
+    return true;
+}
+
 test "multiple lines" {
     const alloc = std.testing.allocator;
     const text =

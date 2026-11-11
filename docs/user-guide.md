@@ -39,8 +39,8 @@ zigshark capture -i eth0 -f 'port 53' -w /tmp/out.pcap
 | `hjkl` / arrows | Move in the focused pane |
 | `Tab` / `Ctrl-W` | Cycle list, tree, hex, and filter |
 | `/` | Focus the display filter. `Tab` / `Shift-Tab` complete field names |
-| Up / Down | In the filter bar, recall recent filters. An empty bar lists them |
-| Enter | Apply the display filter |
+| Up / Down | In the filter bar, recall recent filters. `<Recent>` opens them as a list; Enter applies one |
+| Enter | Apply the display filter immediately. A valid expression also applies after a short pause |
 | `=` | On a field: equals, not-equals, and, or, not, contains. On a row: conversation filter. Apply reloads; Prepare only fills the bar |
 | `g` / `:goto 1234` | Select that frame. A missing frame is a message |
 | `:` | Command palette. The selected row shows the command's arguments |
@@ -57,7 +57,7 @@ zigshark capture -i eth0 -f 'port 53' -w /tmp/out.pcap
 | `Esc` | Dismiss an overlay |
 | Home / `G` | First or last packet. Hex has an offset ruler, a gap after 8 bytes, and the cursor stays distinct inside the selected field |
 
-The filter bar is neutral while empty, green when tshark accepts the expression, and red when it does not. The tshark error line is on the status line. The check runs after a short pause so typing does not wait on tshark. A `$name` macro shows its expansion on the status line before Enter applies it.
+The filter bar is neutral while empty, green when tshark accepts the expression, and red when it does not. The tshark error line is on the status line. The check runs after a short pause so typing does not wait on tshark, and a valid expression then reloads the packet list. Enter applies it immediately. `<Clear>` removes the filter and reloads the full capture. `<Recent>` lists recent filters; j/k and Enter, or a click, apply one. A `$name` macro shows its expansion on the status line before it is applied.
 
 `:filters` lists saved filters and Enter applies one. `:filters save <name>` stores the current expression, separate from the recent list. `:filters <name>` applies that saved filter.
 
@@ -72,14 +72,21 @@ Header menus: Analysis (field filter, go to frame, streams, conversations, captu
 | `:goto <frame>` | Select a frame |
 | `:streams [tcp\|udp] [index] [ascii\|hex\|raw]` | Follow the selected stream |
 | `:convs [tcp\|udp\|ip\|ipv6\|eth]` | Conversations. Enter filters |
-| `:columns default\|delta\|absolute\|set <format>` | Packet-list columns |
-| `:decode-as layer==selector,protocol` | Add a decode-as rule |
+| `:columns default\|delta\|absolute\|set <format>\|add <field>\|drop <field>` | Packet-list columns. `add` uses the selected field |
+| `:expert` | Expert info on the open packet. Enter opens the field |
+| `:hierarchy` | Protocol hierarchy. Enter adds that protocol to the filter |
+| `:endpoints [tcp\|udp\|ip\|ipv6\|eth]` | Loudest addresses, sorted by bytes. Enter filters |
+| `:export packets\|packet\|json\|csv <path>` | Write the displayed packets. `y` confirms an overwrite |
+| `:export objects http\|smb <dir>` | Export objects with tshark |
+| `:decode-as [layer==selector,protocol]` | No arguments uses the selected packet |
+| `:time-ref` | Set or clear time zero. `Ctrl-T` does the same |
 | `:search <text>` | Search the focused pane |
 | `:search-regex <pattern>` | `. * + ? [] ^ $`, not PCRE |
 | `:search-hex <hex bytes>` | Search packet bytes |
 | `:search-filter <display filter>` | Jump to the next matching frame |
 | `:load <path>` | Open a capture |
 | `:set [<key> <value>]` | List or change a setting. A bad value is not saved |
+| `:set tls-keylog-file <path>` | Pass a TLS key log to tshark. The status line shows `tls-keys` |
 | `:profile list\|create\|use\|delete <name>` | Profiles |
 | `:theme [list\|<name>]` | Theme. `:no-theme` restores the built-in theme |
 | `:recent <number>` / `:recent-filter <number>` | Open a recent file or filter |

@@ -12,3 +12,5 @@ zig-pkg/
 /tmp/
 
 termshark_reference/
+__pycache__/
+*.pyc

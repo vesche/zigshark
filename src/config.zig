@@ -29,6 +29,7 @@ pub const Config = struct {
     theme: []u8 = &.{},
 
     column_format: []u8 = &.{},
+    tls_keylog_file: []u8 = &.{},
     conv_types: []u8 = &.{},
     conv_absolute_time: bool = false,
     conv_resolve_names: bool = true,
@@ -109,7 +110,7 @@ pub const Config = struct {
             "conv_types",              "search_type",            "search_target",
             "copy_command",            "browse_command",         "pager",
             "wormhole_rendezvous_url", "wormhole_transit_relay", "profile",
-            "wireshark_profile",
+            "wireshark_profile",       "tls_keylog_file",
         };
         inline for (fields) |name| {
             const ptr = &@field(self, name);
@@ -193,6 +194,7 @@ pub const Config = struct {
         if (self.browse_command.len != 0) try w.print("browse-command = \"{s}\"\n", .{self.browse_command});
         if (self.pager.len != 0) try w.print("pager = \"{s}\"\n", .{self.pager});
         if (self.wireshark_profile.len != 0) try w.print("wireshark-profile = \"{s}\"\n", .{self.wireshark_profile});
+        if (self.tls_keylog_file.len != 0) try w.print("tls-keylog-file = \"{s}\"\n", .{self.tls_keylog_file});
 
         try w.writeAll("\n[recents]\n");
         for (self.recent_files.items) |f| try w.print("file = \"{s}\"\n", .{f});
@@ -431,12 +433,14 @@ pub const Config = struct {
             \\wormhole-rendezvous-url = {s}
             \\wormhole-transit-relay = {s}
             \\wireshark-profile = {s}
+            \\tls-keylog-file = {s}
             \\
         , .{
             self.wormhole_length,
             self.wormhole_rendezvous_url,
             self.wormhole_transit_relay,
             self.wireshark_profile,
+            self.tls_keylog_file,
         });
         return writer.toOwnedSlice();
     }
@@ -518,6 +522,8 @@ pub const Config = struct {
             try replaceOwned(self.allocator, &self.pager, value);
         } else if (std.mem.eql(u8, key, "wireshark-profile")) {
             try replaceOwned(self.allocator, &self.wireshark_profile, value);
+        } else if (std.mem.eql(u8, key, "tls-keylog-file")) {
+            try replaceOwned(self.allocator, &self.tls_keylog_file, value);
         } else return false;
         return true;
     }

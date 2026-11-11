@@ -6,6 +6,39 @@ const text_util = @import("text_util.zig");
 
 pub const menu_text = "[Analysis] [Misc] [Help]";
 
+pub const analysis_menu =
+    \\Filter field
+    \\Go to frame
+    \\Streams
+    \\Conversations
+    \\Capture info
+    \\Expert
+    \\Protocol hierarchy
+    \\Endpoints
+    \\Export
+;
+
+pub const misc_menu =
+    \\Columns
+    \\Theme
+    \\Profile
+    \\Marks
+    \\Tail
+;
+
+pub const help_menu = "Keyboard shortcuts";
+
+pub fn menuAnchor(width: u16, menu: HeaderBar.Menu) u16 {
+    const total: u16 = @intCast(menu_text.len);
+    if (width <= total) return 0;
+    const start = width - total;
+    return start + switch (menu) {
+        .analysis => @as(u16, 0),
+        .misc => @as(u16, 11),
+        .help => @as(u16, 18),
+    };
+}
+
 pub fn menuAt(width: u16, col: u16) ?HeaderBar.Menu {
     const total: u16 = @intCast(menu_text.len);
     if (width <= total + 2 or col >= width) return null;
@@ -24,6 +57,7 @@ pub const HeaderBar = struct {
     source: []const u8 = "",
     menu_start: u16 = 0,
     last_width: u16 = 0,
+    open_menu: ?Menu = null,
     userdata: ?*anyopaque = null,
     onMenu: ?*const fn (?*anyopaque, Menu) void = null,
 
@@ -96,7 +130,41 @@ pub const HeaderBar = struct {
         const menu_width: u16 = @intCast(@min(menu_text.len, size.width));
         if (size.width > menu_width + 2) {
             self.menu_start = size.width - menu_width;
-            _ = text_util.writeText(&surface, ctx, self.menu_start, 0, menu_text, style, size.width);
+            const selected: vaxis.Style = .{
+                .fg = self.theme.selected_fg,
+                .bg = self.theme.selected_bg,
+                .bold = true,
+            };
+            var menu_cursor = self.menu_start;
+            menu_cursor = text_util.writeText(
+                &surface,
+                ctx,
+                menu_cursor,
+                0,
+                "[Analysis]",
+                if (self.open_menu == .analysis) selected else style,
+                size.width,
+            );
+            menu_cursor = text_util.writeText(&surface, ctx, menu_cursor, 0, " ", style, size.width);
+            menu_cursor = text_util.writeText(
+                &surface,
+                ctx,
+                menu_cursor,
+                0,
+                "[Misc]",
+                if (self.open_menu == .misc) selected else style,
+                size.width,
+            );
+            menu_cursor = text_util.writeText(&surface, ctx, menu_cursor, 0, " ", style, size.width);
+            _ = text_util.writeText(
+                &surface,
+                ctx,
+                menu_cursor,
+                0,
+                "[Help]",
+                if (self.open_menu == .help) selected else style,
+                size.width,
+            );
         } else {
             self.menu_start = size.width;
         }
@@ -110,4 +178,8 @@ test "header menus sit on the right edge" {
     try std.testing.expectEqual(HeaderBar.Menu.analysis, menuAt(80, start).?);
     try std.testing.expectEqual(HeaderBar.Menu.misc, menuAt(80, start + 11).?);
     try std.testing.expectEqual(HeaderBar.Menu.help, menuAt(80, start + 18).?);
+    try std.testing.expectEqual(start, menuAnchor(80, .analysis));
+    try std.testing.expectEqual(start + 11, menuAnchor(80, .misc));
+    try std.testing.expectEqual(@as(usize, 9), std.mem.count(u8, analysis_menu, "\n") + 1);
+    try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, misc_menu, "\n") + 1);
 }
