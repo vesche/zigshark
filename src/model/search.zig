@@ -39,6 +39,12 @@ pub const Hit = struct {
     byte_offset: ?usize = null,
 };
 
+fn fieldMatches(state: *const SearchState, haystack: []const u8) bool {
+    if (state.needle.len == 0) return true;
+    if (state.kind == .regex) return regexFind(haystack, state.needle) != null;
+    return haystackMatches(haystack, state.needle, state.case_sensitive);
+}
+
 fn haystackMatches(haystack: []const u8, needle: []const u8, case_sensitive: bool) bool {
     if (needle.len == 0) return true;
     if (case_sensitive) return std.mem.indexOf(u8, haystack, needle) != null;
@@ -70,7 +76,7 @@ pub fn findNextList(
         };
         const summary = sess.packets[idx];
         for (summary.columns, 0..) |col, ci| {
-            if (haystackMatches(col, state.needle, state.case_sensitive)) {
+            if (fieldMatches(state, col)) {
                 state.last_index = idx;
                 _ = sess.select(idx);
                 return .{ .packet_index = idx, .column = ci };
@@ -83,7 +89,7 @@ pub fn findNextList(
         while (i <= start) : (i += 1) {
             const summary = sess.packets[i];
             for (summary.columns, 0..) |col, ci| {
-                if (haystackMatches(col, state.needle, state.case_sensitive)) {
+                if (fieldMatches(state, col)) {
                     state.last_index = i;
                     _ = sess.select(i);
                     return .{ .packet_index = i, .column = ci };
@@ -97,6 +103,11 @@ pub fn findNextList(
 pub fn findNextBytes(bytes: *const packet.PacketBytes, state: *SearchState, from: usize) ?usize {
     if (state.needle.len == 0) return null;
     switch (state.kind) {
+        .regex => {
+            if (from > bytes.raw.len) return null;
+            const rel = regexFind(bytes.raw[from..], state.needle) orelse return null;
+            return from + rel;
+        },
         .hex => {
             var off: usize = from;
             while (off < bytes.raw.len) : (off += 1) {
@@ -183,6 +194,135 @@ test "search byte text returns actual offset" {
     defer state.deinit(allocator);
     try state.setNeedle(allocator, "needle");
     try std.testing.expectEqual(@as(?usize, 5), findNextBytes(&bytes, &state, 0));
+}
+
+/// Byte-oriented search. Supports `.`, `*`, `+`, `?`, `[]` classes, `^`, `$`, and `\`.
+/// Returns the start offset of the first match.
+pub fn regexFind(haystack: []const u8, pattern: []const u8) ?usize {
+    if (pattern.len == 0) return 0;
+    if (pattern[0] == '^') {
+        return if (regexMatchAt(haystack, pattern[1..], 0)) 0 else null;
+    }
+    var i: usize = 0;
+    while (i <= haystack.len) : (i += 1) {
+        if (regexMatchAt(haystack, pattern, i)) return i;
+        if (i == haystack.len) break;
+    }
+    return null;
+}
+
+fn regexMatchAt(haystack: []const u8, pattern: []const u8, index: usize) bool {
+    if (pattern.len == 0) return true;
+    if (pattern[0] == '$' and pattern.len == 1) return index == haystack.len;
+    const atom_len = regexAtomLen(pattern) orelse return false;
+    const atom = pattern[0..atom_len];
+    var rest = pattern[atom_len..];
+    const quant: u8 = if (rest.len > 0 and (rest[0] == '*' or rest[0] == '+' or rest[0] == '?')) blk: {
+        const q = rest[0];
+        rest = rest[1..];
+        break :blk q;
+    } else 1;
+    return regexQuant(haystack, atom, quant, rest, index);
+}
+
+fn regexQuant(
+    haystack: []const u8,
+    atom: []const u8,
+    quant: u8,
+    rest: []const u8,
+    index: usize,
+) bool {
+    var ends: [160]usize = undefined;
+    var count: usize = 0;
+    ends[0] = index;
+    var pos = index;
+    const max: usize = if (quant == '?') 1 else if (quant == 1) 1 else ends.len - 1;
+    while (count < max) {
+        const next = regexAtom(haystack, atom, pos) orelse break;
+        if (next == pos) break;
+        count += 1;
+        pos = next;
+        ends[count] = pos;
+    }
+    const min: usize = if (quant == '+' or quant == 1) 1 else 0;
+    if (count < min) return false;
+    var taken = count;
+    while (true) {
+        if (regexMatchAt(haystack, rest, ends[taken])) return true;
+        if (taken == min) break;
+        taken -= 1;
+    }
+    return false;
+}
+
+fn regexAtomLen(pattern: []const u8) ?usize {
+    if (pattern.len == 0) return null;
+    if (pattern[0] == '\\') return if (pattern.len >= 2) 2 else null;
+    if (pattern[0] == '[') {
+        var i: usize = 1;
+        if (i < pattern.len and pattern[i] == '^') i += 1;
+        var closed = false;
+        while (i < pattern.len) : (i += 1) {
+            if (pattern[i] == '\\' and i + 1 < pattern.len) {
+                i += 1;
+                continue;
+            }
+            if (pattern[i] == ']') {
+                closed = true;
+                i += 1;
+                break;
+            }
+        }
+        return if (closed) i else null;
+    }
+    return 1;
+}
+
+fn regexAtom(haystack: []const u8, atom: []const u8, index: usize) ?usize {
+    if (index >= haystack.len) return null;
+    const byte = haystack[index];
+    if (atom.len == 1 and atom[0] == '.') return index + 1;
+    if (atom.len == 2 and atom[0] == '\\') {
+        return if (byte == atom[1]) index + 1 else null;
+    }
+    if (atom.len >= 2 and atom[0] == '[' and atom[atom.len - 1] == ']') {
+        return if (classContains(atom, byte)) index + 1 else null;
+    }
+    if (atom.len == 1 and byte == atom[0]) return index + 1;
+    return null;
+}
+
+fn classContains(atom: []const u8, byte: u8) bool {
+    var body = atom[1 .. atom.len - 1];
+    var negated = false;
+    if (body.len > 0 and body[0] == '^') {
+        negated = true;
+        body = body[1..];
+    }
+    var found = false;
+    var i: usize = 0;
+    while (i < body.len) : (i += 1) {
+        var ch = body[i];
+        if (ch == '\\' and i + 1 < body.len) {
+            i += 1;
+            ch = body[i];
+        }
+        if (i + 2 < body.len and body[i + 1] == '-' and body[i + 2] != ']') {
+            const end = body[i + 2];
+            if (byte >= ch and byte <= end) found = true;
+            i += 2;
+            continue;
+        }
+        if (byte == ch) found = true;
+    }
+    return if (negated) !found else found;
+}
+
+test "regex finds a wildcard span" {
+    try std.testing.expectEqual(@as(?usize, 0), regexFind("syn retrans", "syn.*retrans"));
+    try std.testing.expectEqual(@as(?usize, null), regexFind("ack", "^syn"));
+    try std.testing.expectEqual(@as(?usize, 1), regexFind("xdead", "de.d"));
+    try std.testing.expectEqual(@as(?usize, 3), regexFind("ab 42 zz", "[0-9]+"));
 }
 
 test "search hexadecimal byte sequence" {

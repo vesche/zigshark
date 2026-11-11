@@ -13,7 +13,7 @@ Legend:
 |------|--------|---------------|
 | Open PCAP file | **done** | Async `model/loader` + PTY smoke |
 | Display filter apply/validate | **done** | Macro expansion, validation, async reload |
-| Display-filter completion | **partial** | Lazy `tshark -G fields` cache; first-match Tab completion, no popup list yet |
+| Display-filter completion | **done** | Lazy field cache. Tab and Shift-Tab cycle matches for the token being typed and show `n/total` |
 | Capture filter (CLI) | **done** | Applied to dumpcap/tshark live capture |
 | Interface list `-D` | done | `shark/tools.listInterfaces` |
 | Live capture dumpcap + tshark fallback | **partial** | Multi-interface and growing-file refresh work; fake-dumpcap integration passes. Privileged local capture is unavailable on the development host |
@@ -28,22 +28,22 @@ Legend:
 | Layouts and resizing | **done** | Vertical list/tree/hex default, side-by-side alternate, keyboard and mouse split resizing |
 | Column formats parser | **done** | Modern two/three-field rows covered |
 | Column editor / arbitrary Wireshark columns | **partial** | Fixed parity-oriented columns plus mouse sorting; editor still missing |
-| Follow TCP/UDP streams | **partial** | Scrollable `:streams` view; chunk/frame navigation and display modes still missing |
-| Conversations | **partial** | Scrollable tshark table; structured row actions/filter builders still missing |
+| Follow TCP/UDP streams | **partial** | `:streams [tcp\|udp] [index] [ascii\|hex\|raw]` follows the current packet's stream when the index is omitted. The view lists chunks. Enter applies `tcp.stream` / `udp.stream`. tshark's follow output has no frame numbers, so a chunk cannot jump to its packet yet |
+| Conversations | **done** | `:convs [tcp\|udp\|ip\|ipv6\|eth]` is a selectable list. Enter builds a two-endpoint display filter and applies it |
 | Capinfos | **done** | Scrollable `:capinfo` view |
 | Search list/details/bytes/hex | **done** | Focus-aware `Ctrl-F`, `n`/`N`, literal and hex byte search |
-| Regex and display-filter search | **missing** | Models exist but no complete UI/runtime implementation |
-| Local/global marks | **partial** | Lower/uppercase mark bindings work; cross-PCAP persistence is still missing |
-| Copy / clipboard | **partial** | Focused row/tree/hex/filter copy via OSC52 or configured command; termshark's expandable copy mode is still missing |
+| Regex and display-filter search | **done** | `:search-regex` (`. * + ? [] ^ $`) on the list, tree, or hex pane. `:search-filter` jumps to the next matching frame |
+| Local/global marks | **done** | Lowercase marks are per session. Uppercase marks are written to `config.toml` and reopen the right file |
+| Copy / clipboard | **done** | OSC52 or the configured copy command. Copy mode on the protocol tree copies the selected field and the children currently shown under it |
 | Recents | **done** | Persisted numbered recents with `:recents` / `:recent` |
 | Macros | **done** | Expanded before display-filter validation |
-| Profiles | **partial** | `-C`, `:profile create/use`; profile management UI/delete/link remains |
+| Profiles | **done** | `:profile list`, `create`, `use`, and `delete` |
 | Wireshark profile | **done** | Configured profile passed to summary/detail tshark commands |
-| Themes | **partial** | Propagated light/dark runtime theme; external theme TOML packs still missing |
+| Themes | **done** | Light/dark plus TOML packs. `:theme midnight` loads `themes/midnight.toml` or `~/.config/zigshark/themes/`. `:theme list` |
 | Wormhole transfer | **partial** | External CLI integration with missing-tool error; no progress UI |
 | Pass-through to tshark | **done** | Auto/explicit modes, zigshark-only flag stripping, file shorthand tests |
 | Decode-as / timestamp CLI | **done** | Applied to summary and detail tshark commands |
-| Config TOML | **partial** | Core runtime settings persist; not every planned key has a UI |
+| Config TOML | **partial** | Core settings, marks, and `:set` values persist. Not every key has a dedicated editor |
 | Help, menus and command palette | **done** | Keyboard help, clickable header menus, fuzzy command palette |
 | Terminal restore / Ctrl-C | **done** | PTY test verifies clean alternate-screen exit with no allocator dump |
 | Unix suspend/resume and `--tty` | **missing** | Job-control parity remains |

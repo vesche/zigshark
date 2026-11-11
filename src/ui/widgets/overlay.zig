@@ -11,6 +11,10 @@ pub const Overlay = struct {
     visible: bool = false,
     scroll_top: usize = 0,
     viewport_rows: usize = 1,
+    /// When set, j/k moves a row cursor and Enter is handled by the app.
+    pick: bool = false,
+    selected: usize = 0,
+    line_count: usize = 0,
 
     pub fn widget(self: *Overlay) vxfw.Widget {
         return .{
@@ -37,6 +41,17 @@ pub const Overlay = struct {
             .key_press => |key| {
                 if (key.matches(vaxis.Key.escape, .{})) {
                     self.visible = false;
+                    self.pick = false;
+                    return ctx.consumeAndRedraw();
+                }
+                if (self.pick and (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{}))) {
+                    if (self.line_count > 0 and self.selected + 1 < self.line_count) self.selected += 1;
+                    self.revealSelected();
+                    return ctx.consumeAndRedraw();
+                }
+                if (self.pick and (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{}))) {
+                    self.selected -|= 1;
+                    self.revealSelected();
                     return ctx.consumeAndRedraw();
                 }
                 if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
@@ -90,6 +105,7 @@ pub const Overlay = struct {
         const border: vaxis.Style = .{ .fg = self.theme.pane_border, .bg = self.theme.bg };
         const title_style: vaxis.Style = .{ .fg = self.theme.header_fg, .bg = self.theme.header_bg, .bold = true };
         const text_style: vaxis.Style = .{ .fg = self.theme.fg, .bg = self.theme.bg };
+        const pick_style: vaxis.Style = .{ .fg = self.theme.selected_fg, .bg = self.theme.selected_bg };
         var r: u16 = 0;
         while (r < h) : (r += 1) {
             var c: u16 = 0;
@@ -106,8 +122,10 @@ pub const Overlay = struct {
         var body_row: u16 = row0 + 2;
         const body_width: usize = @max(@as(usize, 1), w -| 4);
         var visual_line: usize = 0;
+        var source_index: usize = 0;
         var lines = std.mem.splitScalar(u8, self.body, '\n');
         while (lines.next()) |line| {
+            const line_style = if (self.pick and source_index == self.selected) pick_style else text_style;
             var offset: usize = 0;
             var emitted = false;
             while (offset < line.len or !emitted) {
@@ -125,7 +143,7 @@ pub const Overlay = struct {
                         col0 + 2,
                         body_row,
                         line[offset..end],
-                        text_style,
+                        line_style,
                         col0 + w - 1,
                     );
                     body_row += 1;
@@ -134,7 +152,10 @@ pub const Overlay = struct {
                 emitted = true;
                 offset = end;
             }
+            source_index += 1;
         }
+        self.line_count = source_index;
+        if (self.line_count > 0 and self.selected >= self.line_count) self.selected = self.line_count - 1;
         const max_scroll = visual_line -| self.viewport_rows;
         if (self.scroll_top > max_scroll) self.scroll_top = max_scroll;
         _ = text_util.writeText(
@@ -142,10 +163,16 @@ pub const Overlay = struct {
             ctx,
             col0 + 2,
             row0 + h - 1,
-            "j/k scroll  PgUp/PgDn  Esc close",
+            if (self.pick) "j/k select  Enter apply  Esc close" else "j/k scroll  PgUp/PgDn  Esc close",
             border,
             col0 + w - 1,
         );
         return surf;
+    }
+
+    fn revealSelected(self: *Overlay) void {
+        if (self.selected < self.scroll_top) self.scroll_top = self.selected;
+        const view = @max(self.viewport_rows, 1);
+        if (self.selected >= self.scroll_top + view) self.scroll_top = self.selected + 1 - view;
     }
 };

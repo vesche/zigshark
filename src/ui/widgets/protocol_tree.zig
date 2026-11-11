@@ -2,6 +2,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const packet = @import("../../model/packet.zig");
+const search_mod = @import("../../model/search.zig");
 const theme_mod = @import("../theme.zig");
 const text_util = @import("text_util.zig");
 
@@ -64,7 +65,28 @@ pub const ProtocolTree = struct {
         return self.flat.items[self.selected].label;
     }
 
+    pub fn formatSubtree(self: *const ProtocolTree, allocator: std.mem.Allocator) ![]u8 {
+        if (self.selected >= self.flat.items.len) return allocator.dupe(u8, "");
+        const depth = self.flat.items[self.selected].depth;
+        var writer: std.Io.Writer.Allocating = .init(allocator);
+        errdefer writer.deinit();
+        var index = self.selected;
+        while (index < self.flat.items.len) : (index += 1) {
+            const node = self.flat.items[index];
+            if (index != self.selected and node.depth <= depth) break;
+            if (index != self.selected) try writer.writer.writeByte('\n');
+            var pad: u8 = 0;
+            while (pad < node.depth) : (pad += 1) try writer.writer.writeAll("  ");
+            try writer.writer.writeAll(node.label);
+        }
+        return writer.toOwnedSlice();
+    }
+
     pub fn findText(self: *ProtocolTree, needle: []const u8, forward: bool) bool {
+        return self.findPattern(needle, false, forward);
+    }
+
+    pub fn findPattern(self: *ProtocolTree, needle: []const u8, regex: bool, forward: bool) bool {
         if (needle.len == 0 or self.flat.items.len == 0) return false;
         var step: usize = 0;
         while (step < self.flat.items.len) : (step += 1) {
@@ -72,7 +94,12 @@ pub const ProtocolTree = struct {
                 (self.selected + 1 + step) % self.flat.items.len
             else
                 (self.selected + self.flat.items.len - 1 - step) % self.flat.items.len;
-            if (containsIgnoreCase(self.flat.items[index].label, needle)) {
+            const label = self.flat.items[index].label;
+            const hit = if (regex)
+                search_mod.regexFind(label, needle) != null
+            else
+                containsIgnoreCase(label, needle);
+            if (hit) {
                 self.selected = index;
                 self.ensureVisible();
                 self.notifySelect();

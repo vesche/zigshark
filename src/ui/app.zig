@@ -16,6 +16,8 @@ const header_bar = @import("widgets/header_bar.zig");
 const help_view = @import("views/help.zig");
 const streams_view = @import("views/streams.zig");
 const convs_view = @import("views/convs.zig");
+const convs_shark = @import("../shark/convs.zig");
+const streams_shark = @import("../shark/streams.zig");
 const capinfo_view = @import("views/capinfo.zig");
 const search_mod = @import("../model/search.zig");
 const signals = @import("../platform/signals.zig");
@@ -127,6 +129,13 @@ pub const AppModel = struct {
     byte_search_offset: usize = 0,
     pending_global_frame: ?u32 = null,
     link_guard: bool = false,
+    completion_prefix: []u8 = &.{},
+    completion_index: usize = 0,
+    completion_note: [96]u8 = @splat(0),
+    completion_note_len: usize = 0,
+    conversations: []convs_shark.Conversation = &.{},
+    conversation_proto: []u8 = &.{},
+    stream_filter: []u8 = &.{},
 
     hsplit_main: hsplit.HSplit,
     hsplit_detail: hsplit.HSplit,
@@ -172,6 +181,13 @@ pub const AppModel = struct {
         self.byte_search_offset = 0;
         self.pending_global_frame = null;
         self.link_guard = false;
+        self.completion_prefix = &.{};
+        self.completion_index = 0;
+        self.completion_note = @splat(0);
+        self.completion_note_len = 0;
+        self.conversations = &.{};
+        self.conversation_proto = &.{};
+        self.stream_filter = &.{};
 
         self.packet_table = .{
             .theme = self.theme,
@@ -251,6 +267,10 @@ pub const AppModel = struct {
         if (self.fields.len != 0) self.allocator.free(self.fields);
         if (self.fields_tshark_path.len != 0) self.allocator.free(self.fields_tshark_path);
         self.search.deinit(self.allocator);
+        self.clearConversations();
+        if (self.conversation_proto.len != 0) self.allocator.free(self.conversation_proto);
+        if (self.stream_filter.len != 0) self.allocator.free(self.stream_filter);
+        if (self.completion_prefix.len != 0) self.allocator.free(self.completion_prefix);
         self.protocol_tree.deinit();
         self.filter.deinit();
         self.command.deinit();
@@ -498,7 +518,7 @@ pub const AppModel = struct {
         self.fields = try names.toOwnedSlice(self.allocator);
     }
 
-    fn completeFilter(self: *AppModel) !bool {
+    fn completeFilter(self: *AppModel, forward: bool) !bool {
         if (!self.fields_ready.load(.acquire) or self.fields.len == 0) return false;
         const text = try self.filter.copyText(self.allocator);
         defer self.allocator.free(text);
@@ -509,21 +529,54 @@ pub const AppModel = struct {
                 start -= 1;
             } else break;
         }
-        const prefix = text[start..];
-        if (prefix.len == 0) return false;
-        for (self.fields) |field| {
-            if (std.mem.startsWith(u8, field, prefix)) {
-                const completed = try std.fmt.allocPrint(
-                    self.allocator,
-                    "{s}{s}",
-                    .{ text[0..start], field },
-                );
-                defer self.allocator.free(completed);
-                try self.filter.setText(completed);
-                return true;
-            }
+        const token = text[start..];
+        if (token.len == 0) return false;
+
+        const continuing = self.completion_prefix.len != 0 and std.mem.startsWith(u8, token, self.completion_prefix);
+        const stem = if (continuing) self.completion_prefix else token;
+        if (!continuing) {
+            if (self.completion_prefix.len != 0) self.allocator.free(self.completion_prefix);
+            self.completion_prefix = try self.allocator.dupe(u8, token);
+            self.completion_index = 0;
         }
-        return false;
+
+        var total: usize = 0;
+        for (self.fields) |field| {
+            if (std.mem.startsWith(u8, field, stem)) total += 1;
+        }
+        if (total == 0) return false;
+        if (continuing) {
+            if (forward) {
+                self.completion_index = (self.completion_index + 1) % total;
+            } else if (self.completion_index == 0) {
+                self.completion_index = total - 1;
+            } else {
+                self.completion_index -= 1;
+            }
+        } else if (self.completion_index >= total) {
+            self.completion_index = 0;
+        }
+
+        var seen: usize = 0;
+        var chosen: []const u8 = stem;
+        for (self.fields) |field| {
+            if (!std.mem.startsWith(u8, field, stem)) continue;
+            if (seen == self.completion_index) {
+                chosen = field;
+                break;
+            }
+            seen += 1;
+        }
+        const completed = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ text[0..start], chosen });
+        defer self.allocator.free(completed);
+        try self.filter.setText(completed);
+        const note = std.fmt.bufPrint(&self.completion_note, " complete {d}/{d}", .{
+            self.completion_index + 1,
+            total,
+        }) catch self.completion_note[0..0];
+        self.completion_note_len = note.len;
+        self.status.mode = self.completion_note[0..self.completion_note_len];
+        return true;
     }
 
     fn ensureFieldCompletions(self: *AppModel) !void {
@@ -682,6 +735,7 @@ pub const AppModel = struct {
             self.overlay = .help;
             self.help_overlay.title = "Help";
             self.help_overlay.body = help_view.text;
+            self.help_overlay.pick = false;
             self.help_overlay.visible = true;
         } else if (std.mem.eql(u8, cmd, "filter")) {
             self.focus = .filter;
@@ -715,6 +769,20 @@ pub const AppModel = struct {
             try self.search.setNeedle(self.allocator, args);
             self.byte_search_offset = 0;
             if (!try self.findNextSearch(true)) try self.showMessage("No search match");
+        } else if (std.mem.eql(u8, cmd, "search-regex")) {
+            if (args.len == 0) {
+                try self.showMessage("Usage: :search-regex <pattern>");
+                return;
+            }
+            self.search.kind = .regex;
+            self.search.target = switch (self.focus) {
+                .protocol => .details,
+                .hex => .bytes,
+                else => .list,
+            };
+            try self.search.setNeedle(self.allocator, args);
+            self.byte_search_offset = 0;
+            if (!try self.findNextSearch(true)) try self.showMessage("No regex match");
         } else if (std.mem.eql(u8, cmd, "search-hex")) {
             if (args.len == 0) {
                 try self.showMessage("Usage: :search-hex <hex bytes>");
@@ -756,16 +824,19 @@ pub const AppModel = struct {
             var proto: []const u8 = "tcp";
             var mode: []const u8 = "ascii";
             var index: u32 = 0;
+            var explicit_index = false;
             var stream_args = std.mem.tokenizeAny(u8, args, " \t");
             if (stream_args.next()) |first| {
                 if (std.ascii.eqlIgnoreCase(first, "tcp") or std.ascii.eqlIgnoreCase(first, "udp")) {
                     proto = first;
                     if (stream_args.next()) |second| {
                         index = std.fmt.parseInt(u32, second, 10) catch 0;
+                        explicit_index = true;
                     }
                     if (stream_args.next()) |third| mode = third;
                 } else {
                     index = std.fmt.parseInt(u32, first, 10) catch 0;
+                    explicit_index = true;
                     if (stream_args.next()) |second| mode = second;
                 }
             }
@@ -775,6 +846,12 @@ pub const AppModel = struct {
             {
                 try self.showMessage("Stream mode must be ascii, hex, or raw");
                 return;
+            }
+            if (!explicit_index) {
+                if (self.streamFromDetail()) |found| {
+                    proto = found.proto;
+                    index = found.index;
+                }
             }
             const body = try streams_view.loadFollow(
                 self.allocator,
@@ -786,18 +863,14 @@ pub const AppModel = struct {
                 mode,
             );
             defer self.allocator.free(body);
-            try self.showMessage(body);
-            self.overlay = .streams;
+            try self.showStream(proto, index, body);
         } else if (std.mem.eql(u8, cmd, "convs")) {
             const path = self.capturePath() orelse {
                 try self.showMessage("No capture file loaded");
                 return;
             };
             const ctype = if (args.len != 0) args else "tcp";
-            const body = try convs_view.loadConversations(self.allocator, self.io, self.tools.tshark, path, ctype);
-            defer self.allocator.free(body);
-            try self.showMessage(body);
-            self.overlay = .convs;
+            try self.showConversations(path, ctype);
         } else if (std.mem.eql(u8, cmd, "capinfo")) {
             const path = self.capturePath() orelse {
                 try self.showMessage("No capture file loaded");
@@ -851,6 +924,10 @@ pub const AppModel = struct {
         } else if (std.mem.eql(u8, cmd, "profile")) {
             try self.runProfileCommand(args);
         } else if (std.mem.eql(u8, cmd, "theme")) {
+            if (std.mem.eql(u8, args, "list")) {
+                try self.showThemeList();
+                return;
+            }
             if (args.len != 0) {
                 try self.config.setThemeName(args);
                 const loaded = self.loadConfiguredTheme() catch {
@@ -918,7 +995,11 @@ pub const AppModel = struct {
                 try self.loadDetailForSelection();
                 return true;
             },
-            .details => return self.protocol_tree.findText(self.search.needle, forward),
+            .details => return self.protocol_tree.findPattern(
+                self.search.needle,
+                self.search.kind == .regex,
+                forward,
+            ),
             .bytes => {
                 const bundle = &(self.detail_bundle orelse return false);
                 var hit: ?usize = null;
@@ -1077,12 +1158,157 @@ pub const AppModel = struct {
             try self.showMessage("Unknown option");
             return;
         }
+        self.persistConfig();
         try self.showMessage("Option updated");
     }
 
+    fn persistConfig(self: *AppModel) void {
+        const path = self.paths.configFile(self.allocator) catch return;
+        defer self.allocator.free(path);
+        self.config.save(self.io, path) catch {};
+    }
+
+    fn clearConversations(self: *AppModel) void {
+        for (self.conversations) |*conversation| conversation.deinit(self.allocator);
+        if (self.conversations.len != 0) self.allocator.free(self.conversations);
+        self.conversations = &.{};
+    }
+
+    fn showPick(self: *AppModel, title: []const u8, body: []const u8, kind: OverlayKind) !void {
+        if (self.overlay_body_owned.len != 0) self.allocator.free(self.overlay_body_owned);
+        self.overlay_body_owned = try self.allocator.dupe(u8, body);
+        self.help_overlay.title = title;
+        self.help_overlay.body = self.overlay_body_owned;
+        self.help_overlay.visible = true;
+        self.help_overlay.pick = true;
+        self.help_overlay.selected = 0;
+        self.help_overlay.scroll_top = 0;
+        self.help_overlay.line_count = std.mem.count(u8, body, "\n") + if (body.len > 0 and !std.mem.endsWith(u8, body, "\n")) @as(usize, 1) else 0;
+        self.msg_overlay.visible = false;
+        self.overlay = kind;
+    }
+
+    fn showStream(self: *AppModel, proto: []const u8, index: u32, body: []const u8) !void {
+        if (self.stream_filter.len != 0) self.allocator.free(self.stream_filter);
+        self.stream_filter = try std.fmt.allocPrint(self.allocator, "{s}.stream == {d}", .{ proto, index });
+        var parsed = streams_shark.parse(self.allocator, body) catch {
+            try self.showPick("Stream", body, .streams);
+            return;
+        };
+        defer parsed.deinit(self.allocator);
+        if (parsed.filter.len != 0) {
+            self.allocator.free(self.stream_filter);
+            self.stream_filter = try self.allocator.dupe(u8, parsed.filter);
+        }
+        var text: std.Io.Writer.Allocating = .init(self.allocator);
+        defer text.deinit();
+        if (parsed.chunks.len == 0) {
+            try text.writer.writeAll(body);
+        } else {
+            for (parsed.chunks, 0..) |chunk, i| {
+                if (i != 0) try text.writer.writeByte('\n');
+                const preview = std.mem.sliceTo(chunk.data, 0);
+                const shown = if (preview.len > 48) preview[0..48] else preview;
+                try text.writer.print("{d: >3}  {s}  {d} bytes  {s}", .{
+                    i,
+                    if (chunk.direction == .client) "client -> server" else "server -> client",
+                    chunk.data.len,
+                    shown,
+                });
+            }
+        }
+        const owned = try text.toOwnedSlice();
+        defer self.allocator.free(owned);
+        try self.showPick("Stream  Enter applies the stream filter", owned, .streams);
+    }
+
+    fn showConversations(self: *AppModel, path: []const u8, proto: []const u8) !void {
+        var argv = try process_mod.argvConversations(self.allocator, self.tools.tshark, path, proto);
+        defer argv.deinit(self.allocator);
+        var out = try process_mod.runCapture(self.allocator, self.io, argv.slice());
+        defer out.deinit(self.allocator);
+        self.clearConversations();
+        if (self.conversation_proto.len != 0) self.allocator.free(self.conversation_proto);
+        self.conversation_proto = try self.allocator.dupe(u8, proto);
+        self.conversations = convs_shark.parse(self.allocator, out.stdout) catch {
+            try self.showPick("Conversations", if (out.stdout.len != 0) out.stdout else out.stderr, .convs);
+            return;
+        };
+        var text: std.Io.Writer.Allocating = .init(self.allocator);
+        defer text.deinit();
+        if (self.conversations.len == 0) {
+            try text.writer.print("No {s} conversations\n{s}", .{ proto, out.stderr });
+        }
+        for (self.conversations, 0..) |conversation, i| {
+            if (i != 0) try text.writer.writeByte('\n');
+            try text.writer.print("{d: >3}  {s}", .{ i + 1, conversation.addr_a });
+            if (conversation.port_a) |port| try text.writer.print(":{d}", .{port});
+            try text.writer.print(" <-> {s}", .{conversation.addr_b});
+            if (conversation.port_b) |port| try text.writer.print(":{d}", .{port});
+            try text.writer.print("   {d} frames  {d} bytes", .{ conversation.frames_total, conversation.bytes_total });
+        }
+        const owned = try text.toOwnedSlice();
+        defer self.allocator.free(owned);
+        try self.showPick("Conversations  Enter filters the list", owned, .convs);
+    }
+
+    fn activatePick(self: *AppModel) !void {
+        switch (self.overlay) {
+            .convs => {
+                const index = self.help_overlay.selected;
+                if (index >= self.conversations.len) return;
+                const filter = try convs_shark.displayFilter(
+                    self.allocator,
+                    self.conversations[index],
+                    self.conversation_proto,
+                );
+                defer self.allocator.free(filter);
+                self.dismissOverlays();
+                try self.filter.setText(filter);
+                try onFilterSubmit(self, filter);
+            },
+            .streams => {
+                const filter = try self.allocator.dupe(u8, self.stream_filter);
+                defer self.allocator.free(filter);
+                if (filter.len == 0) return;
+                self.dismissOverlays();
+                try self.filter.setText(filter);
+                try onFilterSubmit(self, filter);
+            },
+            else => {},
+        }
+    }
+
+    fn showThemeList(self: *AppModel) !void {
+        var text: std.Io.Writer.Allocating = .init(self.allocator);
+        defer text.deinit();
+        try text.writer.writeAll("Themes: default, or a .toml name from themes/ or the config themes directory\n");
+        try text.writer.writeAll("midnight\npaper\n");
+        const themes_dir = self.paths.themesDir(self.allocator) catch null;
+        if (themes_dir) |dir_path| {
+            defer self.allocator.free(dir_path);
+            var dir = std.Io.Dir.cwd().openDir(self.io, dir_path, .{ .iterate = true }) catch null;
+            if (dir) |*opened| {
+                defer opened.close(self.io);
+                var it = opened.iterate();
+                while (it.next(self.io) catch null) |entry| {
+                    if (!std.mem.endsWith(u8, entry.name, ".toml")) continue;
+                    try text.writer.print("{s}\n", .{entry.name[0 .. entry.name.len - 5]});
+                }
+            }
+        }
+        const owned = try text.toOwnedSlice();
+        defer self.allocator.free(owned);
+        try self.showMessage(owned);
+    }
+
     fn runProfileCommand(self: *AppModel, args: []const u8) !void {
+        if (args.len == 0 or std.mem.eql(u8, args, "list")) {
+            try self.showProfileList();
+            return;
+        }
         const separator = std.mem.indexOfScalar(u8, args, ' ') orelse {
-            try self.showMessage("Usage: :profile use <name> or :profile create <name>");
+            try self.showMessage("Usage: :profile list | create <name> | use <name> | delete <name>");
             return;
         };
         const action = std.mem.trim(u8, args[0..separator], " \t");
@@ -1096,8 +1322,16 @@ pub const AppModel = struct {
             try self.showMessage("Profile created");
             return;
         }
+        if (std.mem.eql(u8, action, "delete")) {
+            profiles_feature.deleteProfile(self.allocator, self.io, self.paths, name) catch {
+                try self.showMessage("Could not delete that profile");
+                return;
+            };
+            try self.showMessage("Profile deleted");
+            return;
+        }
         if (!std.mem.eql(u8, action, "use")) {
-            try self.showMessage("Usage: :profile use <name> or :profile create <name>");
+            try self.showMessage("Usage: :profile list | create <name> | use <name> | delete <name>");
             return;
         }
 
@@ -1174,14 +1408,49 @@ pub const AppModel = struct {
         defer self.allocator.free(filename);
         const path = try std.fs.path.join(self.allocator, &.{ themes_dir, filename });
         defer self.allocator.free(path);
-        const contents = try std.Io.Dir.cwd().readFileAlloc(
-            self.io,
-            path,
-            self.allocator,
-            .limited(64 * 1024),
-        );
+        const cwd = std.Io.Dir.cwd();
+        const contents = cwd.readFileAlloc(self.io, path, self.allocator, .limited(64 * 1024)) catch blk: {
+            const bundled = try std.fmt.allocPrint(self.allocator, "themes/{s}.toml", .{self.config.theme});
+            defer self.allocator.free(bundled);
+            break :blk try cwd.readFileAlloc(self.io, bundled, self.allocator, .limited(64 * 1024));
+        };
         defer self.allocator.free(contents);
         return theme_mod.parseToml(contents, base);
+    }
+
+    fn fieldShow(node: *const packet.DetailNode, name: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, node.name, name) and node.show.len != 0) return node.show;
+        for (node.children) |*child| {
+            if (fieldShow(child, name)) |show| return show;
+        }
+        return null;
+    }
+
+    fn streamFromDetail(self: *const AppModel) ?struct { proto: []const u8, index: u32 } {
+        const bundle = self.detail_bundle orelse return null;
+        if (fieldShow(&bundle.pdml.root, "tcp.stream")) |show| {
+            return .{ .proto = "tcp", .index = std.fmt.parseInt(u32, show, 10) catch return null };
+        }
+        if (fieldShow(&bundle.pdml.root, "udp.stream")) |show| {
+            return .{ .proto = "udp", .index = std.fmt.parseInt(u32, show, 10) catch return null };
+        }
+        return null;
+    }
+
+    fn showProfileList(self: *AppModel) !void {
+        const names = try profiles_feature.listProfiles(self.allocator, self.io, self.paths);
+        defer {
+            for (names) |name| self.allocator.free(name);
+            self.allocator.free(names);
+        }
+        var text: std.Io.Writer.Allocating = .init(self.allocator);
+        defer text.deinit();
+        try text.writer.writeAll("Profiles\n");
+        if (names.len == 0) try text.writer.writeAll("(none yet — :profile create <name>)\n");
+        for (names) |name| try text.writer.print("{s}\n", .{name});
+        const owned = try text.toOwnedSlice();
+        defer self.allocator.free(owned);
+        try self.showMessage(owned);
     }
 
     fn copyFocused(self: *AppModel, ctx: *vxfw.EventContext) !void {
@@ -1208,13 +1477,20 @@ pub const AppModel = struct {
                     text,
                 );
             },
-            .protocol => try copy_feature.copyText(
-                self.allocator,
-                self.io,
-                ctx,
-                self.config.copy_command,
-                self.protocol_tree.selectedText(),
-            ),
+            .protocol => {
+                const text = if (self.copy_mode)
+                    try self.protocol_tree.formatSubtree(self.allocator)
+                else
+                    try self.allocator.dupe(u8, self.protocol_tree.selectedText());
+                defer self.allocator.free(text);
+                try copy_feature.copyText(
+                    self.allocator,
+                    self.io,
+                    ctx,
+                    self.config.copy_command,
+                    text,
+                );
+            },
             .hex => {
                 const text = try self.hex.formatSelection(self.allocator);
                 defer self.allocator.free(text);
@@ -1232,6 +1508,7 @@ pub const AppModel = struct {
 
     fn dismissOverlays(self: *AppModel) void {
         self.help_overlay.visible = false;
+        self.help_overlay.pick = false;
         self.msg_overlay.visible = false;
         self.command.visible = false;
         self.overlay = .none;
@@ -1295,6 +1572,10 @@ pub const AppModel = struct {
                 if (self.help_overlay.visible or self.msg_overlay.visible) {
                     if (key.matches('q', .{}) or key.matches(vaxis.Key.escape, .{})) {
                         self.dismissOverlays();
+                        return ctx.consumeAndRedraw();
+                    }
+                    if (self.help_overlay.visible and self.help_overlay.pick and key.matches(vaxis.Key.enter, .{})) {
+                        try self.activatePick();
                         return ctx.consumeAndRedraw();
                     }
                     if (self.help_overlay.visible) {
@@ -1406,9 +1687,15 @@ pub const AppModel = struct {
                     self.hsplit_detail.ratio = self.config.detail_ratio;
                     return ctx.consumeAndRedraw();
                 }
+                if (key.matches(vaxis.Key.tab, .{ .shift = true })) {
+                    if (self.focus == .filter) {
+                        try self.ensureFieldCompletions();
+                        if (try self.completeFilter(false)) return ctx.consumeAndRedraw();
+                    }
+                }
                 if (key.matches(vaxis.Key.tab, .{})) {
                     if (self.focus == .filter) try self.ensureFieldCompletions();
-                    if (self.focus == .filter and try self.completeFilter()) {
+                    if (self.focus == .filter and try self.completeFilter(true)) {
                         return ctx.consumeAndRedraw();
                     }
                     self.cycleFocus();
@@ -1461,6 +1748,7 @@ pub const AppModel = struct {
                                 if (self.capturePath()) |path| {
                                     if (self.session.selectedFrame()) |frame| {
                                         try self.config.setGlobalMark(ch, path, frame);
+                                    self.persistConfig();
                                     }
                                 }
                             } else {

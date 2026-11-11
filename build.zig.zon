@@ -15,6 +15,7 @@
         "src",
         "tests",
         "docs",
+        "themes",
         "LICENSE",
         "README.md",
     },

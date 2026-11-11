@@ -189,3 +189,55 @@ test "parse modern tcp conversation row" {
     try std.testing.expectEqual(@as(u64, 3), result[0].frames_total);
     try std.testing.expect(result[0].duration > 0);
 }
+
+pub fn displayFilter(allocator: std.mem.Allocator, conversation: Conversation, proto: []const u8) ![]u8 {
+    const transport = std.ascii.eqlIgnoreCase(proto, "tcp") or std.ascii.eqlIgnoreCase(proto, "udp");
+    if (transport) {
+        if (conversation.port_a) |port_a| {
+            if (conversation.port_b) |port_b| {
+                return std.fmt.allocPrint(
+                    allocator,
+                    "(ip.addr == {s} and ip.addr == {s}) and ({s}.port == {d} and {s}.port == {d})",
+                    .{ conversation.addr_a, conversation.addr_b, proto, port_a, proto, port_b },
+                );
+            }
+        }
+    }
+    if (std.ascii.eqlIgnoreCase(proto, "eth")) {
+        return std.fmt.allocPrint(
+            allocator,
+            "eth.addr == {s} and eth.addr == {s}",
+            .{ conversation.addr_a, conversation.addr_b },
+        );
+    }
+    const field = if (std.ascii.eqlIgnoreCase(proto, "ipv6")) "ipv6.addr" else "ip.addr";
+    return std.fmt.allocPrint(
+        allocator,
+        "{s} == {s} and {s} == {s}",
+        .{ field, conversation.addr_a, field, conversation.addr_b },
+    );
+}
+
+test "conversation display filter includes both ports" {
+    const alloc = std.testing.allocator;
+    const conversation = Conversation{
+        .addr_a = try alloc.dupe(u8, "10.0.0.1"),
+        .port_a = 12345,
+        .addr_b = try alloc.dupe(u8, "10.0.0.2"),
+        .port_b = 80,
+        .frames_ab = 1,
+        .bytes_ab = 1,
+        .frames_ba = 1,
+        .bytes_ba = 1,
+        .frames_total = 2,
+        .bytes_total = 2,
+        .rel_start = 0,
+        .duration = 0,
+    };
+    var owned = conversation;
+    defer owned.deinit(alloc);
+    const filter = try displayFilter(alloc, owned, "tcp");
+    defer alloc.free(filter);
+    try std.testing.expect(std.mem.indexOf(u8, filter, "tcp.port == 12345") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filter, "tcp.port == 80") != null);
+}
