@@ -166,7 +166,7 @@ pub fn parsePdmlPacket(allocator: std.mem.Allocator, xml: []const u8, frame: u32
 
     var visible_count: usize = 0;
     for (parsed.nodes) |*node| {
-        if (!isHiddenTopLevel(node)) visible_count += 1;
+        if (!shouldOmitPdml(node)) visible_count += 1;
     }
     const children = try allocator.alloc(DetailNode, visible_count);
     var initialized: usize = 0;
@@ -175,7 +175,7 @@ pub fn parsePdmlPacket(allocator: std.mem.Allocator, xml: []const u8, frame: u32
         allocator.free(children);
     }
     for (parsed.nodes) |*node| {
-        if (isHiddenTopLevel(node)) continue;
+        if (shouldOmitPdml(node)) continue;
         children[initialized] = try convertPdmlNode(allocator, node);
         initialized += 1;
     }
@@ -193,19 +193,26 @@ pub fn parsePdmlPacket(allocator: std.mem.Allocator, xml: []const u8, frame: u32
     };
 }
 
-fn isHiddenTopLevel(node: *const pdml.Node) bool {
-    return if (node.name) |name| std.mem.eql(u8, name, "geninfo") else false;
+fn shouldOmitPdml(node: *const pdml.Node) bool {
+    if (node.hide) return true;
+    const name = node.name orelse return false;
+    return std.mem.eql(u8, name, "geninfo") or std.mem.eql(u8, name, "fake-field-wrapper");
 }
 
 fn convertPdmlNode(allocator: std.mem.Allocator, source: *const pdml.Node) !DetailNode {
-    const children = try allocator.alloc(DetailNode, source.children.len);
+    var visible: usize = 0;
+    for (source.children) |*child| {
+        if (!shouldOmitPdml(child)) visible += 1;
+    }
+    const children = try allocator.alloc(DetailNode, visible);
     var initialized: usize = 0;
     errdefer {
         for (children[0..initialized]) |*node| node.deinit(allocator);
         allocator.free(children);
     }
-    for (source.children, 0..) |*child, i| {
-        children[i] = try convertPdmlNode(allocator, child);
+    for (source.children) |*child| {
+        if (shouldOmitPdml(child)) continue;
+        children[initialized] = try convertPdmlNode(allocator, child);
         initialized += 1;
     }
     return .{

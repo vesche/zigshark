@@ -23,6 +23,7 @@ pub const FilterBar = struct {
     userdata: ?*anyopaque = null,
     onSubmit: ?*const fn (?*anyopaque, []const u8) anyerror!void = null,
     onRecent: ?*const fn (?*anyopaque) anyerror!void = null,
+    onFocus: ?*const fn (?*anyopaque) void = null,
     apply_col: u16 = 0,
     recent_col: u16 = 0,
 
@@ -49,6 +50,10 @@ pub const FilterBar = struct {
         const self: *FilterBar = @ptrCast(@alignCast(ptr));
         switch (event) {
             .mouse => |mouse| {
+                if (mouse.type == .press and mouse.button == .left) {
+                    if (self.onFocus) |cb| cb(self.userdata);
+                    try ctx.requestFocus(self.widget());
+                }
                 if (mouse.type == .press and mouse.button == .left and mouse.row == 0 and mouse.col >= 0) {
                     const col: u16 = @intCast(mouse.col);
                     if (col >= self.recent_col and self.recent_col > 0) {

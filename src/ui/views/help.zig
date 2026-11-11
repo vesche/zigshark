@@ -1,14 +1,18 @@
 pub const text =
     \\zigshark — keys
     \\
-    \\hjkl / arrows     Navigate focused pane
-    \\Tab / Ctrl-W      Cycle panes
+    \\hjkl / arrows     Navigate the focused pane
+    \\Tab / Ctrl-W      Cycle list → tree → hex → filter
+    \\Click a pane      Focus it. Click [+] or [-] to expand
+    \\Tree +/- Enter    Expand or collapse the selected field
+    \\Tree ← / →        Collapse / expand (h / l)
+    \\Hex click / hjkl  Select a byte; the tree jumps to that field
     \\/                 Focus display filter
     \\:                 Command palette
     \\?                 This help
     \\|                 Toggle layout
     \\\                 Zoom/unzoom focused pane
-    \\+ / -             Resize packet list
+    \\+ / -             In the list: resize panes. In the tree: expand
     \\< / >             Resize tree / hex
     \\m[a-z] / '[a-z]   Set / jump local mark
     \\m[A-Z] / '[A-Z]   Set / jump global mark

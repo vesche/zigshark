@@ -10,3 +10,5 @@ zig-pkg/
 .DS_Store
 *.log
 /tmp/
+
+termshark_reference/

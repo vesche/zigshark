@@ -13,7 +13,6 @@ const command_palette = @import("widgets/command_palette.zig");
 const filter_bar = @import("widgets/filter_bar.zig");
 const status_bar = @import("widgets/status_bar.zig");
 const header_bar = @import("widgets/header_bar.zig");
-const text_util = @import("widgets/text_util.zig");
 const help_view = @import("views/help.zig");
 const streams_view = @import("views/streams.zig");
 const convs_view = @import("views/convs.zig");
@@ -127,6 +126,7 @@ pub const AppModel = struct {
     fields_tshark_path: []u8 = &.{},
     byte_search_offset: usize = 0,
     pending_global_frame: ?u32 = null,
+    link_guard: bool = false,
 
     hsplit_main: hsplit.HSplit,
     hsplit_detail: hsplit.HSplit,
@@ -171,6 +171,7 @@ pub const AppModel = struct {
         self.fields_tshark_path = try self.allocator.dupe(u8, self.tools.tshark);
         self.byte_search_offset = 0;
         self.pending_global_frame = null;
+        self.link_guard = false;
 
         self.packet_table = .{
             .theme = self.theme,
@@ -178,15 +179,23 @@ pub const AppModel = struct {
             .userdata = self,
             .onSelect = onPacketSelect,
             .onSort = onPacketSort,
+            .onFocus = onPacketFocus,
         };
         self.protocol_tree = protocol_tree.ProtocolTree.init(allocator, self.theme);
         self.protocol_tree.userdata = self;
         self.protocol_tree.onSelect = onTreeSelect;
-        self.hex = .{ .theme = self.theme };
+        self.protocol_tree.onFocus = onTreeFocus;
+        self.hex = .{
+            .theme = self.theme,
+            .userdata = self,
+            .onCursor = onHexCursor,
+            .onFocus = onHexFocus,
+        };
         self.filter = filter_bar.FilterBar.init(allocator, self.theme);
         self.filter.userdata = self;
         self.filter.onSubmit = onFilterSubmit;
         self.filter.onRecent = onRecentFilters;
+        self.filter.onFocus = onFilterFocus;
         if (opts.cli.display_filter) |df| try self.filter.setText(df);
         self.status = .{ .theme = self.theme };
         self.header = .{
@@ -326,9 +335,41 @@ pub const AppModel = struct {
         }
     }
 
+    fn onPacketFocus(userdata: ?*anyopaque) void {
+        const self: *AppModel = @ptrCast(@alignCast(userdata.?));
+        self.focus = .packets;
+    }
+
+    fn onTreeFocus(userdata: ?*anyopaque) void {
+        const self: *AppModel = @ptrCast(@alignCast(userdata.?));
+        self.focus = .protocol;
+    }
+
+    fn onHexFocus(userdata: ?*anyopaque) void {
+        const self: *AppModel = @ptrCast(@alignCast(userdata.?));
+        self.focus = .hex;
+    }
+
+    fn onFilterFocus(userdata: ?*anyopaque) void {
+        const self: *AppModel = @ptrCast(@alignCast(userdata.?));
+        self.focus = .filter;
+    }
+
     fn onTreeSelect(userdata: ?*anyopaque, pos: usize, size: usize) void {
         const self: *AppModel = @ptrCast(@alignCast(userdata.?));
         self.hex.setHighlight(pos, size);
+        if (self.link_guard) return;
+        self.link_guard = true;
+        self.hex.setCursor(pos, false);
+        self.link_guard = false;
+    }
+
+    fn onHexCursor(userdata: ?*anyopaque, offset: usize) void {
+        const self: *AppModel = @ptrCast(@alignCast(userdata.?));
+        if (self.link_guard) return;
+        self.link_guard = true;
+        self.protocol_tree.selectCovering(offset);
+        self.link_guard = false;
     }
 
     fn onFilterSubmit(userdata: ?*anyopaque, text: []const u8) anyerror!void {
@@ -1331,7 +1372,7 @@ pub const AppModel = struct {
                     }
                     return ctx.consumeAndRedraw();
                 }
-                if (key.matches('+', .{}) or key.matches('=', .{})) {
+                if ((key.matches('+', .{}) or key.matches('=', .{})) and self.focus == .packets) {
                     self.config.packet_list_ratio = @min(
                         @as(f32, 0.85),
                         self.config.packet_list_ratio + 0.05,
@@ -1340,7 +1381,7 @@ pub const AppModel = struct {
                     self.vsplit_main.ratio = self.config.packet_list_ratio;
                     return ctx.consumeAndRedraw();
                 }
-                if (key.matches('-', .{}) or key.matches('_', .{ .shift = true })) {
+                if ((key.matches('-', .{}) or key.matches('_', .{ .shift = true })) and self.focus == .packets) {
                     self.config.packet_list_ratio = @max(
                         @as(f32, 0.15),
                         self.config.packet_list_ratio - 0.05,
@@ -1482,6 +1523,15 @@ pub const AppModel = struct {
 
     pub fn draw(self: *AppModel, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const size = ctx.max.size();
+        self.packet_table.focused = self.focus == .packets;
+        self.protocol_tree.focused = self.focus == .protocol;
+        self.hex.focused = self.focus == .hex;
+        self.status.pane = switch (self.focus) {
+            .packets => "list",
+            .protocol => "tree",
+            .hex => "hex",
+            .filter => "filter",
+        };
         const header_h: u16 = 1;
         const filter_h: u16 = 1;
         const status_h: u16 = 1;
@@ -1674,35 +1724,12 @@ pub const AppModel = struct {
         tree_h: u16,
         start_idx: usize,
     ) std.mem.Allocator.Error!usize {
+        if (tree_h == 0) return start_idx;
         var idx = start_idx;
-        const title_h: u16 = if (tree_h > 1) 1 else 0;
-        const body_h = tree_h -| title_h;
-        if (title_h == 1) {
-            const title = try drawPaneTitle(ctx, width, self.theme, try self.frameTitle(ctx.arena));
-            self.children_buf[idx] = .{ .origin = .{ .row = row, .col = col }, .surface = title };
-            idx += 1;
-        }
-        if (body_h > 0) {
-            const tree = try self.protocol_tree.draw(ctx.withConstraints(.{ .height = body_h }, .{ .width = width, .height = body_h }));
-            self.children_buf[idx] = .{ .origin = .{ .row = row + title_h, .col = col }, .surface = tree };
-            idx += 1;
-        }
+        const tree = try self.protocol_tree.draw(ctx.withConstraints(.{ .height = tree_h }, .{ .width = width, .height = tree_h }));
+        self.children_buf[idx] = .{ .origin = .{ .row = row, .col = col }, .surface = tree };
+        idx += 1;
         return idx;
-    }
-
-    fn frameTitle(self: *const AppModel, arena: std.mem.Allocator) ![]const u8 {
-        if (self.detail_bundle) |bundle| {
-            if (bundle.pdml.root.children.len > 0) {
-                const first = bundle.pdml.root.children[0];
-                if (first.showname.len != 0) return first.showname;
-                if (first.name.len != 0) return first.name;
-            }
-            return try std.fmt.allocPrint(arena, "Frame {d}", .{bundle.pdml.frame});
-        }
-        if (self.session.selectedFrame()) |frame| {
-            return try std.fmt.allocPrint(arena, "Frame {d}", .{frame});
-        }
-        return "Packet details";
     }
 };
 
@@ -1732,16 +1759,3 @@ fn drawDivider(ctx: vxfw.DrawContext, width: u16, theme: theme_mod.Theme) std.me
     return surf;
 }
 
-fn drawPaneTitle(ctx: vxfw.DrawContext, width: u16, theme: theme_mod.Theme, title: []const u8) std.mem.Allocator.Error!vxfw.Surface {
-    var surf = try vxfw.Surface.init(ctx.arena, inertWidget(), .{ .width = width, .height = 1 });
-    const style: vaxis.Style = .{ .fg = theme.pane_title_fg, .bg = theme.pane_title_bg };
-    var col: u16 = 0;
-    while (col < width) : (col += 1) {
-        surf.writeCell(col, 0, .{
-            .char = .{ .grapheme = " ", .width = 1 },
-            .style = style,
-        });
-    }
-    _ = text_util.writeText(&surf, ctx, 1, 0, title, style, width);
-    return surf;
-}

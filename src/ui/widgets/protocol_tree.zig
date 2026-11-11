@@ -24,8 +24,10 @@ pub const ProtocolTree = struct {
     expanded: std.AutoHashMap(usize, void),
     flat: std.ArrayList(FlatNode) = .empty,
     allocator: std.mem.Allocator,
+    focused: bool = false,
     userdata: ?*anyopaque = null,
     onSelect: ?*const fn (?*anyopaque, usize, usize) void = null,
+    onFocus: ?*const fn (?*anyopaque) void = null,
 
     pub fn init(allocator: std.mem.Allocator, theme: theme_mod.Theme) ProtocolTree {
         return .{
@@ -145,6 +147,35 @@ pub const ProtocolTree = struct {
         return self.draw(ctx);
     }
 
+    /// Expand every ancestor of the tightest field covering `offset` and select it.
+    /// This is the termshark hex-cursor → protocol-tree jump.
+    pub fn selectCovering(self: *ProtocolTree, offset: usize) void {
+        const root = self.root orelse return;
+        var current: *const packet.DetailNode = root;
+        var target: ?*const packet.DetailNode = null;
+        var guard: u8 = 0;
+        while (guard < 64) : (guard += 1) {
+            var best: ?*const packet.DetailNode = null;
+            for (current.children) |*child| {
+                if (child.size == 0) continue;
+                if (offset < child.pos or offset >= child.pos + child.size) continue;
+                if (best) |prev| {
+                    if (child.size < prev.size or child.size == prev.size) best = child;
+                } else best = child;
+            }
+            if (best) |chosen| {
+                if (chosen.children.len > 0) self.expanded.put(@intFromPtr(chosen), {}) catch {};
+                target = chosen;
+                current = chosen;
+            } else break;
+        }
+        const chosen = target orelse return;
+        self.rebuildFlat();
+        self.selectNode(@intFromPtr(chosen));
+        self.scrollIntoMiddle();
+        self.notifySelect();
+    }
+
     pub fn handleEvent(self: *ProtocolTree, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
         switch (event) {
             .mouse => |mouse| {
@@ -154,6 +185,24 @@ pub const ProtocolTree = struct {
                 }
                 if (mouse.button == .wheel_up) {
                     self.scroll_top -|= 3;
+                    return ctx.consumeAndRedraw();
+                }
+                if (mouse.type == .press and mouse.button == .left and mouse.row >= 0 and mouse.col >= 0) {
+                    self.noteFocus();
+                    try ctx.requestFocus(self.widget());
+                    const row: usize = @intCast(mouse.row);
+                    const index = self.scroll_top + row;
+                    if (index >= self.flat.items.len) return ctx.consumeAndRedraw();
+                    const col: u16 = @intCast(mouse.col);
+                    const node = self.flat.items[index];
+                    const marker_col: u16 = @as(u16, node.depth) * 2;
+                    const on_marker = node.expandable and col >= marker_col and col < marker_col + 3;
+                    self.selected = index;
+                    if (on_marker) {
+                        self.toggleSelected();
+                    } else {
+                        self.notifySelect();
+                    }
                     return ctx.consumeAndRedraw();
                 }
             },
@@ -188,47 +237,117 @@ pub const ProtocolTree = struct {
                     self.notifySelect();
                     return ctx.consumeAndRedraw();
                 }
-                if (key.matches(vaxis.Key.home, .{})) {
+                if (key.matches(vaxis.Key.home, .{}) or key.matches('g', .{})) {
                     self.selected = 0;
                     self.ensureVisible();
                     self.notifySelect();
                     return ctx.consumeAndRedraw();
                 }
-                if (key.matches(vaxis.Key.end, .{})) {
+                if (key.matches(vaxis.Key.end, .{}) or key.matches('G', .{ .shift = true })) {
                     if (self.flat.items.len > 0) self.selected = self.flat.items.len - 1;
                     self.ensureVisible();
                     self.notifySelect();
                     return ctx.consumeAndRedraw();
                 }
-                if (key.matches(vaxis.Key.enter, .{}) or key.matches(vaxis.Key.right, .{})) {
-                    if (self.selected < self.flat.items.len) {
-                        const n = self.flat.items[self.selected];
-                        if (n.expandable) {
-                            if (self.expanded.contains(n.node_index)) {
-                                _ = self.expanded.remove(n.node_index);
-                            } else {
-                                try self.expanded.put(n.node_index, {});
-                            }
-                            self.rebuildFlat();
-                            self.notifySelect();
-                            return ctx.consumeAndRedraw();
-                        }
-                    }
+                if (key.matches(vaxis.Key.enter, .{}) or key.matches(' ', .{})) {
+                    self.toggleSelected();
+                    return ctx.consumeAndRedraw();
                 }
-                if (key.matches(vaxis.Key.left, .{})) {
-                    if (self.selected < self.flat.items.len) {
-                        const n = self.flat.items[self.selected];
-                        if (n.expandable and n.expanded) {
-                            _ = self.expanded.remove(n.node_index);
-                            self.rebuildFlat();
-                            self.notifySelect();
-                            return ctx.consumeAndRedraw();
-                        }
-                    }
+                if (key.matches(vaxis.Key.right, .{}) or key.matches('l', .{}) or key.matches('+', .{}) or key.matches('=', .{})) {
+                    self.expandSelected();
+                    return ctx.consumeAndRedraw();
+                }
+                if (key.matches(vaxis.Key.left, .{}) or key.matches('h', .{}) or key.matches('-', .{}) or key.matches('_', .{ .shift = true })) {
+                    self.collapseSelected();
+                    return ctx.consumeAndRedraw();
                 }
             },
             else => {},
         }
+    }
+
+    fn noteFocus(self: *ProtocolTree) void {
+        if (self.onFocus) |cb| cb(self.userdata);
+    }
+
+    fn selectNode(self: *ProtocolTree, node_index: usize) void {
+        for (self.flat.items, 0..) |n, i| {
+            if (n.node_index == node_index) {
+                self.selected = i;
+                return;
+            }
+        }
+    }
+
+    fn toggleSelected(self: *ProtocolTree) void {
+        if (self.selected >= self.flat.items.len) return;
+        const n = self.flat.items[self.selected];
+        if (!n.expandable) return;
+        if (self.expanded.contains(n.node_index)) {
+            _ = self.expanded.remove(n.node_index);
+        } else {
+            self.expanded.put(n.node_index, {}) catch {};
+        }
+        const keep = n.node_index;
+        self.rebuildFlat();
+        self.selectNode(keep);
+        self.ensureVisible();
+        self.notifySelect();
+    }
+
+    fn expandSelected(self: *ProtocolTree) void {
+        if (self.selected >= self.flat.items.len) return;
+        const n = self.flat.items[self.selected];
+        if (n.expandable and !n.expanded) {
+            self.expanded.put(n.node_index, {}) catch {};
+            const keep = n.node_index;
+            self.rebuildFlat();
+            self.selectNode(keep);
+            self.ensureVisible();
+            self.notifySelect();
+            return;
+        }
+        if (n.expanded and self.selected + 1 < self.flat.items.len) {
+            self.selected += 1;
+            self.ensureVisible();
+            self.notifySelect();
+        }
+    }
+
+    fn collapseSelected(self: *ProtocolTree) void {
+        if (self.selected >= self.flat.items.len) return;
+        const n = self.flat.items[self.selected];
+        if (n.expandable and n.expanded) {
+            _ = self.expanded.remove(n.node_index);
+            const keep = n.node_index;
+            self.rebuildFlat();
+            self.selectNode(keep);
+            self.ensureVisible();
+            self.notifySelect();
+            return;
+        }
+        if (n.depth > 0) {
+            var i = self.selected;
+            while (i > 0) {
+                i -= 1;
+                if (self.flat.items[i].depth < n.depth) {
+                    self.selected = i;
+                    self.ensureVisible();
+                    self.notifySelect();
+                    return;
+                }
+            }
+        }
+    }
+
+    fn scrollIntoMiddle(self: *ProtocolTree) void {
+        if (self.viewport_rows <= 1) {
+            self.ensureVisible();
+            return;
+        }
+        const half = self.viewport_rows / 2;
+        self.scroll_top = if (self.selected > half) self.selected - half else 0;
+        self.ensureVisible();
     }
 
     fn notifySelect(self: *ProtocolTree) void {
@@ -244,7 +363,11 @@ pub const ProtocolTree = struct {
         const size = ctx.max.size();
         var surf = try vxfw.Surface.init(ctx.arena, self.widget(), size);
         const normal: vaxis.Style = .{ .fg = self.theme.fg, .bg = self.theme.bg };
-        const sel: vaxis.Style = .{ .fg = self.theme.selected_fg, .bg = self.theme.selected_bg };
+        const sel: vaxis.Style = if (self.focused)
+            .{ .fg = self.theme.selected_fg, .bg = self.theme.selected_bg }
+        else
+            .{ .fg = self.theme.fg, .bg = theme_mod.rgb(0, 50, 90) };
+        const marker_fg = self.theme.accent;
         self.viewport_rows = size.height;
         self.ensureVisible();
         var row: u16 = 0;
@@ -272,13 +395,61 @@ pub const ProtocolTree = struct {
                 if (n.expanded) "[-] " else "[+] "
             else
                 "    ";
-            col = text_util.writeText(&surf, ctx, col, row, prefix, style, size.width);
+            const marker_style: vaxis.Style = .{ .fg = marker_fg, .bg = style.bg, .bold = n.expandable };
+            col = text_util.writeText(&surf, ctx, col, row, prefix, marker_style, size.width);
             _ = text_util.writeText(&surf, ctx, col, row, n.label, style, size.width);
             row += 1;
         }
         return surf;
     }
 };
+
+test "hex offset selects the tightest field and expands ancestors" {
+    const allocator = std.testing.allocator;
+    const eth_type = packet.DetailNode{
+        .name = "eth.type",
+        .showname = "Type: IPv4",
+        .show = "0x0800",
+        .pos = 12,
+        .size = 2,
+        .children = &.{},
+    };
+    const dst = packet.DetailNode{
+        .name = "eth.dst",
+        .showname = "Destination",
+        .show = "",
+        .pos = 0,
+        .size = 6,
+        .children = &.{},
+    };
+    var eth_kids = [_]packet.DetailNode{ dst, eth_type };
+    const eth = packet.DetailNode{
+        .name = "eth",
+        .showname = "Ethernet II",
+        .show = "",
+        .pos = 0,
+        .size = 14,
+        .children = &eth_kids,
+    };
+    var root_kids = [_]packet.DetailNode{eth};
+    var root = packet.DetailNode{
+        .name = "__packet_root",
+        .showname = "",
+        .show = "",
+        .pos = 0,
+        .size = 0,
+        .children = &root_kids,
+    };
+
+    var tree = ProtocolTree.init(allocator, theme_mod.dark());
+    defer tree.deinit();
+    tree.viewport_rows = 8;
+    tree.setRoot(&root);
+    tree.selectCovering(12);
+    try std.testing.expectEqualStrings("Type: IPv4", tree.selectedText());
+    try std.testing.expect(tree.flat.items.len >= 3);
+    try std.testing.expect(tree.flat.items[0].expanded);
+}
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len > haystack.len) return false;

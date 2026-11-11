@@ -13,6 +13,7 @@ pub const StatusBar = struct {
     filter: []const u8 = "",
     source: []const u8 = "",
     mode: []const u8 = "",
+    pane: []const u8 = "list",
 
     pub fn widget(self: *StatusBar) vxfw.Widget {
         return .{
@@ -50,13 +51,14 @@ pub const StatusBar = struct {
             .capturing => " capturing",
             .error_state => " error",
         };
-        const text = try std.fmt.allocPrint(ctx.arena, "{s} Packets: {d}  Frame: {s}{s}  Filter: {s}  │  {s}  │  Tab panes  ? help  : commands ", .{
+        const text = try std.fmt.allocPrint(ctx.arena, "{s} Packets: {d}  Frame: {s}{s}  Filter: {s}  │  {s}  │  Pane: {s}  │  Tab focus  +/- tree  hjkl hex ", .{
             self.mode,
             self.packet_count,
             frame_str,
             load_str,
             if (self.filter.len != 0) self.filter else "(none)",
             self.source,
+            self.pane,
         });
         _ = text_util.writeText(&surf, ctx, 0, 0, text, style, size.width);
         return surf;

@@ -16,9 +16,11 @@ pub const PacketTable = struct {
     sort_column: usize = 0,
     sort_ascending: bool = true,
     pending_g: bool = false,
+    focused: bool = false,
     userdata: ?*anyopaque = null,
     onSelect: ?*const fn (?*anyopaque, usize) void = null,
     onSort: ?*const fn (?*anyopaque, usize, bool) void = null,
+    onFocus: ?*const fn (?*anyopaque) void = null,
 
     pub fn widget(self: *PacketTable) vxfw.Widget {
         return .{
@@ -80,6 +82,10 @@ pub const PacketTable = struct {
         self.clampSelection();
         switch (event) {
             .mouse => |m| {
+                if (m.type == .press and m.button == .left) {
+                    if (self.onFocus) |cb| cb(self.userdata);
+                    try ctx.requestFocus(self.widget());
+                }
                 if (m.button == .left and m.row >= 0 and m.col >= 0) {
                     const row: usize = @intCast(m.row);
                     if (row == 0) {
@@ -168,7 +174,10 @@ pub const PacketTable = struct {
         const columns = fillColumns(&column_buf, size.width);
         const header_style: vaxis.Style = .{ .fg = self.theme.header_fg, .bg = self.theme.header_bg, .bold = true };
         const normal: vaxis.Style = .{ .fg = self.theme.fg, .bg = self.theme.bg };
-        const selected_style: vaxis.Style = .{ .fg = self.theme.selected_fg, .bg = self.theme.selected_bg };
+        const selected_style: vaxis.Style = if (self.focused)
+            .{ .fg = self.theme.selected_fg, .bg = self.theme.selected_bg }
+        else
+            .{ .fg = self.theme.fg, .bg = theme_mod.rgb(0, 50, 90) };
 
         fillRow(&surf, 0, size.width, header_style);
         const header_line = try formatRow(ctx.arena, columns, null);
