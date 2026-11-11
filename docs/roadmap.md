@@ -39,7 +39,7 @@ VM checklist, for whenever those hosts exist:
 
 `zig build test` is the bar. It already covers CLI parsing, config and profiles, the `tests/fixtures/1.pcap` PSML/PDML/hex fixtures, conversations, streams, columns, fields, capinfos, session sort and marks, search, frame retention, cancellation before spawn, the detail LRU, theme files, hex hit testing, protocol-tree jump on the real PDML, column hit testing, the command palette, and a live tshark integration test that skips when tshark is absent. Linux CI also runs `tests/pty_smoke.py` for a render and a clean Ctrl-C.
 
-The hole was `src/ui/app.zig`: command dispatch, filter completion, hex-to-tree linking, and `:clear-packets` lived only in the draw loop. `tests/app_suite.zig` now drives those without a TTY. The PTY smoke test still only checks that the process draws and dies cleanly. It does not press keys. Tail refresh, and the cases under Next, are still untested.
+The hole was `src/ui/app.zig`: command dispatch, filter completion, hex-to-tree linking, and `:clear-packets` lived only in the draw loop. `tests/app_suite.zig` now drives those without a TTY. The Next cases are covered in the parser, model, loader, and UI suites. The PTY smoke test still only checks that the process draws and dies cleanly. It does not press keys. Tail refresh, and the items under Later, are still untested.
 
 ### Now
 
@@ -56,16 +56,16 @@ Headless coverage lives in `tests/app_suite.zig`. `AppModel.initOffline` builds 
 
 ### Next
 
-- [ ] Sort: reverse the same column, numeric versus text columns, and keep the selected frame when the row moves
-- [ ] PSML with more than seven columns, and a packet whose column count is short
-- [ ] Truncated PDML, a hidden field nested under a visible field, and a field with no `pos`
-- [ ] Hexdump with a short last line, a blank line, and a packet longer than one row
-- [ ] Regex: class at end of input, `^` not at the start, `$` in the middle, an escaped metacharacter, an odd trailing hex nibble
-- [ ] Loader: a stale generation drops its result, a second request cancels the first child, cache eviction frees the bundle
-- [ ] `features/recents.zig` versus `Config.addRecentFile`: one policy, one test. Today they disagree (see section 6)
-- [ ] Wormhole job: missing binary, a line of progress, failure text. No network
-- [ ] Theme load falls back from `~/.config/zigshark/themes` to `themes/<name>.toml`
-- [ ] Narrow packet list (width under 70) and a click past the last column
+- [x] Sort: reverse the same column, numeric versus text columns, and keep the selected frame when the row moves
+- [x] PSML with more than seven columns, and a packet whose column count is short
+- [x] Truncated PDML, a hidden field nested under a visible field, and a field with no `pos`
+- [x] Hexdump with a short last line, a blank line, and a packet longer than one row
+- [x] Regex: class at end of input, `^` not at the start, `$` in the middle, an escaped metacharacter, an odd trailing hex nibble
+- [x] Loader: a stale generation drops its result, a second request cancels the first child, cache eviction frees the bundle
+- [x] Recent files: one policy. `addRecentFile` moves the newest path to index 0. The old `pushRecent` behavior is gone (see section 6)
+- [x] Wormhole job: missing binary, a line of progress, failure text. No network
+- [x] Theme load falls back from `~/.config/zigshark/themes` to `themes/<name>.toml`
+- [x] Narrow packet list (width under 70) and a click past the last column
 
 ### Later, with the performance work
 
@@ -227,7 +227,7 @@ These are already visible. Confirm each one before deleting anything.
 | The UI controller is one file | `src/ui/app.zig`, about 2,200 lines | The section 2 command tests now exist (`tests/app_suite.zig`). Split command dispatch, capture/tail, and filter completion from drawing. The tests are there so the split does not change behavior unnoticed. |
 | Settings that persist and do nothing | `src/config.zig` | `disk-cache-size-mb`, `ui-cache-size`, `stream-cache-size`, `disable-shark-fin`, `conv-absolute-time`, `capture-command`, `tail-command`, `wormhole-length`, `wormhole-rendezvous-url`, and `wormhole-transit-relay` are saved and listed by `:set`. Either wire them (wormhole flags into the job argv, conversation time into the convs view, capture command into the live argv) or stop presenting them as live options. |
 | Detail cache size is sticky | `src/ui/app.zig` `:set pcap-cache-size` | Rebuild the LRU, or document that the setting applies on the next launch and stop writing the unused field. |
-| Two recent-file policies | `src/features/recents.zig`, `Config.addRecentFile` | `pushRecent` ignores a path it has already seen and drops the oldest from the front. `addRecentFile` moves the newest to index 0. `list` walks the slice and returns it unchanged. Pick the config behavior and delete the other. |
+| Two recent-file policies | `src/features/recents.zig`, `Config.addRecentFile` | Resolved. Opening a capture calls `addRecentFile`, which moves the newest path to index 0 and drops the oldest from the end. The separate `pushRecent` policy is gone. |
 | `--tty PATH` does not retarget the terminal | `src/cli.zig`, `src/main.zig` | The flag forces the TUI onto the controlling terminal. vaxis still opens `/dev/tty`. Say that in the help text until it is true. |
 | Palette match line is a no-op | `command_palette.zig` `matching` | `startsWith(..., "")` is always true. Use the parsed command as the needle and test an empty palette against a typed prefix. |
 | Copy is the expanded rows only | protocol tree copy mode | Fine if the command says "visible subtree". A "copy field" action should be the one node. Do not pretend it is a PDML export. |

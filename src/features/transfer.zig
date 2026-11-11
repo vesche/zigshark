@@ -5,15 +5,19 @@ pub const TransferError = error{
     WormholeFailed,
 } || std.process.SpawnError || std.process.Child.WaitError;
 
-pub fn wormholeAvailable(io: std.Io) bool {
+fn commandAvailable(io: std.Io, command: []const u8) bool {
     const result = std.process.run(std.heap.page_allocator, io, .{
-        .argv = &.{ "wormhole", "--version" },
+        .argv = &.{ command, "--version" },
         .stdout_limit = .limited(512),
         .stderr_limit = .limited(512),
     }) catch return false;
     defer std.heap.page_allocator.free(result.stdout);
     defer std.heap.page_allocator.free(result.stderr);
     return result.term.success();
+}
+
+pub fn wormholeAvailable(io: std.Io) bool {
+    return commandAvailable(io, "wormhole");
 }
 
 pub fn sendFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) TransferError!void {
@@ -38,11 +42,29 @@ pub const Job = struct {
     thread: ?std.Thread = null,
 
     pub fn start(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !*Job {
-        if (!wormholeAvailable(io)) return error.WormholeNotFound;
+        return startNamed(allocator, io, "wormhole", path);
+    }
+
+    fn startNamed(allocator: std.mem.Allocator, io: std.Io, tool: []const u8, path: []const u8) !*Job {
+        if (!commandAvailable(io, tool)) return error.WormholeNotFound;
+        return startArgv(allocator, io, &.{ tool, "send", path });
+    }
+
+    fn startArgv(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !*Job {
         const job = try allocator.create(Job);
+        errdefer allocator.destroy(job);
         job.* = .{ .allocator = allocator, .io = io };
-        const owned_path = try allocator.dupe(u8, path);
-        job.thread = try std.Thread.spawn(.{}, runJob, .{ job, owned_path });
+        const owned = try allocator.alloc([]u8, argv.len);
+        errdefer allocator.free(owned);
+        var filled: usize = 0;
+        errdefer {
+            for (owned[0..filled]) |arg| allocator.free(arg);
+        }
+        for (argv) |arg| {
+            owned[filled] = try allocator.dupe(u8, arg);
+            filled += 1;
+        }
+        job.thread = try std.Thread.spawn(.{}, runJob, .{ job, owned });
         return job;
     }
 
@@ -71,15 +93,15 @@ pub const Job = struct {
     }
 };
 
-fn runJob(job: *Job, path: []u8) void {
-    defer job.allocator.free(path);
-    defer job.finished.store(true, .release);
-    job.append("Sending ");
-    job.append(path);
-    job.append("\n");
+fn runJob(job: *Job, argv: [][]u8) void {
+    defer {
+        for (argv) |arg| job.allocator.free(arg);
+        job.allocator.free(argv);
+        job.finished.store(true, .release);
+    }
 
     var child = std.process.spawn(job.io, .{
-        .argv = &.{ "wormhole", "send", path },
+        .argv = argv,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
@@ -87,7 +109,6 @@ fn runJob(job: *Job, path: []u8) void {
         job.append("failed to start wormhole\n");
         return;
     };
-    defer child.kill(job.io);
 
     var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
     var multi_reader: std.Io.File.MultiReader = undefined;
@@ -110,8 +131,60 @@ fn runJob(job: *Job, path: []u8) void {
         }
     } else |_| {}
     const term = child.wait(job.io) catch {
+        if (child.id != null) child.kill(job.io);
         job.append("\nwormhole failed\n");
         return;
     };
     if (!term.success()) job.append("\nwormhole failed\n");
+}
+
+fn waitJob(job: *Job, io: std.Io) !void {
+    var spins: usize = 0;
+    while (!job.isFinished()) : (spins += 1) {
+        if (spins > 200) return error.TimedOut;
+        try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    }
+}
+
+test "wormhole reports a missing binary without using the network" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    try std.testing.expectError(
+        error.WormholeNotFound,
+        Job.startNamed(allocator, io, "zigshark-missing-wormhole", "x.pcap"),
+    );
+
+    const job = try Job.startArgv(allocator, io, &.{"/no/such/zigshark-wormhole"});
+    defer job.destroy();
+    try waitJob(job, io);
+    const text = try job.snapshot(allocator);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "failed to start wormhole") != null);
+}
+
+test "wormhole job keeps a progress line and failure text" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/fake-wormhole", .{tmp.sub_path[0..]});
+    defer allocator.free(path);
+    const script =
+        \\#!/bin/sh
+        \\printf 'sending 1/2\n'
+        \\exit 1
+    ;
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = script,
+        .flags = .{ .permissions = @fromBackingInt(@intCast(0o755)) },
+    });
+
+    const job = try Job.startArgv(allocator, io, &.{path});
+    defer job.destroy();
+    try waitJob(job, io);
+    const text = try job.snapshot(allocator);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "sending 1/2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "wormhole failed") != null);
 }

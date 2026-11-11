@@ -554,3 +554,24 @@ test "set rejects a bad value and an unknown key without rewriting the file" {
     try std.testing.expectEqualStrings("more", h.cfg.pager);
     try std.testing.expectEqualStrings("Option updated", h.app.msg_overlay.body);
 }
+
+test "theme load falls back from the config directory to themes/" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+
+    try h.app.runCommand("theme", "midnight");
+    try std.testing.expect(h.app.theme.accent.eql(zigshark.ui.theme.rgb(0xf7, 0x81, 0x66)));
+
+    const themes_dir = try h.paths.themesDir(h.allocator);
+    defer h.allocator.free(themes_dir);
+    try std.Io.Dir.cwd().createDirPath(h.io, themes_dir);
+    const override = try std.fs.path.join(h.allocator, &.{ themes_dir, "midnight.toml" });
+    defer h.allocator.free(override);
+    try std.Io.Dir.cwd().writeFile(h.io, .{
+        .sub_path = override,
+        .data = "accent = \"#010203\"\n",
+    });
+    try h.app.runCommand("theme", "midnight");
+    try std.testing.expect(h.app.theme.accent.eql(zigshark.ui.theme.rgb(1, 2, 3)));
+}

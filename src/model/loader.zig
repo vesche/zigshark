@@ -610,3 +610,182 @@ test "asynchronous summary request returns owned event" {
     }
     for (events) |*event| event.deinit(allocator);
 }
+
+const fake_tshark =
+    \\#!/bin/bash
+    \\path=
+    \\prev=
+    \\for arg in "$@"; do
+    \\  if [ "$prev" = "-r" ]; then
+    \\    path=$arg
+    \\  fi
+    \\  prev=$arg
+    \\done
+    \\case "$path" in
+    \\  *hold*)
+    \\    echo started > "$path.started"
+    \\    while [ ! -f "$path.release" ]; do
+    \\      :
+    \\    done
+    \\    printf '%s\n' '<psml><packet><section>1</section></packet></psml>'
+    \\    ;;
+    \\  *slow*)
+    \\    echo started > "$path.started"
+    \\    start=$SECONDS
+    \\    while (( SECONDS - start < 5 )); do
+    \\      :
+    \\    done
+    \\    echo finished > "$path.finished"
+    \\    printf '%s\n' '<psml><packet><section>4</section></packet></psml>'
+    \\    ;;
+    \\  *)
+    \\    printf '%s\n' '<psml><packet><section>9</section></packet></psml>'
+    \\    ;;
+    \\esac
+    \\exit 0
+;
+
+fn writeExecutable(io: std.Io, path: []const u8, body: []const u8) !void {
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = body,
+        .flags = .{ .permissions = @fromBackingInt(@intCast(0o755)) },
+    });
+}
+
+fn waitForPath(io: std.Io, path: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    var spins: usize = 0;
+    while (spins < 100) : (spins += 1) {
+        if (cwd.access(io, path, .{})) |_| return else |_| {
+            try std.Io.sleep(io, .fromMilliseconds(20), .awake);
+        }
+    }
+    return error.TimedOut;
+}
+
+fn joinWorkers(loader: *CaptureLoader) void {
+    while (loader.workers.pop()) |worker| worker.join();
+}
+
+fn testingTools(allocator: std.mem.Allocator, tshark: []const u8) !tools_mod.Tools {
+    return .{
+        .allocator = allocator,
+        .tshark = try allocator.dupe(u8, tshark),
+        .dumpcap = try allocator.dupe(u8, "dumpcap"),
+        .capinfos = try allocator.dupe(u8, "capinfos"),
+        .tshark_version = try allocator.dupe(u8, "0.0.0"),
+        .dumpcap_version = try allocator.dupe(u8, "0"),
+        .capinfos_version = try allocator.dupe(u8, "0"),
+        .supports_color = false,
+        .dumpcap_can_capture = false,
+    };
+}
+
+fn ownedBundle(allocator: std.mem.Allocator, frame: u32) !packet.DetailBundle {
+    return .{
+        .pdml = .{
+            .frame = frame,
+            .root = .{
+                .name = try allocator.dupe(u8, "frame"),
+                .showname = try allocator.dupe(u8, ""),
+                .show = try std.fmt.allocPrint(allocator, "{d}", .{frame}),
+                .pos = 0,
+                .size = 1,
+                .children = try allocator.alloc(packet.DetailNode, 0),
+            },
+        },
+        .bytes = .{
+            .frame = frame,
+            .raw = try allocator.dupe(u8, "ab"),
+            .hexdump_lines = try allocator.alloc([]const u8, 0),
+        },
+    };
+}
+
+test "stale psml generation is dropped and a second request cancels the first child" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const script_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/tshark", .{tmp.sub_path[0..]});
+    defer allocator.free(script_path);
+    const hold_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/hold.pcap", .{tmp.sub_path[0..]});
+    defer allocator.free(hold_path);
+    const slow_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/slow.pcap", .{tmp.sub_path[0..]});
+    defer allocator.free(slow_path);
+    const fast_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/fast.pcap", .{tmp.sub_path[0..]});
+    defer allocator.free(fast_path);
+    try writeExecutable(io, script_path, fake_tshark);
+
+    var tools = try testingTools(allocator, script_path);
+    defer tools.deinit();
+    var loader = CaptureLoader.init(allocator, io, &tools, .{});
+    defer {
+        joinWorkers(&loader);
+        loader.deinit(io);
+    }
+
+    var session = session_mod.Session.init(allocator, .{ .file = hold_path });
+    defer session.deinit();
+    try loader.requestPsml(&session);
+    const started = try std.fmt.allocPrint(allocator, "{s}.started", .{hold_path});
+    defer allocator.free(started);
+    try waitForPath(io, started);
+    _ = loader.list_generation.fetchAdd(1, .acq_rel);
+    const release = try std.fmt.allocPrint(allocator, "{s}.release", .{hold_path});
+    defer allocator.free(release);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = release, .data = "go\n" });
+    joinWorkers(&loader);
+    const dropped = try loader.drainEvents();
+    defer {
+        for (dropped) |*event| event.deinit(allocator);
+        allocator.free(dropped);
+    }
+    try std.testing.expectEqual(@as(usize, 0), dropped.len);
+
+    try session.setFileSource(slow_path);
+    try loader.requestPsml(&session);
+    const slow_started = try std.fmt.allocPrint(allocator, "{s}.started", .{slow_path});
+    defer allocator.free(slow_started);
+    try waitForPath(io, slow_started);
+    const before = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    try session.setFileSource(fast_path);
+    try loader.requestPsml(&session);
+    joinWorkers(&loader);
+    const after = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    try std.testing.expect(after - before < 3 * std.time.ns_per_s);
+    const finished = try std.fmt.allocPrint(allocator, "{s}.finished", .{slow_path});
+    defer allocator.free(finished);
+    if (std.Io.Dir.cwd().access(io, finished, .{})) |_| return error.ChildWasNotCancelled else |_| {}
+
+    const events = try loader.drainEvents();
+    defer {
+        for (events) |*event| event.deinit(allocator);
+        allocator.free(events);
+    }
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    switch (events[0]) {
+        .packets_loaded => |table| {
+            try std.testing.expectEqual(@as(usize, 1), table.packets.len);
+            try std.testing.expectEqual(@as(u32, 9), table.packets[0].frame);
+        },
+        else => return error.UnexpectedEvent,
+    }
+}
+
+test "detail cache eviction frees the bundle" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tools = try testingTools(allocator, "tshark");
+    defer tools.deinit();
+    var loader = CaptureLoader.init(allocator, io, &tools, .{ .cache_size = 1 });
+    defer loader.deinit(io);
+
+    try loader.detail_cache.put(io, 1, try ownedBundle(allocator, 1));
+    try loader.detail_cache.put(io, 2, try ownedBundle(allocator, 2));
+    try std.testing.expectEqual(@as(usize, 1), loader.detail_cache.len(io));
+    try std.testing.expect(loader.detail_cache.get(io, 1) == null);
+    const kept = loader.detail_cache.get(io, 2) orelse return error.MissingBundle;
+    try std.testing.expectEqual(@as(u32, 2), kept.pdml.frame);
+}

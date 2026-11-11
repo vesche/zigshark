@@ -257,3 +257,44 @@ test "session navigation and marks" {
     try std.testing.expectEqual(@as(u32, 2), session.packets[0].frame);
     try std.testing.expectEqual(@as(?u32, 2), session.selectedFrame());
 }
+
+test "sort reverses a column, compares numbers, and keeps the selected frame" {
+    const allocator = std.testing.allocator;
+    var session = Session.init(allocator, .{ .file = "/tmp/x.pcap" });
+    defer session.deinit();
+
+    // "10" sorts before "2" as text and after it as a number.
+    var ten = [_][]const u8{ "10", "1.5", "b" };
+    var two = [_][]const u8{ "2", "0.5", "c" };
+    var three = [_][]const u8{ "3", "10", "a" };
+    var packets = [_]packet.PacketSummary{
+        .{ .frame = 10, .columns = &ten, .owns_columns = false },
+        .{ .frame = 2, .columns = &two, .owns_columns = false },
+        .{ .frame = 3, .columns = &three, .owns_columns = false },
+    };
+    session.setPacketsBorrowed(&packets);
+    try std.testing.expect(session.select(0));
+
+    session.setSort(0, true);
+    try std.testing.expectEqual(@as(u32, 2), session.packets[0].frame);
+    try std.testing.expectEqual(@as(u32, 3), session.packets[1].frame);
+    try std.testing.expectEqual(@as(u32, 10), session.packets[2].frame);
+    try std.testing.expectEqual(@as(?u32, 10), session.selectedFrame());
+
+    session.setSort(0, false);
+    try std.testing.expectEqual(@as(u32, 10), session.packets[0].frame);
+    try std.testing.expectEqual(@as(u32, 3), session.packets[1].frame);
+    try std.testing.expectEqual(@as(u32, 2), session.packets[2].frame);
+    try std.testing.expectEqual(@as(?u32, 10), session.selectedFrame());
+
+    session.setSort(1, true);
+    try std.testing.expectEqual(@as(u32, 2), session.packets[0].frame);
+    try std.testing.expectEqual(@as(u32, 10), session.packets[1].frame);
+    try std.testing.expectEqual(@as(u32, 3), session.packets[2].frame);
+
+    session.setSort(2, true);
+    try std.testing.expectEqual(@as(u32, 3), session.packets[0].frame);
+    try std.testing.expectEqual(@as(u32, 10), session.packets[1].frame);
+    try std.testing.expectEqual(@as(u32, 2), session.packets[2].frame);
+    try std.testing.expectEqual(@as(?u32, 10), session.selectedFrame());
+}

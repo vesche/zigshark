@@ -36,6 +36,31 @@ test "fixture psml keeps headers, frames, and colors" {
     try std.testing.expectEqualStrings("TLSv1.2", table.packets[0].columns[4]);
 }
 
+test "psml keeps extra columns and a short packet row" {
+    const allocator = std.testing.allocator;
+    const xml =
+        \\<psml><structure>
+        \\<section>No.</section><section>Time</section><section>Source</section>
+        \\<section>Dest</section><section>Proto</section><section>Len</section>
+        \\<section>Info</section><section>Extra</section>
+        \\</structure>
+        \\<packet>
+        \\<section>1</section><section>0</section><section>a</section><section>b</section>
+        \\<section>TCP</section><section>60</section><section>syn</section><section>more</section>
+        \\</packet>
+        \\<packet><section>2</section><section>1.0</section></packet>
+        \\</psml>
+    ;
+    var table = try zigshark.model.packet.parsePsml(allocator, xml);
+    defer table.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 8), table.headers.len);
+    try std.testing.expectEqualStrings("Extra", table.headers[7]);
+    try std.testing.expectEqual(@as(usize, 8), table.packets[0].columns.len);
+    try std.testing.expectEqualStrings("more", table.packets[0].columns[7]);
+    try std.testing.expectEqual(@as(u32, 2), table.packets[1].frame);
+    try std.testing.expectEqual(@as(usize, 2), table.packets[1].columns.len);
+}
+
 test "empty and comment-only psml produce no packets" {
     const allocator = std.testing.allocator;
     var table = try zigshark.model.packet.parsePsml(allocator, "<!-- nothing -->\n");
@@ -67,9 +92,55 @@ test "pdml fixture drops geninfo and hidden fields" {
     try std.testing.expectEqual(@as(usize, 14), eth.size);
 }
 
+test "truncated pdml errors, and a hidden child is dropped" {
+    const allocator = std.testing.allocator;
+    const truncated = "<pdml><packet><proto name=\"eth\" showname=\"Ethernet\" pos=\"0\" size=\"14\"><field name=\"eth.dst\" pos=\"0\" size=\"6\">";
+    try std.testing.expectError(error.UnexpectedEnd, zigshark.model.packet.parsePdmlPacket(allocator, truncated, 1));
+
+    const xml =
+        \\<pdml><packet>
+        \\<proto name="eth" showname="Ethernet" pos="0" size="14">
+        \\<field name="eth.dst" showname="Destination" pos="0" size="6" show="aa"/>
+        \\<field name="eth.dst_resolved" hide="yes" show="host.local" pos="0" size="6">
+        \\<field name="eth.secret" show="nope"/>
+        \\</field>
+        \\<field name="eth.note" showname="note" show="generated"/>
+        \\</proto>
+        \\</packet></pdml>
+    ;
+    var detail = try zigshark.model.packet.parsePdmlPacket(allocator, xml, 1);
+    defer detail.deinit(allocator);
+    try std.testing.expect(treeHas(&detail.root, "eth"));
+    try std.testing.expect(treeHas(&detail.root, "eth.dst"));
+    try std.testing.expect(!treeHas(&detail.root, "eth.dst_resolved"));
+    try std.testing.expect(!treeHas(&detail.root, "eth.secret"));
+    const note = findNamed(&detail.root, "eth.note") orelse return error.MissingField;
+    try std.testing.expectEqual(@as(usize, 0), note.pos);
+    try std.testing.expectEqual(@as(usize, 0), note.size);
+    try std.testing.expectEqualStrings("generated", note.show);
+}
+
 test "pdml without a packet is an error" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.UnexpectedEnd, zigshark.model.packet.parsePdmlPacket(allocator, "<pdml></pdml>", 1));
+}
+
+test "hexdump keeps a short last line and stops at a blank line" {
+    const allocator = std.testing.allocator;
+    const text =
+        \\0000  01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10
+        \\0010  aa
+        \\
+        \\0000  ff ff
+        \\
+    ;
+    var bytes = try zigshark.model.packet.parseHexdump(allocator, text, 4);
+    defer bytes.deinit(allocator);
+    try std.testing.expectEqual(@as(u32, 4), bytes.frame);
+    try std.testing.expectEqual(@as(usize, 2), bytes.hexdump_lines.len);
+    try std.testing.expectEqual(@as(usize, 17), bytes.raw.len);
+    try std.testing.expectEqual(@as(u8, 0x10), bytes.raw[15]);
+    try std.testing.expectEqual(@as(u8, 0xaa), bytes.raw[16]);
 }
 
 test "hexdump fixture matches the first ethernet header" {

@@ -267,6 +267,19 @@ fn convertPdmlNode(allocator: std.mem.Allocator, source: *const pdml.Node) !Deta
     };
 }
 
+fn appendDumpBytes(allocator: std.mem.Allocator, raw: *std.ArrayList(u8), line: []const u8) !void {
+    var parts = std.mem.tokenizeAny(u8, line, " \t");
+    const offset = parts.next() orelse return;
+    if (offset.len < 4) return;
+    for (offset) |char| if (!std.ascii.isHex(char)) return;
+    while (parts.next()) |token| {
+        if (token.len != 2) break;
+        if (!std.ascii.isHex(token[0]) or !std.ascii.isHex(token[1])) break;
+        const byte = std.fmt.parseInt(u8, token, 16) catch break;
+        try raw.append(allocator, byte);
+    }
+}
+
 pub fn parseHexdump(allocator: std.mem.Allocator, text: []const u8, frame: u32) !PacketBytes {
     var lines_list: std.ArrayList([]const u8) = .empty;
     errdefer {
@@ -289,15 +302,7 @@ pub fn parseHexdump(allocator: std.mem.Allocator, text: []const u8, frame: u32) 
             packet_start = false;
         }
         try lines_list.append(allocator, try allocator.dupe(u8, line));
-        if (line.len >= 47) {
-            var i: usize = 6;
-            while (i + 2 <= 53 and i < line.len) : (i += 3) {
-                const pair = line[i .. i + 2];
-                if (pair[0] == ' ' or pair[1] == ' ') continue;
-                const byte = std.fmt.parseInt(u8, pair, 16) catch continue;
-                try raw.append(allocator, byte);
-            }
-        }
+        try appendDumpBytes(allocator, &raw, line);
     }
 
     return .{

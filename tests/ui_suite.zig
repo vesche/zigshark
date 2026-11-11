@@ -70,6 +70,17 @@ test "protocol tree jumps to ethertype and copies the visible subtree" {
     try std.testing.expect(tree.findPattern("IPv4", true, false));
 }
 
+test "narrow packet list drops addresses and a click past the end misses" {
+    const no_headers = [_][]const u8{};
+    try std.testing.expectEqual(@as(?usize, 0), table_mod.columnAt(&no_headers, 60, 0));
+    // After No. and Time, the next narrow column is protocol, not source.
+    try std.testing.expectEqual(@as(?usize, 4), table_mod.columnAt(&no_headers, 60, 17));
+    try std.testing.expect(table_mod.columnAt(&no_headers, 60, 62) == null);
+
+    const headers = [_][]const u8{ "No.", "Time", "Source", "Info" };
+    try std.testing.expect(table_mod.columnAt(&headers, 40, 1000) == null);
+}
+
 test "header columns report the clicked index" {
     const headers = [_][]const u8{ "No.", "Time", "Protocol", "Info" };
     try std.testing.expectEqual(@as(?usize, 0), table_mod.columnAt(&headers, 100, 1));

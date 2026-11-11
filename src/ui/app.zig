@@ -732,7 +732,7 @@ pub const AppModel = struct {
         try self.session.setFileSource(path);
         self.hide_through_frame = 0;
         self.noteTail(path);
-        try recents.pushRecent(self.config, path);
+        try self.config.addRecentFile(path);
         self.live_capture = false;
         self.clearDetail();
         self.loader.clearDetailCache(self.io);

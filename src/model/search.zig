@@ -325,6 +325,32 @@ test "regex finds a wildcard span" {
     try std.testing.expectEqual(@as(?usize, 3), regexFind("ab 42 zz", "[0-9]+"));
 }
 
+test "regex class, anchors, and escapes stay within the small matcher" {
+    try std.testing.expectEqual(@as(?usize, 2), regexFind("zz9", "[0-9]"));
+    try std.testing.expectEqual(@as(?usize, 1), regexFind("az9", "z[0-9]"));
+    try std.testing.expectEqual(@as(?usize, 0), regexFind("x^", "x^"));
+    try std.testing.expectEqual(@as(?usize, null), regexFind("x", "x^"));
+    try std.testing.expectEqual(@as(?usize, 0), regexFind("a$b", "a$b"));
+    try std.testing.expectEqual(@as(?usize, null), regexFind("ab", "a$b"));
+    try std.testing.expectEqual(@as(?usize, 0), regexFind("ab", "ab$"));
+    try std.testing.expectEqual(@as(?usize, 0), regexFind("a.b", "a\\.b"));
+    try std.testing.expectEqual(@as(?usize, null), regexFind("axb", "a\\.b"));
+}
+
+test "odd trailing hex nibble does not match" {
+    const allocator = std.testing.allocator;
+    const raw = try allocator.dupe(u8, &.{ 0xde, 0xad });
+    defer allocator.free(raw);
+    const lines: [][]const u8 = &.{};
+    const bytes = packet.PacketBytes{ .frame = 1, .raw = raw, .hexdump_lines = lines };
+    var state = SearchState{ .kind = .hex };
+    defer state.deinit(allocator);
+    try state.setNeedle(allocator, "dea");
+    try std.testing.expectEqual(@as(?usize, null), findNextBytes(&bytes, &state, 0));
+    try state.setNeedle(allocator, "dead");
+    try std.testing.expectEqual(@as(?usize, 0), findNextBytes(&bytes, &state, 0));
+}
+
 test "search hexadecimal byte sequence" {
     const allocator = std.testing.allocator;
     const raw = try allocator.dupe(u8, &.{ 0x00, 0xde, 0xad, 0xbe, 0xef });

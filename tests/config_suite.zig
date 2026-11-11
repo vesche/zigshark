@@ -74,6 +74,11 @@ test "recent files stay unique and capped" {
     try cfg.addRecentFile("/tmp/c24.pcap");
     try std.testing.expectEqual(@as(usize, 20), cfg.recent_files.items.len);
     try std.testing.expectEqualStrings("/tmp/c24.pcap", cfg.recent_files.items[0]);
+    // Reopening an older path moves it to the front instead of leaving it in place.
+    try cfg.addRecentFile("/tmp/c5.pcap");
+    try std.testing.expectEqual(@as(usize, 20), cfg.recent_files.items.len);
+    try std.testing.expectEqualStrings("/tmp/c5.pcap", cfg.recent_files.items[0]);
+    try std.testing.expectEqualStrings("/tmp/c24.pcap", cfg.recent_files.items[1]);
 }
 
 test "macros expand a known name and leave an unknown dollar sign" {
