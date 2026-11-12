@@ -42,6 +42,7 @@ pub const defaultCommands = [_]CommandDef{
     .{ .name = "expert", .description = "Expert info on the open packet", .usage = ":expert" },
     .{ .name = "time-ref", .description = "Set or clear time zero on the selected frame", .usage = ":time-ref" },
     .{ .name = "tail", .description = "Follow a growing capture", .usage = ":tail" },
+    .{ .name = "stop", .description = "Stop the live capture and keep the saved file", .usage = ":stop" },
     .{ .name = "config", .description = "Show active configuration", .usage = ":config" },
     .{ .name = "logs", .description = "Show log file location", .usage = ":logs" },
     .{ .name = "theme", .description = "Toggle or load a theme", .usage = ":theme [list|<name>]" },

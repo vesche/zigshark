@@ -37,6 +37,23 @@ const PsmlTask = struct {
     loader: *CaptureLoader,
     argv: process.Argv,
     generation: u64,
+    append_rows: bool,
+};
+
+const LiveWatch = struct {
+    loader: *CaptureLoader,
+    child: std.process.Child,
+    out_path: []u8,
+};
+
+const LiveListTask = struct {
+    loader: *CaptureLoader,
+    argv: process.Argv,
+    path: []u8,
+    generation: u64,
+    stop: std.atomic.Value(bool) = .init(false),
+    follow: ?std.Thread = null,
+    stdin: ?std.Io.File = null,
 };
 
 const DetailTask = struct {
@@ -61,7 +78,13 @@ pub const CaptureLoader = struct {
     /// Packet-list reloads and detail loads must not cancel each other.
     list_cancel: process.CancellationToken = .{},
     cancel_token: process.CancellationToken = .{},
-    live_child: ?std.process.Child = null,
+    list_inflight: std.atomic.Value(u32) = .init(0),
+    /// Set while dumpcap or the tshark fallback is writing the capture file.
+    capture_active: std.atomic.Value(bool) = .init(false),
+    live_stop: std.atomic.Value(bool) = .init(false),
+    live_reaped: std.atomic.Value(bool) = .init(true),
+    live_id: ?std.process.Child.Id = null,
+    live_watcher: ?std.Thread = null,
     /// Headless tests record the PSML argv and skip worker threads.
     defer_spawn: bool = false,
     psml_argv: process.Argv = .{},
@@ -94,7 +117,7 @@ pub const CaptureLoader = struct {
         self.list_cancel.cancel(io);
         self.cancel_token.cancel(io);
         if (self.has_psml_argv) self.psml_argv.deinit(self.allocator);
-        if (self.live_child) |*child| child.kill(io);
+        self.stopLiveCapture(io);
         for (self.workers.items) |worker| worker.join();
         self.workers.deinit(self.allocator);
         self.detail_cache.deinit();
@@ -123,7 +146,28 @@ pub const CaptureLoader = struct {
         self.detail_cache.setCapacity(self.io, self.config.cache_size);
     }
 
+    pub fn listInFlight(self: *const CaptureLoader) bool {
+        return self.list_inflight.load(.acquire) != 0;
+    }
+
     pub fn requestPsml(self: *CaptureLoader, session: *session_mod.Session) !void {
+        if (self.capture_active.load(.acquire) and !self.defer_spawn) {
+            try self.startLiveList(session);
+            return;
+        }
+        try self.requestPsmlNewerThan(session, null);
+    }
+
+    /// `after_frame` appends only packets newer than that frame. Live refresh
+    /// uses it so a growing file is not dissected from the start again.
+    pub fn requestPsmlNewerThan(self: *CaptureLoader, session: *session_mod.Session, after_frame: ?u32) !void {
+        const owned_filter = if (after_frame) |frame|
+            try frameFloorFilter(self.allocator, session.display_filter, frame)
+        else
+            null;
+        defer if (owned_filter) |filter| self.allocator.free(filter);
+        const filter: ?[]const u8 = owned_filter orelse session.display_filter;
+
         session.loading = .loading_list;
         self.list_cancel.cancel(self.io);
         const generation = self.list_generation.fetchAdd(1, .acq_rel) + 1;
@@ -132,7 +176,7 @@ pub const CaptureLoader = struct {
             self.allocator,
             self.tools.tshark,
             session.source,
-            session.display_filter,
+            filter,
             if (self.config.column_format.len != 0) self.config.column_format else null,
         );
         errdefer argv.deinit(self.allocator);
@@ -152,8 +196,13 @@ pub const CaptureLoader = struct {
             .loader = self,
             .argv = argv,
             .generation = generation,
+            .append_rows = after_frame != null,
         };
+        argv = .{};
+        errdefer task.argv.deinit(self.allocator);
         try self.workers.ensureUnusedCapacity(self.allocator, 1);
+        _ = self.list_inflight.fetchAdd(1, .acq_rel);
+        errdefer _ = self.list_inflight.fetchSub(1, .acq_rel);
         const worker = try std.Thread.spawn(.{}, runPsmlWorker, .{task});
         self.workers.appendAssumeCapacity(worker);
     }
@@ -312,38 +361,60 @@ pub const CaptureLoader = struct {
     ) !void {
         if (interfaces.len == 0) return error.NoCaptureInterface;
         session.loading = .capturing;
+        // dumpcap drops privileges before creating -w, so under sudo it cannot
+        // create test.pcap in this directory. The capture bytes come back on
+        // stdout and this process writes the absolute path.
+        const absolute = try absoluteCapturePath(self.allocator, io, temp_path);
+        createCaptureFile(io, absolute) catch |err| {
+            self.allocator.free(absolute);
+            return err;
+        };
         if (session.capture_path.len != 0) self.allocator.free(session.capture_path);
-        session.capture_path = try self.allocator.dupe(u8, temp_path);
+        session.capture_path = absolute;
         session.source = .{ .fifo = session.capture_path };
 
         var argv: process.Argv = undefined;
         if (self.tools.dumpcap_can_capture) {
-            argv = try process.argvDumpcapLive(self.allocator, self.tools.dumpcap, interfaces, temp_path, session.capture_filter);
+            argv = try process.argvDumpcapLive(self.allocator, self.tools.dumpcap, interfaces, session.capture_filter);
         } else {
             try session.setError(tools_mod.dumpcapPermissionMessage());
             try self.pushEvent(.{ .error_msg = try self.allocator.dupe(u8, tools_mod.dumpcapPermissionMessage()) });
-            argv = try process.argvTsharkLiveFallback(self.allocator, self.tools.tshark, interfaces, temp_path, session.capture_filter);
+            argv = try process.argvTsharkLiveFallback(self.allocator, self.tools.tshark, interfaces, session.capture_filter);
         }
         defer argv.deinit(self.allocator);
 
-        self.live_child = try std.process.spawn(io, .{
+        self.stopLiveCapture(io);
+        const out_path = try self.allocator.dupe(u8, session.capture_path);
+        const watch = try self.allocator.create(LiveWatch);
+        watch.loader = self;
+        watch.out_path = out_path;
+        watch.child = std.process.spawn(io, .{
             .argv = argv.slice(),
             .stdin = .ignore,
             .stdout = .pipe,
             .stderr = .pipe,
-        });
-        try self.pushEvent(.{ .capture_progress = try self.allocator.dupe(u8, "capture started") });
-    }
-
-    pub fn pollLiveCapture(self: *CaptureLoader, io: std.Io) !void {
-        var child = self.live_child orelse return;
-        const term = child.wait(io) catch return;
-        self.live_child = null;
-        if (!term.success()) {
-            try self.pushEvent(.{ .error_msg = try self.allocator.dupe(u8, "capture process exited with failure") });
-            return;
-        }
-        try self.pushEvent(.done);
+        }) catch |err| {
+            self.allocator.free(watch.out_path);
+            self.allocator.destroy(watch);
+            return err;
+        };
+        // The watcher owns the child. It writes stdout into the capture file
+        // and drains stderr so the capture cannot block on a full pipe.
+        self.live_reaped.store(false, .release);
+        self.live_stop.store(false, .release);
+        self.live_id = watch.child.id;
+        self.live_watcher = std.Thread.spawn(.{}, runLiveWatch, .{watch}) catch |err| {
+            if (watch.child.id != null) watch.child.kill(io);
+            self.allocator.free(watch.out_path);
+            self.allocator.destroy(watch);
+            self.live_id = null;
+            return err;
+        };
+        self.capture_active.store(true, .release);
+        self.pushEvent(.{ .capture_progress = try self.allocator.dupe(u8, "capture started") }) catch |err| {
+            self.stopLiveCapture(io);
+            return err;
+        };
     }
 
     pub fn cancel(self: *CaptureLoader, io: std.Io) void {
@@ -353,21 +424,395 @@ pub const CaptureLoader = struct {
     }
 
     pub fn stopLiveCapture(self: *CaptureLoader, io: std.Io) void {
-        if (self.live_child) |*child| {
-            if (child.id != null) child.kill(io);
+        _ = io;
+        if (!self.live_reaped.load(.acquire)) {
+            if (self.live_id) |id| signalStop(id);
         }
-        self.live_child = null;
+        self.live_id = null;
+        if (self.live_watcher) |thread| {
+            thread.join();
+            self.live_watcher = null;
+        }
+        // The file is flushed. The list reader closes tshark's stdin after this
+        // and finishes the packets already on disk.
+        self.live_stop.store(true, .release);
+        self.capture_active.store(false, .release);
+    }
+
+    /// One tshark reads the growing capture from the start of the call until
+    /// the capture stops. Restarting it on every new packet re-dissects the
+    /// whole file and saturates the machine.
+    pub fn startLiveList(self: *CaptureLoader, session: *session_mod.Session) !void {
+        const path = self.filePath(session) orelse return error.NoCaptureFile;
+        const path_copy = try self.allocator.dupe(u8, path);
+        var argv = process.argvPsmlLoad(
+            self.allocator,
+            self.tools.tshark,
+            .stdin,
+            session.display_filter,
+            if (self.config.column_format.len != 0) self.config.column_format else null,
+        ) catch |err| {
+            self.allocator.free(path_copy);
+            return err;
+        };
+        errdefer argv.deinit(self.allocator);
+        errdefer self.allocator.free(path_copy);
+
+        session.loading = .loading_list;
+        self.list_cancel.cancel(self.io);
+        const generation = self.list_generation.fetchAdd(1, .acq_rel) + 1;
+        self.list_cancel.reset();
+        try appendDissectionOptions(self.allocator, &argv, session, self.config.tshark_args);
+        if (self.tools.supports_color) try argv.append(self.allocator, "--color");
+
+        if (self.defer_spawn) {
+            if (self.has_psml_argv) self.psml_argv.deinit(self.allocator);
+            self.psml_argv = argv;
+            self.has_psml_argv = true;
+            argv = .{};
+            self.allocator.free(path_copy);
+            return;
+        }
+
+        const task = try self.allocator.create(LiveListTask);
+        task.* = .{
+            .loader = self,
+            .argv = argv,
+            .path = path_copy,
+            .generation = generation,
+        };
+        argv = .{};
+        try self.workers.ensureUnusedCapacity(self.allocator, 1);
+        _ = self.list_inflight.fetchAdd(1, .acq_rel);
+        self.workers.appendAssumeCapacity(std.Thread.spawn(.{}, runLiveList, .{task}) catch |err| {
+            _ = self.list_inflight.fetchSub(1, .acq_rel);
+            task.argv.deinit(self.allocator);
+            self.allocator.destroy(task);
+            return err;
+        });
     }
 };
+
+fn signalStop(id: std.process.Child.Id) void {
+    if (builtin.os.tag == .windows) {
+        const status: std.os.windows.NTSTATUS = @enumFromInt(1);
+        _ = std.os.windows.ntdll.NtTerminateProcess(id, status);
+    } else if (builtin.os.tag != .wasi) {
+        std.posix.kill(id, std.posix.SIG.TERM) catch {};
+    }
+}
+
+fn runLiveWatch(watch: *LiveWatch) void {
+    const loader = watch.loader;
+    defer {
+        loader.allocator.free(watch.out_path);
+        loader.allocator.destroy(watch);
+    }
+    const io = loader.io;
+
+    var stderr_text: std.ArrayList(u8) = .empty;
+    defer stderr_text.deinit(loader.allocator);
+
+    const cwd = std.Io.Dir.cwd();
+    const file = cwd.createFile(io, watch.out_path, .{ .truncate = true }) catch {
+        if (watch.child.id) |id| signalStop(id);
+        const term = watch.child.wait(io) catch {
+            loader.live_reaped.store(true, .release);
+            return;
+        };
+        loader.live_reaped.store(true, .release);
+        _ = term;
+        reportLiveFailure(loader, "could not write the capture file");
+        return;
+    };
+    defer file.close(io);
+
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(loader.allocator, io, multi_reader_buffer.toStreams(), &.{ watch.child.stdout.?, watch.child.stderr.? });
+    defer multi_reader.deinit();
+
+    var write_failed = false;
+    while (multi_reader.fill(65536, .none)) |_| {
+        const stdout = multi_reader.reader(0);
+        const chunk = stdout.buffered();
+        if (chunk.len != 0) {
+            file.writeStreamingAll(io, chunk) catch {
+                write_failed = true;
+                if (watch.child.id) |id| signalStop(id);
+                stdout.seek = stdout.end;
+                break;
+            };
+            stdout.seek = stdout.end;
+        }
+        const stderr = multi_reader.reader(1);
+        const err_chunk = stderr.buffered();
+        if (err_chunk.len != 0 and stderr_text.items.len < 4096) {
+            const room = 4096 - stderr_text.items.len;
+            const take = @min(room, err_chunk.len);
+            stderr_text.appendSlice(loader.allocator, err_chunk[0..take]) catch {};
+        }
+        if (err_chunk.len != 0) stderr.seek = stderr.end;
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => {},
+    }
+
+    const term = watch.child.wait(io) catch {
+        loader.live_reaped.store(true, .release);
+        return;
+    };
+    loader.live_reaped.store(true, .release);
+    if (loader.live_stop.load(.acquire)) return;
+    if (write_failed) {
+        reportLiveFailure(loader, "could not write the capture file");
+        return;
+    }
+    if (term.success()) return;
+
+    const trimmed = std.mem.trim(u8, stderr_text.items, " \t\r\n");
+    const shown = if (trimmed.len != 0) trimmed else "capture process exited with failure";
+    reportLiveFailure(loader, shown);
+}
+
+fn reportLiveFailure(loader: *CaptureLoader, message: []const u8) void {
+    const limit = @min(message.len, 4096);
+    const copy = loader.allocator.dupe(u8, message[0..limit]) catch return;
+    var event: Event = .{ .error_msg = copy };
+    loader.pushEvent(event) catch {
+        event.deinit(loader.allocator);
+    };
+}
+
+fn drainChildStderr(allocator: std.mem.Allocator, io: std.Io, stderr: std.Io.File, out: *std.ArrayList(u8)) void {
+    var buf: [4096]u8 = undefined;
+    var iov: [1][]u8 = .{&buf};
+    const cap = 16 * 1024;
+    while (out.items.len < cap) {
+        const n = stderr.readStreaming(io, &iov) catch break;
+        if (n == 0) return;
+        const room = cap - out.items.len;
+        const take = @min(n, room);
+        out.appendSlice(allocator, buf[0..take]) catch break;
+    }
+    while (true) {
+        const n = stderr.readStreaming(io, &iov) catch return;
+        if (n == 0) return;
+    }
+}
+
+fn giveCaptureToSudoUser(io: std.Io, file: std.Io.File) void {
+    var raw: [32 * 1024]u8 = undefined;
+    const cwd = std.Io.Dir.cwd();
+    const env_file = cwd.openFile(io, "/proc/self/environ", .{}) catch return;
+    defer env_file.close(io);
+    var iov: [1][]u8 = .{&raw};
+    const n = env_file.readStreaming(io, &iov) catch return;
+    if (n == 0) return;
+    const uid = envValue(raw[0..n], "SUDO_UID") orelse return;
+    const gid = envValue(raw[0..n], "SUDO_GID") orelse return;
+    const uid_i = std.fmt.parseInt(std.Io.File.Uid, uid, 10) catch return;
+    const gid_i = std.fmt.parseInt(std.Io.File.Gid, gid, 10) catch return;
+    file.setOwner(io, uid_i, gid_i) catch {};
+}
+
+fn envValue(block: []const u8, key: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, block, 0);
+    while (it.next()) |entry| {
+        if (std.mem.startsWith(u8, entry, key) and entry.len > key.len and entry[key.len] == '=') {
+            return entry[key.len + 1 ..];
+        }
+    }
+    return null;
+}
+
+fn absoluteCapturePath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    return std.fs.path.join(allocator, &.{ cwd, path });
+}
+
+fn createCaptureFile(io: std.Io, path: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    if (std.fs.path.dirname(path)) |dir| {
+        if (dir.len != 0) try cwd.createDirPath(io, dir);
+    }
+    const file = try cwd.createFile(io, path, .{
+        .truncate = true,
+        .permissions = @fromBackingInt(@intCast(0o644)),
+    });
+    defer file.close(io);
+    // sudo leaves this process as root, which can create the file, then
+    // dumpcap drops to the invoking user. Hand the file to that user.
+    giveCaptureToSudoUser(io, file);
+}
+
+fn runLiveList(task: *LiveListTask) void {
+    const loader = task.loader;
+    const io = loader.io;
+    defer {
+        task.stop.store(true, .release);
+        if (task.follow) |thread| thread.join();
+        if (task.stdin) |stdin| stdin.close(io);
+        _ = loader.list_inflight.fetchSub(1, .acq_rel);
+        task.argv.deinit(loader.allocator);
+        loader.allocator.free(task.path);
+        loader.allocator.destroy(task);
+    }
+    if (loader.list_cancel.isCancelled()) return;
+
+    var child = std.process.spawn(io, .{
+        .argv = task.argv.slice(),
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch |err| {
+        emitWorkerError(loader, @errorName(err));
+        return;
+    };
+    loader.list_cancel.bind(io, &child);
+    defer loader.list_cancel.release(io, &child);
+
+    const stdin = child.stdin orelse return;
+    child.stdin = null;
+    task.stdin = stdin;
+    task.follow = std.Thread.spawn(.{}, pumpCapture, .{task}) catch |err| {
+        emitWorkerError(loader, @errorName(err));
+        return;
+    };
+
+    var feed = PsmlFeed.init(loader, task.generation, false);
+    defer feed.deinit();
+    var stderr_text: std.ArrayList(u8) = .empty;
+    defer stderr_text.deinit(loader.allocator);
+    const term = streamChildOutput(loader, &child, &feed, &stderr_text) catch |err| {
+        if (err == error.Cancelled or task.generation != loader.list_generation.load(.acquire)) return;
+        emitWorkerError(loader, @errorName(err));
+        return;
+    };
+    if (task.generation != loader.list_generation.load(.acquire) or loader.list_cancel.isCancelled()) return;
+    feed.finish() catch |err| {
+        if (err == error.Cancelled or task.generation != loader.list_generation.load(.acquire)) return;
+        emitWorkerError(loader, @errorName(err));
+        return;
+    };
+    const failed = !term.success() and !process.isTruncatedCapture(stderr_text.items);
+    if (failed and !loader.live_stop.load(.acquire)) {
+        const trimmed = std.mem.trim(u8, stderr_text.items, " \t\r\n");
+        emitWorkerError(loader, if (trimmed.len != 0) trimmed else "live packet list failed");
+        return;
+    }
+    loader.pushEvent(.done) catch {};
+}
+
+fn pumpCapture(task: *LiveListTask) void {
+    const loader = task.loader;
+    const io = loader.io;
+    const stdin = task.stdin orelse return;
+    defer {
+        stdin.close(io);
+        task.stdin = null;
+    }
+    const cwd = std.Io.Dir.cwd();
+    var file: ?std.Io.File = null;
+    defer if (file) |opened| opened.close(io);
+    var offset: u64 = 0;
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        if (file == null) {
+            file = cwd.openFile(io, task.path, .{}) catch {
+                if (task.stop.load(.acquire) or loader.live_stop.load(.acquire)) break;
+                std.Io.sleep(io, .fromMilliseconds(40), .awake) catch break;
+                continue;
+            };
+        }
+        const opened = file.?;
+        const stat = cwd.statFile(io, task.path, .{}) catch {
+            if (task.stop.load(.acquire) or loader.live_stop.load(.acquire)) break;
+            std.Io.sleep(io, .fromMilliseconds(40), .awake) catch break;
+            continue;
+        };
+        if (stat.size < offset) offset = 0;
+        if (stat.size == offset) {
+            if (task.stop.load(.acquire) or loader.live_stop.load(.acquire)) break;
+            std.Io.sleep(io, .fromMilliseconds(40), .awake) catch break;
+            continue;
+        }
+        const want = @min(buf.len, stat.size - offset);
+        var iov: [1][]u8 = .{buf[0..want]};
+        const n = opened.readPositional(io, &iov, offset) catch break;
+        if (n == 0) {
+            if (task.stop.load(.acquire) or loader.live_stop.load(.acquire)) break;
+            std.Io.sleep(io, .fromMilliseconds(40), .awake) catch break;
+            continue;
+        }
+        stdin.writeStreamingAll(io, buf[0..n]) catch break;
+        offset += n;
+    }
+}
+
+fn streamChildOutput(
+    loader: *CaptureLoader,
+    child: *std.process.Child,
+    feed: *PsmlFeed,
+    stderr_text: *std.ArrayList(u8),
+) !std.process.Child.Term {
+    const io = loader.io;
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(loader.allocator, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
+
+    while (multi_reader.fill(4096, .none)) |_| {
+        if (loader.list_cancel.isCancelled()) return error.Cancelled;
+        const stdout = multi_reader.reader(0);
+        const chunk = stdout.buffered();
+        if (chunk.len != 0) {
+            try PsmlFeed.onChunk(@ptrCast(feed), chunk);
+            stdout.seek = stdout.end;
+        }
+        const stderr = multi_reader.reader(1);
+        const err_chunk = stderr.buffered();
+        if (err_chunk.len != 0 and stderr_text.items.len < 4096) {
+            const room = 4096 - stderr_text.items.len;
+            const take = @min(room, err_chunk.len);
+            stderr_text.appendSlice(loader.allocator, err_chunk[0..take]) catch {};
+        }
+        stderr.seek = stderr.end;
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => {
+            if (loader.list_cancel.isCancelled()) return error.Cancelled;
+            return err;
+        },
+    }
+    return if (loader.list_cancel.isCancelled())
+        error.Cancelled
+    else
+        try loader.list_cancel.waitUnlessCancelled(io, child);
+}
+
+fn frameFloorFilter(allocator: std.mem.Allocator, display: []const u8, after_frame: u32) ![]u8 {
+    if (display.len == 0) return std.fmt.allocPrint(allocator, "frame.number > {d}", .{after_frame});
+    return std.fmt.allocPrint(allocator, "({s}) and frame.number > {d}", .{ display, after_frame });
+}
+
+/// A live file should be read again only after the previous read has finished
+/// and dumpcap has appended bytes.
+pub fn liveReloadDue(in_flight: bool, size: u64, synced: u64) bool {
+    return !in_flight and size != 0 and size != synced;
+}
 
 fn runPsmlWorker(task: *PsmlTask) void {
     const loader = task.loader;
     defer {
+        _ = loader.list_inflight.fetchSub(1, .acq_rel);
         task.argv.deinit(loader.allocator);
         loader.allocator.destroy(task);
     }
 
-    var feed = PsmlFeed.init(loader, task.generation);
+    var feed = PsmlFeed.init(loader, task.generation, task.append_rows);
     defer feed.deinit();
     var saw_stdout = false;
     var output = process.runStdoutChunks(
@@ -392,8 +837,14 @@ fn runPsmlWorker(task: *PsmlTask) void {
         return;
     };
     if (!output.term.success()) {
-        emitWorkerError(loader, output.stderr);
-        return;
+        // A capture that is still open ends mid-packet. Keep the rows tshark
+        // already wrote instead of covering the list with an error dialog.
+        const usable = process.isTruncatedCapture(output.stderr) and
+            (feed.emitted_rows > 0 or loader.capture_active.load(.acquire));
+        if (!usable) {
+            emitWorkerError(loader, output.stderr);
+            return;
+        }
     }
     loader.pushEvent(.done) catch {};
 }
@@ -409,11 +860,12 @@ const PsmlFeed = struct {
     replace_next: bool = true,
     emitted_rows: usize = 0,
 
-    fn init(loader: *CaptureLoader, generation: u64) PsmlFeed {
+    fn init(loader: *CaptureLoader, generation: u64, append_rows: bool) PsmlFeed {
         return .{
             .loader = loader,
             .generation = generation,
             .started_ns = std.Io.Timestamp.now(loader.io, .awake).nanoseconds,
+            .replace_next = !append_rows,
         };
     }
 
@@ -452,7 +904,14 @@ const PsmlFeed = struct {
         }
         self.dropPending(available.consumed);
 
-        const bundle = @max(self.loader.config.bundle_size, 1);
+        // Paint a live capture before a thousand-row bundle fills. The read
+        // often ends at a short packet, and that tail has to be flushed by
+        // the time tshark exits.
+        const configured: usize = @max(@as(usize, self.loader.config.bundle_size), 1);
+        const bundle: usize = if (self.loader.capture_active.load(.acquire))
+            @min(configured, 16)
+        else
+            configured;
         while (self.batch.items.len >= bundle) {
             try self.emit(bundle, false);
         }
@@ -875,11 +1334,13 @@ test "stale psml generation is dropped and a second request cancels the first ch
     const started = try std.fmt.allocPrint(allocator, "{s}.started", .{hold_path});
     defer allocator.free(started);
     try waitForPath(io, started);
+    try std.testing.expect(loader.listInFlight());
     _ = loader.list_generation.fetchAdd(1, .acq_rel);
     const release = try std.fmt.allocPrint(allocator, "{s}.release", .{hold_path});
     defer allocator.free(release);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = release, .data = "go\n" });
     joinWorkers(&loader);
+    try std.testing.expect(!loader.listInFlight());
     const dropped = try loader.drainEvents();
     defer {
         for (dropped) |*event| event.deinit(allocator);
@@ -1147,4 +1608,117 @@ test "psml rows arrive before tshark exits and a later chunk appends" {
     };
     try std.testing.expect(appended);
     for (rest) |*event| event.deinit(allocator);
+}
+
+test "live reload waits for the in-flight read and then asks for new frames" {
+    try std.testing.expect(!liveReloadDue(true, 100, 0));
+    try std.testing.expect(!liveReloadDue(false, 0, 0));
+    try std.testing.expect(!liveReloadDue(false, 40, 40));
+    try std.testing.expect(liveReloadDue(false, 40, 0));
+
+    const allocator = std.testing.allocator;
+    const floor = try frameFloorFilter(allocator, "tcp or udp", 7);
+    defer allocator.free(floor);
+    try std.testing.expectEqualStrings("(tcp or udp) and frame.number > 7", floor);
+    const bare = try frameFloorFilter(allocator, "", 7);
+    defer allocator.free(bare);
+    try std.testing.expectEqualStrings("frame.number > 7", bare);
+
+    var tools = try testingTools(allocator, "tshark");
+    defer tools.deinit();
+    var loader = CaptureLoader.init(allocator, std.testing.io, &tools, .{});
+    loader.defer_spawn = true;
+    defer loader.deinit(std.testing.io);
+    var session = session_mod.Session.init(allocator, .{ .fifo = "live.pcap" });
+    defer session.deinit();
+    try session.setFilter("tcp", null);
+    try loader.requestPsmlNewerThan(&session, 4);
+    const argv = loader.psml_argv.slice();
+    var saw_floor = false;
+    var saw_flush = false;
+    for (argv) |arg| {
+        if (std.mem.eql(u8, arg, "(tcp) and frame.number > 4")) saw_floor = true;
+        if (std.mem.eql(u8, arg, "-l")) saw_flush = true;
+    }
+    try std.testing.expect(saw_floor);
+    try std.testing.expect(saw_flush);
+    try std.testing.expect(!loader.listInFlight());
+}
+
+test "dumpcap stderr is drained so the capture file is written" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const script_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/dumpcap", .{tmp.sub_path[0..]});
+    defer allocator.free(script_path);
+    const out_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/live.pcap", .{tmp.sub_path[0..]});
+    defer allocator.free(out_path);
+
+    const script =
+        \\#!/usr/bin/env python3
+        \\import sys
+        \\args = sys.argv[1:]
+        \\if "-D" in args:
+        \\    sys.stdout.write("1. fake0\\n")
+        \\    raise SystemExit(0)
+        \\out = None
+        \\i = 0
+        \\while i < len(args):
+        \\    if args[i] == "-w" and i + 1 < len(args):
+        \\        out = args[i + 1]
+        \\        i += 2
+        \\        continue
+        \\    i += 1
+        \\if out != "-":
+        \\    sys.exit(2)
+        \\sys.stderr.write(("x" * 80 + "\\n") * 4000)
+        \\sys.stderr.flush()
+        \\with open("tests/fixtures/1.pcap", "rb") as src:
+        \\    sys.stdout.buffer.write(src.read())
+        \\    sys.stdout.buffer.flush()
+        \\
+    ;
+    const cwd = std.Io.Dir.cwd();
+    {
+        const script_file = try cwd.createFile(io, script_path, .{
+            .truncate = true,
+            .permissions = @fromBackingInt(@intCast(0o755)),
+        });
+        errdefer script_file.close(io);
+        try script_file.writeStreamingAll(io, script);
+        script_file.close(io);
+    }
+
+    var tools = try testingTools(allocator, "tshark");
+    defer tools.deinit();
+    tools.dumpcap_can_capture = true;
+    const dumpcap = try allocator.dupe(u8, script_path);
+    allocator.free(tools.dumpcap);
+    tools.dumpcap = dumpcap;
+
+    var loader = CaptureLoader.init(allocator, io, &tools, .{});
+    defer loader.deinit(io);
+    const ifaces = try allocator.alloc([]const u8, 1);
+    defer allocator.free(ifaces);
+    ifaces[0] = "eth0";
+    var session = session_mod.Session.init(allocator, .{ .interfaces = ifaces });
+    defer session.deinit();
+
+    try loader.startLiveCapture(io, &session, ifaces, out_path);
+    try std.testing.expect(std.fs.path.isAbsolute(session.capture_path));
+    var spins: usize = 0;
+    var wrote = false;
+    while (spins < 200) : (spins += 1) {
+        const stat = cwd.statFile(io, out_path, .{}) catch {
+            try std.Io.sleep(io, .fromMilliseconds(20), .awake);
+            continue;
+        };
+        if (stat.size >= 2000) {
+            wrote = true;
+            break;
+        }
+        try std.Io.sleep(io, .fromMilliseconds(20), .awake);
+    }
+    try std.testing.expect(wrote);
 }

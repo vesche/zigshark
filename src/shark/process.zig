@@ -38,7 +38,7 @@ pub const CancellationToken = struct {
         self.cancelled.store(false, .release);
     }
 
-    fn bind(self: *CancellationToken, io: std.Io, child: *std.process.Child) void {
+    pub fn bind(self: *CancellationToken, io: std.Io, child: *std.process.Child) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         self.child = child;
@@ -47,14 +47,14 @@ pub const CancellationToken = struct {
 
     /// The worker is done with this child. Reap it if another thread has not
     /// already done so, then drop the binding.
-    fn release(self: *CancellationToken, io: std.Io, child: *std.process.Child) void {
+    pub fn release(self: *CancellationToken, io: std.Io, child: *std.process.Child) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         if (self.child == child) self.child = null;
         reap(child, io);
     }
 
-    fn waitUnlessCancelled(self: *CancellationToken, io: std.Io, child: *std.process.Child) !std.process.Child.Term {
+    pub fn waitUnlessCancelled(self: *CancellationToken, io: std.Io, child: *std.process.Child) !std.process.Child.Term {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         if (self.cancelled.load(.acquire) or child.id == null) {
@@ -437,10 +437,14 @@ pub fn argvPsmlLoad(
             try a.append(allocator, path);
         },
         .stdin => {
+            try a.append(allocator, "-l");
             try a.append(allocator, "-r");
             try a.append(allocator, "-");
         },
         .fifo => |path| {
+            // A live file is still growing. Flush each packet so the UI can
+            // paint rows before tshark reaches the current end.
+            try a.append(allocator, "-l");
             try a.append(allocator, "-r");
             try a.append(allocator, path);
         },
@@ -774,18 +778,22 @@ pub fn argvDumpcapLive(
     allocator: std.mem.Allocator,
     dumpcap: []const u8,
     interfaces: []const []const u8,
-    out_path: []const u8,
     capture_filter: ?[]const u8,
 ) !Argv {
     var a: Argv = .{};
     errdefer a.deinit(allocator);
     try a.append(allocator, dumpcap);
+    // Packet counts go to stderr. An unread pipe fills and dumpcap blocks
+    // before it flushes packets.
+    try a.append(allocator, "-q");
     for (interfaces) |iface| {
         try a.append(allocator, "-i");
         try a.append(allocator, iface);
     }
+    // stdout is the capture. dumpcap drops privileges before it would create
+    // -w, so a path in the user's directory fails even under sudo.
     try a.append(allocator, "-w");
-    try a.append(allocator, out_path);
+    try a.append(allocator, "-");
     if (capture_filter) |f| {
         if (f.len != 0) {
             try a.append(allocator, "-f");
@@ -799,18 +807,19 @@ pub fn argvTsharkLiveFallback(
     allocator: std.mem.Allocator,
     tshark: []const u8,
     interfaces: []const []const u8,
-    out_path: []const u8,
     capture_filter: ?[]const u8,
 ) !Argv {
     var a: Argv = .{};
     errdefer a.deinit(allocator);
     try a.append(allocator, tshark);
+    // `-Q` stops the running packet count. Same deadlock as dumpcap without `-q`.
+    try a.append(allocator, "-Q");
     for (interfaces) |iface| {
         try a.append(allocator, "-i");
         try a.append(allocator, iface);
     }
     try a.append(allocator, "-w");
-    try a.append(allocator, out_path);
+    try a.append(allocator, "-");
     if (capture_filter) |f| {
         if (f.len != 0) {
             try a.append(allocator, "-f");
@@ -818,6 +827,12 @@ pub fn argvTsharkLiveFallback(
         }
     }
     return a;
+}
+
+/// tshark exits non-zero with this text when it reads a capture that is still
+/// being written. The packets before the short read are valid.
+pub fn isTruncatedCapture(stderr: []const u8) bool {
+    return std.mem.indexOf(u8, stderr, "cut short in the middle of a packet") != null;
 }
 
 test "argv builders produce expected heads" {
@@ -844,6 +859,32 @@ test "read denial selects the capture path" {
     const stdin_argv = [_][]const u8{ "tshark", "-r", "-", "-T", "psml" };
     const stdin_err = "tshark: You don't have permission to read the file \"-\".\n";
     try std.testing.expect(deniedCaptureArg(&stdin_argv, stdin_err) == null);
+
+    const short = "tshark: The file \"live.pcapng\" appears to have been cut short in the middle of a packet.\n";
+    try std.testing.expect(isTruncatedCapture(short));
+    try std.testing.expect(!isTruncatedCapture("tshark: syntax error\n"));
+}
+
+test "live capture argv stays quiet and flushes packet rows" {
+    const allocator = std.testing.allocator;
+    var dump = try argvDumpcapLive(allocator, "dumpcap", &.{ "eth0", "wlan0" }, "tcp");
+    defer dump.deinit(allocator);
+    try std.testing.expectEqualStrings("dumpcap", dump.list.items[0]);
+    try std.testing.expectEqualStrings("-q", dump.list.items[1]);
+    try std.testing.expectEqualStrings("eth0", dump.list.items[3]);
+    try std.testing.expectEqualStrings("wlan0", dump.list.items[5]);
+    try std.testing.expectEqualStrings("-", dump.list.items[7]);
+    try std.testing.expectEqualStrings("tcp", dump.list.items[dump.list.items.len - 1]);
+
+    var fallback = try argvTsharkLiveFallback(allocator, "tshark", &.{"eth0"}, null);
+    defer fallback.deinit(allocator);
+    try std.testing.expectEqualStrings("-Q", fallback.list.items[1]);
+
+    var live = try argvPsmlLoad(allocator, "tshark", .{ .fifo = "out.pcap" }, null, null);
+    defer live.deinit(allocator);
+    try std.testing.expectEqualStrings("-l", live.list.items[5]);
+    try std.testing.expectEqualStrings("-r", live.list.items[6]);
+    try std.testing.expectEqualStrings("out.pcap", live.list.items[7]);
 }
 
 fn fakeTsharkPath(allocator: std.mem.Allocator) ![]u8 {

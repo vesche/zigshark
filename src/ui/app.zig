@@ -127,7 +127,10 @@ pub const AppModel = struct {
     awaiting_mark: bool = false,
     awaiting_jump: bool = false,
     live_capture: bool = false,
-    live_refresh_ticks: u8 = 0,
+    /// While true, new packets move the selection to the end.
+    follow_tail: bool = false,
+    /// The live packet list is one long-running tshark, not a fresh read per tick.
+    live_list_started: bool = false,
     fields: [][]u8 = &.{},
     fields_worker: ?std.Thread = null,
     fields_ready: std.atomic.Value(bool) = .init(false),
@@ -253,7 +256,8 @@ pub const AppModel = struct {
         self.awaiting_mark = false;
         self.awaiting_jump = false;
         self.live_capture = false;
-        self.live_refresh_ticks = 0;
+        self.follow_tail = false;
+        self.live_list_started = false;
         self.fields = &.{};
         self.fields_worker = null;
         self.fields_ready = .init(false);
@@ -316,6 +320,7 @@ pub const AppModel = struct {
             .onSelect = onPacketSelect,
             .onSort = onPacketSort,
             .onFocus = onPacketFocus,
+            .onUserScroll = onPacketScroll,
         };
         self.protocol_tree = protocol_tree.ProtocolTree.init(allocator, self.theme);
         self.protocol_tree.userdata = self;
@@ -448,8 +453,17 @@ pub const AppModel = struct {
     fn onPacketSelect(userdata: ?*anyopaque, idx: usize) void {
         const self: *AppModel = @ptrCast(@alignCast(userdata.?));
         _ = self.session.select(idx);
+        if (self.live_capture) {
+            const count = self.session.packets.len;
+            self.follow_tail = self.config.auto_scroll and count != 0 and idx + 1 == count;
+        }
         self.syncFromSession();
         self.loadDetailForSelection() catch {};
+    }
+
+    fn onPacketScroll(userdata: ?*anyopaque) void {
+        const self: *AppModel = @ptrCast(@alignCast(userdata.?));
+        if (self.live_capture) self.follow_tail = false;
     }
 
     fn onPacketSort(userdata: ?*anyopaque, column: usize, ascending: bool) void {
@@ -1134,23 +1148,56 @@ pub const AppModel = struct {
         };
         defer self.allocator.free(output_path);
 
-        try self.loader.startLiveCapture(
+        self.loader.startLiveCapture(
             self.io,
             self.session,
             interfaces,
             output_path,
-        );
+        ) catch |err| {
+            const detail = switch (err) {
+                error.AccessDenied, error.PermissionDenied => "permission denied. Remove a root-owned file at that path, or choose a directory you can write.",
+                else => @errorName(err),
+            };
+            const message = try std.fmt.allocPrint(self.allocator, "Cannot create {s}: {s}", .{ output_path, detail });
+            defer self.allocator.free(message);
+            try self.showMessage(message);
+            return;
+        };
         self.live_capture = true;
+        self.follow_tail = self.config.auto_scroll;
+        self.live_list_started = false;
         self.syncFromSession();
+        try self.refreshLiveCapture();
     }
 
     fn refreshLiveCapture(self: *AppModel) !void {
-        if (!self.live_capture or self.session.capture_path.len == 0) return;
-        const cwd = std.Io.Dir.cwd();
-        cwd.access(self.io, self.session.capture_path, .{}) catch return;
-        try self.loader.requestPsml(self.session);
+        if (!self.live_capture or self.session.capture_path.len == 0 or self.live_list_started) return;
+        try self.loader.startLiveList(self.session);
+        self.live_list_started = true;
         self.session.loading = .capturing;
         self.syncFromSession();
+    }
+
+    pub fn stopCapture(self: *AppModel) !void {
+        if (!self.live_capture) {
+            try self.showMessage("No capture is running");
+            return;
+        }
+        const saved = try self.allocator.dupe(u8, self.session.capture_path);
+        defer self.allocator.free(saved);
+        self.loader.stopLiveCapture(self.io);
+        self.live_capture = false;
+        self.follow_tail = false;
+        self.live_list_started = false;
+        self.session.loading = .idle;
+        self.syncFromSession();
+        const message = if (saved.len == 0)
+            try self.allocator.dupe(u8, "Capture stopped.")
+        else
+            try std.fmt.allocPrint(self.allocator, "Capture stopped. Saved {s}", .{saved});
+        defer self.allocator.free(message);
+        try self.showMessage(message);
+        try self.loadDetailForSelection();
     }
 
     fn loadFieldCompletions(self: *AppModel) !void {
@@ -1287,7 +1334,7 @@ pub const AppModel = struct {
             switch (ev.*) {
                 .packets_loaded => |*table| {
                     if (table.generation == 0 or table.generation == self.loader.list_generation.load(.acquire)) {
-                    const follow_live = self.live_capture and self.config.auto_scroll;
+                    const follow_live = self.live_capture and self.follow_tail and self.config.auto_scroll;
                     const previous = if (follow_live) null else self.session.selectedFrame();
                     if (table.headers.len != 0) {
                         self.session.setListHeaders(table.headers);
@@ -1309,6 +1356,7 @@ pub const AppModel = struct {
                     table.packets = &.{};
                     if (follow_live and self.session.packets.len > 0) {
                         _ = self.session.select(self.session.packets.len - 1);
+                        self.packet_table.scroll_free = false;
                     } else if (previous) |frame| {
                         for (self.session.packets, 0..) |summary, index| {
                             if (summary.frame == frame) {
@@ -1348,7 +1396,10 @@ pub const AppModel = struct {
                     try self.showMessage(msg);
                 },
                 .capture_progress => {},
-                .done => if (self.session.loading == .loading_list and !self.live_capture) {
+                .done => if (self.live_capture) {
+                    self.session.loading = .capturing;
+                    self.syncFromSession();
+                } else if (self.session.loading == .loading_list or self.session.loading == .capturing) {
                     self.list_settled_generation = self.loader.list_generation.load(.acquire);
                     if (self.session.display_filter.len == 0) self.unfiltered_total = self.session.packets.len;
                     self.session.loading = .idle;
@@ -1357,7 +1408,7 @@ pub const AppModel = struct {
             }
             ev.deinit(self.allocator);
         }
-        try self.loadDetailForSelection();
+        if (!(self.live_capture and self.follow_tail)) try self.loadDetailForSelection();
     }
 
     pub fn capturePath(self: *const AppModel) ?[]const u8 {
@@ -1377,6 +1428,8 @@ pub const AppModel = struct {
         self.noteTail(path);
         try self.config.addRecentFile(path);
         self.live_capture = false;
+        self.follow_tail = false;
+        self.live_list_started = false;
         self.clearDetail();
         self.loader.clearDetailCache(self.io);
         try self.loader.requestPsml(self.session);
@@ -3314,11 +3367,7 @@ pub const AppModel = struct {
                 }
                 try self.processLoaderEvents();
                 if (self.live_capture) {
-                    self.live_refresh_ticks +%= 1;
-                    if (self.live_refresh_ticks >= 10) {
-                        self.live_refresh_ticks = 0;
-                        try self.refreshLiveCapture();
-                    }
+                    try self.refreshLiveCapture();
                 } else if (self.tailing) {
                     self.tail_ticks +%= 1;
                     if (self.tail_ticks >= 10) {
@@ -3384,6 +3433,10 @@ pub const AppModel = struct {
                 if (key.matches('z', .{ .ctrl = true })) {
                     signals.suspendJob();
                     try ctx.queueRefresh();
+                    return ctx.consumeAndRedraw();
+                }
+                if (self.live_capture and self.focus != .filter and key.matches('s', .{})) {
+                    try self.stopCapture();
                     return ctx.consumeAndRedraw();
                 }
                 if (key.matches('q', .{})) {
@@ -3635,6 +3688,9 @@ pub const AppModel = struct {
             .hex => "hjkl byte",
             .filter => "Enter applies   Up recent   Tab name",
         };
+        if (self.live_capture) {
+            self.status.hint = if (self.follow_tail) "s/:stop ends   scroll pauses tail" else "s/:stop ends   End resumes tail";
+        }
         if (self.header_menu != null) self.status.hint = "j/k move   Enter   Esc";
         self.status.selected_index = self.session.selected_index;
         self.status.tailing = self.tailing;

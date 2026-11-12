@@ -219,6 +219,8 @@ pub fn run(self: *AppModel, cmd: []const u8, args: []const u8) !void {
         try self.restorePreviousFilter();
     } else if (std.mem.eql(u8, cmd, "columns")) {
         try self.applyColumns(args);
+    } else if (std.mem.eql(u8, cmd, "stop")) {
+        try self.stopCapture();
     } else if (std.mem.eql(u8, cmd, "tail")) {
         self.tailing = !self.tailing;
         if (self.tailing) self.tail_size = 0;

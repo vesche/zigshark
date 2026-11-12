@@ -1177,3 +1177,33 @@ test "name resolution reaches tshark and a mark keeps its note" {
     try std.testing.expectEqual(@as(?u32, 7), h.app.session.selectedFrame());
     try std.testing.expect(!h.script.saw("frame contains"));
 }
+
+test "selecting a packet pauses live tail and End resumes it" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    try h.setFrames(&.{ 1, 2, 3 });
+    h.app.live_capture = true;
+    h.app.follow_tail = true;
+    h.app.syncFromSession();
+    h.app.packet_table.onSelect.?(h.app.packet_table.userdata, 0);
+    try std.testing.expect(!h.app.follow_tail);
+    try std.testing.expectEqual(@as(?usize, 0), h.app.session.selected_index);
+
+    h.app.packet_table.onSelect.?(h.app.packet_table.userdata, 2);
+    try std.testing.expect(h.app.follow_tail);
+    try std.testing.expectEqual(@as(?usize, 2), h.app.session.selected_index);
+}
+
+test "stop ends a live capture and names the saved file" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    h.app.live_capture = true;
+    h.app.follow_tail = true;
+    h.session.capture_path = try h.allocator.dupe(u8, "/tmp/keep.pcap");
+    try h.app.runCommand("stop", "");
+    try std.testing.expect(!h.app.live_capture);
+    try std.testing.expect(!h.app.follow_tail);
+    try std.testing.expect(std.mem.indexOf(u8, h.app.msg_overlay.body, "/tmp/keep.pcap") != null);
+}

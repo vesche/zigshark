@@ -57,6 +57,9 @@ pub const text =
     \\Ctrl-Z            Suspend to the shell; fg resumes
     \\:columns          default, delta, absolute, or a tshark column format
     \\:tail             Follow a growing capture file
+    \\s / :stop         Stop a live capture. The file stays open
+    \\End               During a capture, jump to the latest packet and follow it
+    \\Scroll            During a capture, leave the tail so a packet stays selected
     \\Ctrl-L            Redraw
     \\Esc               Dismiss overlays
     \\

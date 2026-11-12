@@ -19,6 +19,8 @@ pub const PacketTable = struct {
     selected: usize = 0,
     scroll_top: usize = 0,
     viewport_rows: usize = 1,
+    /// The wheel moved the view away from the selection. Draw must not pull it back.
+    scroll_free: bool = false,
     last_width: u16 = 0,
     sort_column: usize = 0,
     sort_ascending: bool = true,
@@ -27,6 +29,7 @@ pub const PacketTable = struct {
     onSelect: ?*const fn (?*anyopaque, usize) void = null,
     onSort: ?*const fn (?*anyopaque, usize, bool) void = null,
     onFocus: ?*const fn (?*anyopaque) void = null,
+    onUserScroll: ?*const fn (?*anyopaque) void = null,
 
     pub fn widget(self: *PacketTable) vxfw.Widget {
         return .{
@@ -68,8 +71,25 @@ pub const PacketTable = struct {
         if (self.rows.len == 0) return;
         const clamped = @min(idx, self.rows.len - 1);
         if (clamped == self.selected) return;
+        self.scroll_free = false;
         self.selected = clamped;
+        self.ensureVisible(@max(self.viewport_rows, 1));
         if (self.onSelect) |cb| cb(self.userdata, clamped);
+    }
+
+    fn scrollBy(self: *PacketTable, delta: isize) void {
+        const view = @max(self.viewport_rows, 1);
+        const max_top = self.rows.len -| view;
+        const next: isize = @as(isize, @intCast(self.scroll_top)) + delta;
+        if (next <= 0) {
+            self.scroll_top = 0;
+        } else if (next >= @as(isize, @intCast(max_top))) {
+            self.scroll_top = max_top;
+        } else {
+            self.scroll_top = @intCast(next);
+        }
+        self.scroll_free = true;
+        if (self.onUserScroll) |cb| cb(self.userdata);
     }
 
     pub fn formatSelected(self: *const PacketTable, allocator: std.mem.Allocator) ![]u8 {
@@ -113,16 +133,13 @@ pub const PacketTable = struct {
                         }
                     }
                 }
-                if (m.button == .wheel_up and self.scroll_top > 0) {
-                    self.scroll_top -= 1;
+                if (m.button == .wheel_up) {
+                    self.scrollBy(-3);
                     return ctx.consumeAndRedraw();
                 }
                 if (m.button == .wheel_down) {
-                    const max_top = self.rows.len -| self.viewport_rows;
-                    if (self.scroll_top < max_top) {
-                        self.scroll_top += 1;
-                        return ctx.consumeAndRedraw();
-                    }
+                    self.scrollBy(3);
+                    return ctx.consumeAndRedraw();
                 }
             },
             .key_press => |key| {
@@ -182,7 +199,7 @@ pub const PacketTable = struct {
 
         const body_h = size.height -| 1;
         self.viewport_rows = body_h;
-        self.ensureVisible(body_h);
+        if (!self.scroll_free) self.ensureVisible(body_h);
 
         var line: u16 = 1;
         var idx = self.scroll_top;
@@ -457,4 +474,37 @@ test "each header press reverses that column and the release does not" {
     try std.testing.expect(!table.sort_ascending);
     try table.handleEvent(&ctx, press);
     try std.testing.expect(table.sort_ascending);
+}
+
+test "the wheel can leave the selected row and a redraw keeps that offset" {
+    var rows: [30]packet.PacketSummary = undefined;
+    for (&rows, 0..) |*row, index| {
+        row.* = .{ .frame = @intCast(index + 1), .columns = &.{}, .owns_columns = false };
+    }
+    var table: PacketTable = .{
+        .theme = theme_mod.dark(),
+        .rows = &rows,
+        .viewport_rows = 8,
+        .selected = 0,
+    };
+    var ctx: vxfw.EventContext = .{
+        .io = std.testing.io,
+        .alloc = std.testing.allocator,
+        .cmds = .empty,
+    };
+    defer ctx.cmds.deinit(std.testing.allocator);
+    const down: vxfw.Event = .{ .mouse = .{
+        .col = 1,
+        .row = 2,
+        .button = .wheel_down,
+        .type = .press,
+        .mods = .{},
+    } };
+    var i: usize = 0;
+    while (i < 6) : (i += 1) try table.handleEvent(&ctx, down);
+    try std.testing.expect(table.scroll_top > 8);
+    try std.testing.expect(table.scroll_free);
+    table.viewport_rows = 8;
+    if (!table.scroll_free) table.ensureVisible(8);
+    try std.testing.expect(table.scroll_top > 8);
 }
