@@ -39,6 +39,18 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install wireshark || true
 
+      - name: Install tshark (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          winget install --id WiresharkFoundation.Wireshark --exact --scope machine --accept-package-agreements --accept-source-agreements --disable-interactivity
+          $dir = "C:\Program Files\Wireshark"
+          if (-not (Test-Path "$dir\tshark.exe")) {
+            throw "tshark.exe was not installed at $dir"
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value $dir
+          & "$dir\tshark.exe" -v
+
       - name: Build
         run: zig build
 

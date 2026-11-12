@@ -73,6 +73,7 @@ pub const OverlayKind = enum {
     dns,
     http,
     compare,
+    comment_list,
     decode_selector,
     decode_protocol,
 };
@@ -1449,6 +1450,17 @@ pub const AppModel = struct {
         };
     }
 
+    fn openComparedCapture(self: *AppModel, path: []const u8, frame: u32) !void {
+        if (self.capturePath()) |current| self.config.addRecentFile(current) catch {};
+        self.pending_global_frame = frame;
+        self.openCapture(path) catch {
+            self.pending_global_frame = null;
+            const message = try std.fmt.allocPrint(self.allocator, "Could not open {s}", .{path});
+            defer self.allocator.free(message);
+            try self.showMessage(message);
+        };
+    }
+
     pub fn openCapture(self: *AppModel, path: []const u8) !void {
         if (self.live_capture) self.loader.stopLiveCapture(self.io);
         try self.session.setFileSource(path);
@@ -2240,7 +2252,48 @@ pub const AppModel = struct {
                 self.dismissOverlays();
                 try self.commitFilter(filter, true);
             },
-            .iograph, .dns, .http, .compare => {
+            .comment_list => {
+                const index = self.help_overlay.selected;
+                if (index >= self.stat_filters.len) return;
+                const frame = std.fmt.parseInt(u32, self.stat_filters[index], 10) catch return;
+                self.dismissOverlays();
+                if (self.selectFrame(frame)) {
+                    self.syncFromSession();
+                    try self.loadDetailForSelection();
+                } else {
+                    const message = try std.fmt.allocPrint(self.allocator, "Frame {d} is not in the list", .{frame});
+                    defer self.allocator.free(message);
+                    try self.showMessage(message);
+                }
+            },
+            .compare => {
+                const index = self.help_overlay.selected;
+                if (index >= self.stat_filters.len) return;
+                const spec = self.stat_filters[index];
+                if (std.mem.startsWith(u8, spec, "other\t")) {
+                    const rest = spec["other\t".len..];
+                    const tab = std.mem.indexOfScalar(u8, rest, '\t') orelse return;
+                    const frame = std.fmt.parseInt(u32, rest[0..tab], 10) catch return;
+                    const path = try self.allocator.dupe(u8, rest[tab + 1 ..]);
+                    defer self.allocator.free(path);
+                    self.dismissOverlays();
+                    try self.openComparedCapture(path, frame);
+                    return;
+                }
+                const prefix = "frame.number == ";
+                if (!std.mem.startsWith(u8, spec, prefix)) return;
+                const frame = std.fmt.parseInt(u32, spec[prefix.len..], 10) catch return;
+                self.dismissOverlays();
+                if (self.selectFrame(frame)) {
+                    self.syncFromSession();
+                    try self.loadDetailForSelection();
+                } else {
+                    const message = try std.fmt.allocPrint(self.allocator, "Frame {d} is not in the list", .{frame});
+                    defer self.allocator.free(message);
+                    try self.showMessage(message);
+                }
+            },
+            .iograph, .dns, .http => {
                 const index = self.help_overlay.selected;
                 if (index >= self.stat_filters.len) return;
                 if (self.stat_filters[index].len == 0) {
@@ -2280,52 +2333,40 @@ pub const AppModel = struct {
     }
 
     fn runMenuChoice(self: *AppModel, index: usize) !void {
-        if (self.menu_analysis) {
-            switch (index) {
-                0 => try self.openFieldFilter(),
-                1 => self.openGoto(),
-                2 => {
-                    self.dismissOverlays();
-                    try self.runCommand("streams", "");
-                },
-                3 => {
-                    self.dismissOverlays();
-                    try self.runCommand("convs", "");
-                },
-                4 => {
-                    self.dismissOverlays();
-                    try self.runCommand("capinfo", "");
-                },
-                5 => {
-                    self.dismissOverlays();
-                    try self.runCommand("expert", "");
-                },
-                6 => {
-                    self.dismissOverlays();
-                    try self.runCommand("hierarchy", "");
-                },
-                7 => {
-                    self.dismissOverlays();
-                    try self.runCommand("endpoints", "");
-                },
-                8 => {
-                    self.dismissOverlays();
-                    try self.command.setText("export ");
-                    self.command.visible = true;
-                },
-                else => {},
-            }
+        const body = if (self.menu_analysis) header_bar.analysis_menu else header_bar.misc_menu;
+        const row = menuRow(body, index) orelse return;
+        try self.runMenuRow(row);
+    }
+
+    fn menuRow(body: []const u8, index: usize) ?[]const u8 {
+        var cursor: usize = 0;
+        var lines = std.mem.splitScalar(u8, body, '\n');
+        while (lines.next()) |line| {
+            if (cursor == index) return line;
+            cursor += 1;
+        }
+        return null;
+    }
+
+    /// Menu text is the command. `=` is the field filter. `export` only fills
+    /// the palette and waits for a path.
+    fn runMenuRow(self: *AppModel, row: []const u8) !void {
+        const trimmed = std.mem.trim(u8, row, " \t");
+        if (std.mem.eql(u8, trimmed, "=")) {
+            try self.openFieldFilter();
             return;
         }
-        self.dismissOverlays();
-        switch (index) {
-            0 => try self.runCommand("columns", ""),
-            1 => try self.runCommand("theme", ""),
-            2 => try self.runCommand("profile", ""),
-            3 => try self.runCommand("marks", ""),
-            4 => try self.runCommand("tail", ""),
-            else => {},
+        if (std.mem.eql(u8, trimmed, "export")) {
+            self.dismissOverlays();
+            try self.command.setText("export ");
+            self.command.visible = true;
+            return;
         }
+        const split = std.mem.indexOfScalar(u8, trimmed, ' ');
+        const cmd = if (split) |at| trimmed[0..at] else trimmed;
+        const args = if (split) |at| std.mem.trim(u8, trimmed[at + 1 ..], " \t") else "";
+        self.dismissOverlays();
+        try self.runCommand(cmd, args);
     }
 
     pub fn showThemeList(self: *AppModel) !void {

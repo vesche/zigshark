@@ -124,6 +124,15 @@ fn scriptedRun(
     };
 }
 
+fn commentListReply(allocator: std.mem.Allocator) ![]u8 {
+    var body: std.ArrayList(u8) = .empty;
+    errdefer body.deinit(allocator);
+    try body.appendSlice(allocator, "4\thello\n9\t\n12\tnote two\n");
+    var extra: usize = 0;
+    while (extra < 199) : (extra += 1) try body.appendSlice(allocator, "4\tagain\n");
+    return try body.toOwnedSlice(allocator);
+}
+
 fn argvHas(argv: []const []const u8, needle: []const u8) bool {
     for (argv) |arg| if (std.mem.eql(u8, arg, needle)) return true;
     return false;
@@ -132,10 +141,11 @@ fn argvHas(argv: []const []const u8, needle: []const u8) bool {
 fn replyFor(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
     if (argvHas(argv, "dns.qry.name")) return allocator.dupe(u8, "4\texample.com\t0\n");
     if (argvHas(argv, "http.request.method")) return allocator.dupe(u8, "7\tM-SEARCH\t\t*\t\n");
+    if (argvHas(argv, "frame.number") and argvHas(argv, "frame.comment")) return commentListReply(allocator);
     if (argvHas(argv, "frame.comment")) return allocator.dupe(u8, "saved note\n");
     if (argvHas(argv, "ip.src")) {
         for (argv) |item| if (std.mem.indexOf(u8, item, "other.pcap") != null) {
-            return allocator.dupe(u8, "9\t10.0.0.9\t10.0.0.8\t\t\t53\t\t40\n");
+            return allocator.dupe(u8, "9\t10.9.9.9\t10.8.8.8\t9\t\t\t99\n");
         };
         return allocator.dupe(u8, "1\t10.0.0.1\t10.0.0.2\t80\t\t\t\t60\n2\t10.0.0.9\t10.0.0.8\t\t\t53\t\t40\n");
     }
@@ -1070,10 +1080,41 @@ test "io graph, dns, http, and compare apply a filter from the selected row" {
     try h.app.activatePick();
     try std.testing.expectEqualStrings("http.request.method == \"M-SEARCH\"", h.app.session.display_filter);
 
+    try h.setFrames(&.{ 1, 2 });
     try h.app.runCommand("compare", "other.pcap");
     try std.testing.expect(std.mem.indexOf(u8, h.app.help_overlay.body, "only here") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h.app.help_overlay.body, "only there") != null);
+    const kept = try h.allocator.dupe(u8, h.app.session.display_filter);
+    defer h.allocator.free(kept);
     try h.app.activatePick();
-    try std.testing.expectEqualStrings("frame.number == 1", h.app.session.display_filter);
+    try std.testing.expectEqual(@as(?u32, 1), h.app.session.selectedFrame());
+    try std.testing.expectEqualStrings(kept, h.app.session.display_filter);
+
+    try h.app.runCommand("compare", "other.pcap");
+    h.app.help_overlay.selected = compareLine(h.app.help_overlay.body, "only there");
+    const current = h.app.capturePath() orelse return error.NoCaptureFile;
+    try h.app.activatePick();
+    try std.testing.expectEqualStrings(kept, h.app.session.display_filter);
+    switch (h.app.session.source) {
+        .file => |path| try std.testing.expectEqualStrings("other.pcap", path),
+        else => return error.UnexpectedSource,
+    }
+    try std.testing.expectEqual(@as(?u32, 9), h.app.pending_global_frame);
+    var reopened = false;
+    for (h.app.config.recent_files.items) |file| {
+        if (std.mem.eql(u8, file, current)) reopened = true;
+    }
+    try std.testing.expect(reopened);
+}
+
+fn compareLine(body: []const u8, needle: []const u8) usize {
+    var index: usize = 0;
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, needle) != null) return index;
+        index += 1;
+    }
+    return 0;
 }
 
 test "color rules, packet comments, and lua scripts" {
@@ -1092,6 +1133,23 @@ test "color rules, packet comments, and lua scripts" {
     try h.app.runCommand("comment", "hello");
     try std.testing.expect(h.script.saw("-a"));
     try std.testing.expect(h.script.saw("7:hello"));
+
+    try h.app.runCommand("comment", "list");
+    try std.testing.expect(h.script.saw("frame.number"));
+    try std.testing.expect(std.mem.indexOf(u8, h.app.help_overlay.body, "4  hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h.app.help_overlay.body, "12  note two") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h.app.help_overlay.body, "9  ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, h.app.help_overlay.body, "Stopped after 200 rows") != null);
+    try h.setFrames(&.{4});
+    try h.app.activatePick();
+    try std.testing.expectEqual(@as(?u32, 4), h.app.session.selectedFrame());
+    try std.testing.expectEqual(@as(usize, 0), h.app.session.display_filter.len);
+
+    try h.app.runCommand("comment", "list");
+    h.app.help_overlay.selected = 1;
+    try h.app.activatePick();
+    try std.testing.expect(std.mem.indexOf(u8, h.app.msg_overlay.body, "not in the list") != null);
+    try std.testing.expectEqual(@as(usize, 0), h.app.session.display_filter.len);
 
     try h.app.runCommand("lua", "script.lua");
     try std.testing.expect(h.script.saw("lua_script:script.lua"));
@@ -1270,6 +1328,43 @@ test "stop ends a live capture and names the saved file" {
     try std.testing.expect(std.mem.indexOf(u8, h.app.msg_overlay.body, "/tmp/keep.pcap") != null);
 }
 
+fn menuRowIndex(body: []const u8, row: []const u8) !usize {
+    var index: usize = 0;
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.eql(u8, line, row)) return index;
+        index += 1;
+    }
+    return error.MissingMenuRow;
+}
+
+test "an analysis menu row runs the same command" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    try h.app.runCommand("hierarchy", "");
+    const expected = try h.allocator.dupe(u8, h.app.help_overlay.body);
+    defer h.allocator.free(expected);
+    h.app.dismissOverlays();
+
+    h.app.header_menu = .analysis;
+    h.app.menu_analysis = true;
+    const activate = h.app.dropdown.on_activate orelse return error.MissingMenu;
+    const hierarchy = try menuRowIndex(zigshark.ui.widgets.header_bar.analysis_menu, "hierarchy");
+    activate(h.app.dropdown.userdata, hierarchy);
+    try std.testing.expectEqualStrings(expected, h.app.help_overlay.body);
+
+    h.app.header_menu = .analysis;
+    h.app.menu_analysis = true;
+    const export_row = try menuRowIndex(zigshark.ui.widgets.header_bar.analysis_menu, "export");
+    activate(h.app.dropdown.userdata, export_row);
+    try std.testing.expect(h.app.command.visible);
+    const palette = try zigshark.ui.widgets.filter_bar.fieldText(h.allocator, &h.app.command.field);
+    defer h.allocator.free(palette);
+    try std.testing.expectEqualStrings("export ", palette);
+    try std.testing.expect(std.mem.indexOf(u8, zigshark.ui.widgets.header_bar.analysis_menu, "comment list") != null);
+}
+
 test "a failed analysis menu item is shown" {
     var h: Harness = undefined;
     try h.setup();
@@ -1315,6 +1410,38 @@ test "stream diagram selects the frame and f filters the list" {
     try h.app.runCommand("streams", "filter");
     try std.testing.expectEqualStrings("tcp.stream == 2", h.app.session.display_filter);
     try std.testing.expect(!h.script.saw("frame contains"));
+}
+
+test "quit destroys a sleeping wormhole job" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/sleep-wormhole", .{tmp.sub_path[0..]});
+    defer allocator.free(path);
+    const script =
+        \\#!/bin/sh
+        \\printf started > "$0.started"
+        \\exec sleep 8
+    ;
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = script,
+        .flags = .{ .permissions = @fromBackingInt(@intCast(0o755)) },
+    });
+
+    const job = try zigshark.features.transfer.Job.startArgv(allocator, io, &.{path});
+    var destroyed = false;
+    errdefer if (!destroyed) job.destroy();
+    const started = try std.fmt.allocPrint(allocator, "{s}.started", .{path});
+    defer allocator.free(started);
+    try waitForFile(io, started);
+
+    const before = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    job.destroy();
+    destroyed = true;
+    const elapsed = std.Io.Timestamp.now(io, .awake).nanoseconds - before;
+    if (elapsed >= 3 * std.time.ns_per_s) return error.QuitWaitedOnWormhole;
 }
 
 test "quit kills a running field dump" {

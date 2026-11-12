@@ -1,10 +1,12 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const zigshark = @import("zigshark");
 const packet = zigshark.model.packet;
 const session_mod = zigshark.model.session;
 const search = zigshark.model.search;
 const marks = zigshark.model.marks;
 const process = zigshark.shark.process;
+const loader_mod = zigshark.model.loader;
 
 fn summary(frame: u32, columns: [][]const u8) packet.PacketSummary {
     return .{ .frame = frame, .columns = columns, .owns_columns = false };
@@ -191,6 +193,172 @@ test "cancelling a live child does not panic when it has already exited" {
         token.cancel(io);
         thread.join();
     }
+}
+
+test "one detail window runs pdml and hex together and fills the cache" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tool = try fakeTsharkPath(allocator);
+    defer allocator.free(tool);
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/bothwait.pcap", .{tmp.sub_path[0..]});
+    defer allocator.free(path);
+
+    var tools = try testingTools(allocator, tool);
+    defer tools.deinit();
+    var loader = loader_mod.CaptureLoader.init(allocator, io, &tools, .{});
+    defer {
+        joinWorkers(&loader);
+        loader.deinit(io);
+    }
+    var session = session_mod.Session.init(allocator, .{ .file = path });
+    defer session.deinit();
+
+    try loader.requestDetail(&session, 2);
+    const pdml_started = try std.fmt.allocPrint(allocator, "{s}.pdml.started", .{path});
+    defer allocator.free(pdml_started);
+    const hex_started = try std.fmt.allocPrint(allocator, "{s}.hex.started", .{path});
+    defer allocator.free(hex_started);
+    try waitForPath(io, pdml_started);
+    try waitForPath(io, hex_started);
+    try expectMissing(io, try marker(allocator, path, ".pdml.finished"));
+    try expectMissing(io, try marker(allocator, path, ".hex.finished"));
+
+    const release = try std.fmt.allocPrint(allocator, "{s}.release", .{path});
+    defer allocator.free(release);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = release, .data = "go\n" });
+    joinWorkers(&loader);
+
+    const cached = loader.detail_cache.get(io, 2) orelse return error.MissingBundle;
+    try std.testing.expectEqual(@as(u32, 2), cached.pdml.frame);
+    const events = try loader.drainEvents();
+    defer allocator.free(events);
+    switch (events[0]) {
+        .detail_loaded => |bundle| try std.testing.expectEqual(@as(u32, 2), bundle.pdml.frame),
+        else => return error.UnexpectedEvent,
+    }
+    for (events) |*event| event.deinit(allocator);
+}
+
+test "a second detail selection cancels the first window" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tool = try fakeTsharkPath(allocator);
+    defer allocator.free(tool);
+    const slow_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/bothsleep.pcap", .{tmp.sub_path[0..]});
+    defer allocator.free(slow_path);
+    const fast_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/bothfast.pcap", .{tmp.sub_path[0..]});
+    defer allocator.free(fast_path);
+
+    var tools = try testingTools(allocator, tool);
+    defer tools.deinit();
+    var loader = loader_mod.CaptureLoader.init(allocator, io, &tools, .{});
+    defer {
+        joinWorkers(&loader);
+        loader.deinit(io);
+    }
+    var session = session_mod.Session.init(allocator, .{ .file = slow_path });
+    defer session.deinit();
+
+    try loader.requestDetail(&session, 2);
+    const pdml_started = try std.fmt.allocPrint(allocator, "{s}.pdml.started", .{slow_path});
+    defer allocator.free(pdml_started);
+    const hex_started = try std.fmt.allocPrint(allocator, "{s}.hex.started", .{slow_path});
+    defer allocator.free(hex_started);
+    try waitForPath(io, pdml_started);
+    try waitForPath(io, hex_started);
+
+    const before = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    try session.setFileSource(fast_path);
+    try loader.requestDetail(&session, 7);
+    joinWorkers(&loader);
+    const after = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    try std.testing.expect(after - before < 3 * std.time.ns_per_s);
+    try expectMissing(io, try marker(allocator, slow_path, ".pdml.finished"));
+    try expectMissing(io, try marker(allocator, slow_path, ".hex.finished"));
+    try std.testing.expect(loader.detail_cache.get(io, 2) == null);
+    const kept = loader.detail_cache.get(io, 7) orelse return error.MissingBundle;
+    try std.testing.expectEqual(@as(u32, 7), kept.pdml.frame);
+}
+
+test "quit cancels a sleeping detail load" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tool = try fakeTsharkPath(allocator);
+    defer allocator.free(tool);
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/bothsleep.pcap", .{tmp.sub_path[0..]});
+    defer allocator.free(path);
+
+    var tools = try testingTools(allocator, tool);
+    defer tools.deinit();
+    var loader = loader_mod.CaptureLoader.init(allocator, io, &tools, .{});
+    errdefer loader.deinit(io);
+    var session = session_mod.Session.init(allocator, .{ .file = path });
+    defer session.deinit();
+
+    try loader.requestDetail(&session, 2);
+    const pdml_started = try std.fmt.allocPrint(allocator, "{s}.pdml.started", .{path});
+    defer allocator.free(pdml_started);
+    const hex_started = try std.fmt.allocPrint(allocator, "{s}.hex.started", .{path});
+    defer allocator.free(hex_started);
+    try waitForPath(io, pdml_started);
+    try waitForPath(io, hex_started);
+
+    const before = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    loader.deinit(io);
+    const elapsed = std.Io.Timestamp.now(io, .awake).nanoseconds - before;
+    if (elapsed >= 3 * std.time.ns_per_s) return error.QuitWaitedOnTshark;
+    try expectMissing(io, try marker(allocator, path, ".pdml.finished"));
+    try expectMissing(io, try marker(allocator, path, ".hex.finished"));
+}
+
+fn marker(allocator: std.mem.Allocator, path: []const u8, suffix: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ path, suffix });
+}
+
+fn expectMissing(io: std.Io, path: []u8) !void {
+    const allocator = std.testing.allocator;
+    defer allocator.free(path);
+    if (std.Io.Dir.cwd().access(io, path, .{})) |_| return error.ChildWasNotCancelled else |_| {}
+}
+
+fn fakeTsharkPath(allocator: std.mem.Allocator) ![]u8 {
+    const name = if (builtin.os.tag == .windows) "fake-tshark.exe" else "fake-tshark";
+    return std.fmt.allocPrint(allocator, "zig-out/bin/{s}", .{name});
+}
+
+fn waitForPath(io: std.Io, path: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    var spins: usize = 0;
+    while (spins < 150) : (spins += 1) {
+        if (cwd.access(io, path, .{})) |_| return else |_| {
+            try std.Io.sleep(io, .fromMilliseconds(20), .awake);
+        }
+    }
+    return error.TimedOut;
+}
+
+fn joinWorkers(loader: *loader_mod.CaptureLoader) void {
+    loader.joinWorkers();
+}
+
+fn testingTools(allocator: std.mem.Allocator, tshark: []const u8) !zigshark.shark.tools.Tools {
+    return .{
+        .allocator = allocator,
+        .tshark = try allocator.dupe(u8, tshark),
+        .dumpcap = try allocator.dupe(u8, "dumpcap"),
+        .capinfos = try allocator.dupe(u8, "capinfos"),
+        .tshark_version = try allocator.dupe(u8, "0.0.0"),
+        .dumpcap_version = try allocator.dupe(u8, "0"),
+        .capinfos_version = try allocator.dupe(u8, "0"),
+        .supports_color = false,
+        .dumpcap_can_capture = false,
+    };
 }
 
 test "lru get refreshes a key and remove returns the value" {

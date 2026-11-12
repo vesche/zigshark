@@ -67,106 +67,7 @@ Leave these alone unless a failing test forces a change: the PSML, PDML, and hex
 
 Items are in rank order. Take the first one.
 
-### R-01 Overlap the two detail tshark runs
-
-- Status: ready
-- Outcome: Choosing an uncached frame no longer waits for the PDML process to exit before the hex process starts. The detail log still reports one total and the pdml, hex, and parse parts.
-- Why first: Every cache miss pays two process startups, one after the other, in `runDetailWorker`. That is the wait on the hottest path. The log already includes both runs, so this is not a guess.
-- Touch: `src/model/loader.zig`, `src/shark/process.zig` only if argv must change, `tests/model_suite.zig`
-- Done when:
-  - PDML and hex for the same frame window run at the same time, or in one tshark invocation if that invocation's stdout is still the PDML and hex the current parsers accept.
-  - Both children, or the single child, use the detail `cancel_token`. A newer selection cancels the in-flight window and its result is not cached.
-  - The log line is still `frame N loaded in M ms (pdml A ms, hex B ms, parse C ms)`. The total starts before the dissection work and ends after the parse.
-  - A test shows a second selection cancels the first window, and a test shows one window still fills the detail cache for the requested frame.
-- Do not: Change `parsePdmlPackets` or `parseHexdumpPackets`. Do not switch the detail format to JSON. Do not cache the unfiltered packet list.
-
-### R-02 Join loader threads when they finish
-
-- Status: ready
-- Outcome: A finished list or detail thread is joined and dropped while the session continues. Quit cancels work that is still running and joins only that work.
-- Why here: `CaptureLoader.workers` keeps every thread until `deinit`. A long session of selections holds a thread handle per selection. Quit then joins the whole history. R-01 adds more concurrent children, so the leak gets worse if this stays.
-- Touch: `src/model/loader.zig`, `tests/model_suite.zig`
-- Done when:
-  - After a list or detail worker returns, its thread has been joined and is no longer in `workers`.
-  - `deinit` cancels the list and detail tokens, then joins only threads that have not been reaped yet.
-  - A test with a child that exits immediately shows the handle is gone before the next request returns.
-  - A test with a child that would sleep past the test shows `deinit` returns because the child was killed, not because the test waited out the sleep.
-- Do not: Change PSML streaming, the packet array, or the cancel-token rules. Do not start R-01's overlap design here if R-01 is already done; call the existing worker.
-
-### R-03 List packets that have a comment
-
-- Status: ready
-- Outcome: A person can see every commented frame and press Enter to select one, without opening each packet.
-- Why here: `:comment` reads and writes a single frame. Finding the other comments is a reason to open Wireshark. The read and write paths already exist.
-- Touch: `src/ui/views/analysis.zig`, `src/ui/commands.zig`, `src/ui/views/help.zig`, `docs/user-guide.md`, `tests/app_suite.zig`, `src/shark/process.zig` only if a new argv helper is required
-- Done when:
-  - `:comment` with no text still shows the selected frame's `frame.comment`. `:comment <text>` still writes with editcap to a new `<file>.commented.pcapng` and opens that file. The original file stays in place.
-  - `:comment list` shows frames whose `frame.comment` is non-empty: frame number and the comment text, one line each. The list stops at 200 rows or 1 MiB and the overlay says so.
-  - Enter selects that frame and does not change the display filter. A frame that is not in the current list is a message, not a filter change.
-  - A headless test supplies tshark stdout through the scripted runner. It does not need a real editcap or a real capture.
-  - The user-guide and the in-app help name `:comment list`.
-- Do not: Add a menu arm inside `runMenuChoice`. R-04 attaches commands to the menu. Do not open each packet in the UI to hunt for comments.
-
-### R-04 Menu rows name commands
-
-- Status: ready
-- Outcome: A header menu row runs a command that already exists. Adding an analysis command does not require a second switch.
-- Why here: `runMenuChoice` is a parallel switch beside `commands.zig`. R-03 must not grow that switch. This item removes it before the next analysis command.
-- Touch: `src/ui/app.zig`, `src/ui/commands.zig`, `src/ui/widgets/header_bar.zig`, `tests/app_suite.zig`
-- Done when:
-  - Analysis and Misc menu rows are command names resolved through `runCommand`, except the rows that are not commands today: field filter (`=`) and the export palette prefill.
-  - Export still only fills the palette with `export ` and waits for a path. It does not gain a menu implementation of its own.
-  - `:comment list` is a menu row if R-03 is done. If R-03 is not done, do not invent the comment list here.
-  - A test activates an analysis menu row and observes the same outcome as the command.
-- Do not: Add a menu row for every command. Do not move filter reload or the cancel tokens. Do not redesign the header.
-
-### R-05 Lock quit against the remaining children
-
-- Status: ready
-- Outcome: Quitting while a detail load or a wormhole job is in flight returns because those children were cancelled, and tests keep it that way.
-- Why here: Field-dump cancel, filter-check cancel, and the held PSML child are already tested. Detail children and wormhole are the quit paths still untested. R-01 and R-02 change the loader, so the tests belong after them.
-- Touch: `tests/app_suite.zig`, `tests/model_suite.zig`, and the cancel call site only if a test proves quit still waits
-- Done when:
-  - A test starts a detail child that would sleep, cancels it the way quit does, and returns well before that sleep ends.
-  - A test starts a wormhole job with a stand-in that would sleep, destroys or cancels it the way `AppModel.deinit` does, and returns well before that sleep ends. No network.
-  - Existing field-dump, filter-check, and PSML-hold tests still pass.
-- Do not: Rewrite `deinit`. Do not add a new cancellation mechanism if the current tokens already kill the child.
-
-### R-06 PTY script covers the tree, the hex pane, and ZZ
-
-- Status: ready
-- Outcome: Linux CI drives the fixture through the protocol tree and the hex pane, then quits with `ZZ`.
-- Why here: `tests/pty_smoke.py` already renders the fixture, searches, opens `:capinfo`, checks copy-mode Ctrl-C, and checks a clean Ctrl-C. It does not expand the tree, move in hex, or quit with `ZZ`. Headless tests do not see vaxis.
-- Touch: `tests/pty_smoke.py`, `.github/workflows/ci.yml` only if the script is not already the Linux step
-- Done when:
-  - The script opens `tests/fixtures/1.pcap`, focuses the tree, expands a node, moves in the hex view, and quits with `ZZ`.
-  - Assertions use the terminal model already in that file. They do not search the raw PTY byte stream for pane text.
-  - The script stays Linux-only, next to the existing smoke test, and CI runs it on Linux.
-- Do not: Add a second PTY harness. Do not assert colors or timing.
-
-### R-07 Compare can open the other capture
-
-- Status: ready
-- Outcome: An identity that exists only in the other file can be opened, instead of stopping at "only in the other capture".
-- Why here: `:compare` can select a frame only when it is in the file already open. This is a real gap, and it is a second dissection of both files, so it waits until R-01 has made a detail load cheaper.
-- Touch: `src/ui/views/analysis.zig`, `src/ui/commands.zig`, `docs/user-guide.md`, `src/ui/views/help.zig`, `tests/app_suite.zig`
-- Done when:
-  - Enter on a row that exists only in the other file opens that file and selects the frame. The current file is left as the previous capture the user can reopen, or the message names the path if opening fails.
-  - Enter on a row in the current file still selects that frame and does not change the display filter.
-  - A headless test covers both rows with the scripted runner. It does not dissect two real files.
-- Do not: Dissect both files a second time for the packet list. Do not cache a full second PSML table.
-
-### R-08 Windows CI installs tshark
-
-- Status: ready
-- Outcome: `tests/integration_tools.zig` runs on Windows CI instead of skipping for a missing tshark.
-- Why here: Linux CI installs tshark. macOS tries Homebrew and ignores failure. Windows skips the integration tests. This is confidence, not a session workflow, so it ranks last among Ready.
-- Touch: `.github/workflows/ci.yml`
-- Done when:
-  - The Windows job installs tshark, or Wireshark's tshark, non-interactively.
-  - `zig build test` on that job does not skip `tests/integration_tools.zig` for a missing binary.
-  - If the image cannot install tshark, move this item to Blocked with the exact error and the command that failed. Do not leave a red CI hack in the workflow.
-- Do not: Change the tests to pass without tshark. Do not fail the macOS job when Homebrew fails.
+None.
 
 ## Blocked
 
@@ -225,6 +126,38 @@ These are not Ready items. If one happens twice in a session, add a Ready item. 
 ## Done
 
 Newest first. One short entry. Do not move these back to Ready.
+
+### 2026-11-12 — Windows CI installs tshark
+
+The Windows job installs Wireshark with winget, non-interactively, and adds `C:\Program Files\Wireshark` to PATH before `zig build test`. The install step fails if `tshark.exe` is missing, so the integration tests are not skipped for a missing binary. The macOS Homebrew failure is still ignored. Verified with `zig build` and `zig build test` on this Linux host. The Windows runner itself was not executed here.
+
+### 2026-11-12 — Compare can open the other capture
+
+Enter on a row in the current file selects that frame and leaves the display filter unchanged. Enter on a row that exists only in the other file opens that file, selects its frame when the list loads, and keeps the previous file in recent files. If opening fails, the message names the path. Verified with `zig build` and `zig build test`.
+
+### 2026-11-12 — PTY script covers the tree, hex, and ZZ
+
+The Linux smoke test focuses the protocol tree, expands a node, moves in the hex pane, and quits with `ZZ`. Assertions use the terminal model. CI already runs the script on Linux. Verified with `python3 tests/pty_smoke.py`, `zig build`, and `zig build test`.
+
+### 2026-11-12 — Quit cancels detail and wormhole
+
+Quitting cancels a sleeping detail load through the loader, and `AppModel.deinit` destroys a wormhole job by killing that child. Neither path waits out the sleep. Field-dump, filter-check, and held-PSML quit tests still pass. Verified with `zig build` and `zig build test`.
+
+### 2026-11-12 — Menu rows name commands
+
+Analysis and Misc menu rows are command names passed to `runCommand`. `=` still opens the field filter, and `export` still only fills the palette with `export `. `:comment list` is a menu row. Verified with `zig build` and `zig build test`.
+
+### 2026-11-12 — List packets that have a comment
+
+`:comment` still reads `frame.comment` on the selected frame, and `:comment <text>` still writes it with editcap to a new `.commented.pcapng`. `:comment list` lists commented frames (200 rows or 1 MiB) and Enter selects one without changing the display filter. Verified with `zig build` and `zig build test`.
+
+### 2026-11-12 — Join loader threads when they finish
+
+A finished list or detail thread is joined and dropped on the next request or when events are drained. Quit cancels work that is still running and joins only that work. Verified with `zig build` and `zig build test`.
+
+### 2026-11-12 — Overlap the two detail tshark runs
+
+Choosing an uncached frame starts the PDML and hex tshark processes together. Both use the detail cancel token, so a newer selection drops the in-flight window instead of caching it. The log line is still `frame N loaded in M ms (pdml A ms, hex B ms, parse C ms)`. Verified with `zig build` and `zig build test`.
 
 ### 2026-11-12 — File-wide expert info
 

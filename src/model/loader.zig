@@ -64,6 +64,13 @@ const DetailTask = struct {
     generation: u64,
 };
 
+/// One list or detail thread. `done` is set when the worker function returns.
+/// The handle stays until a later request, `drainEvents`, or `deinit` joins it.
+const LoaderThread = struct {
+    thread: std.Thread = undefined,
+    done: std.atomic.Value(bool) = .init(false),
+};
+
 pub const CaptureLoader = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -72,7 +79,7 @@ pub const CaptureLoader = struct {
     detail_cache: lru_mod.Lru(u32, packet.DetailBundle),
     events: std.ArrayList(Event),
     event_mutex: std.Io.Mutex = .init,
-    workers: std.ArrayList(std.Thread) = .empty,
+    workers: std.ArrayList(*LoaderThread) = .empty,
     list_generation: std.atomic.Value(u64) = .init(0),
     detail_generation: std.atomic.Value(u64) = .init(0),
     /// Packet-list reloads and detail loads must not cancel each other.
@@ -118,7 +125,7 @@ pub const CaptureLoader = struct {
         self.cancel_token.cancel(io);
         if (self.has_psml_argv) self.psml_argv.deinit(self.allocator);
         self.stopLiveCapture(io);
-        for (self.workers.items) |worker| worker.join();
+        self.joinWorkers();
         self.workers.deinit(self.allocator);
         self.detail_cache.deinit();
         for (self.events.items) |*ev| ev.deinit(self.allocator);
@@ -126,6 +133,7 @@ pub const CaptureLoader = struct {
     }
 
     pub fn drainEvents(self: *CaptureLoader) ![]Event {
+        self.reapFinished();
         self.event_mutex.lockUncancelable(self.io);
         defer self.event_mutex.unlock(self.io);
         return try self.events.toOwnedSlice(self.allocator);
@@ -151,6 +159,7 @@ pub const CaptureLoader = struct {
     }
 
     pub fn requestPsml(self: *CaptureLoader, session: *session_mod.Session) !void {
+        self.reapFinished();
         if (self.capture_active.load(.acquire) and !self.defer_spawn) {
             try self.startLiveList(session);
             return;
@@ -161,6 +170,7 @@ pub const CaptureLoader = struct {
     /// `after_frame` appends only packets newer than that frame. Live refresh
     /// uses it so a growing file is not dissected from the start again.
     pub fn requestPsmlNewerThan(self: *CaptureLoader, session: *session_mod.Session, after_frame: ?u32) !void {
+        self.reapFinished();
         const owned_filter = if (after_frame) |frame|
             try frameFloorFilter(self.allocator, session.display_filter, frame)
         else
@@ -200,11 +210,9 @@ pub const CaptureLoader = struct {
         };
         argv = .{};
         errdefer task.argv.deinit(self.allocator);
-        try self.workers.ensureUnusedCapacity(self.allocator, 1);
         _ = self.list_inflight.fetchAdd(1, .acq_rel);
         errdefer _ = self.list_inflight.fetchSub(1, .acq_rel);
-        const worker = try std.Thread.spawn(.{}, runPsmlWorker, .{task});
-        self.workers.appendAssumeCapacity(worker);
+        try self.spawnWorker(runTrackedPsml, task);
     }
 
     pub fn requestDetail(
@@ -212,6 +220,7 @@ pub const CaptureLoader = struct {
         session: *session_mod.Session,
         frame: u32,
     ) !void {
+        self.reapFinished();
         if (self.defer_spawn) return;
         const path = self.filePath(session) orelse return error.NoCaptureFile;
         session.loading = .loading_detail;
@@ -257,9 +266,7 @@ pub const CaptureLoader = struct {
             .frame = frame,
             .generation = generation,
         };
-        try self.workers.ensureUnusedCapacity(self.allocator, 1);
-        const worker = try std.Thread.spawn(.{}, runDetailWorker, .{task});
-        self.workers.appendAssumeCapacity(worker);
+        try self.spawnWorker(runTrackedDetail, task);
     }
 
     fn filePath(_: *const CaptureLoader, session: *const session_mod.Session) ?[]const u8 {
@@ -321,21 +328,23 @@ pub const CaptureLoader = struct {
         defer hex_argv.deinit(self.allocator);
         try appendDissectionOptions(self.allocator, &hex_argv, session, self.config.tshark_args);
 
-        const started = std.Io.Timestamp.now(io, .awake).nanoseconds;
-        var pdml_out = try process.runCapture(self.allocator, io, pdml_argv.slice());
-        defer pdml_out.deinit(self.allocator);
-        const pdml_done = std.Io.Timestamp.now(io, .awake).nanoseconds;
-        var hex_out = try process.runCapture(self.allocator, io, hex_argv.slice());
-        defer hex_out.deinit(self.allocator);
-        const hex_done = std.Io.Timestamp.now(io, .awake).nanoseconds;
+        var captured = captureDetailWindow(self, io, pdml_argv.slice(), hex_argv.slice()) catch |err| {
+            if (err == error.Cancelled or self.cancel_token.isCancelled()) return;
+            return err;
+        };
+        defer captured.deinit(self.allocator);
         if (self.cancel_token.isCancelled()) return;
-        if (!pdml_out.term.success()) {
-            try self.pushEvent(.{ .error_msg = try self.allocator.dupe(u8, pdml_out.stderr) });
+        if (!captured.pdml.term.success()) {
+            try self.pushEvent(.{ .error_msg = try self.allocator.dupe(u8, captured.pdml.stderr) });
+            return;
+        }
+        if (!captured.hex.term.success()) {
+            try self.pushEvent(.{ .error_msg = try self.allocator.dupe(u8, captured.hex.stderr) });
             return;
         }
 
-        try ingestDetail(self, pdml_out.stdout, hex_out.stdout, frame, null);
-        logDetailLoad(io, frame, started, pdml_done, hex_done);
+        try ingestDetail(self, captured.pdml.stdout, captured.hex.stdout, frame, null);
+        logDetailLoad(io, frame, captured.started_ns, captured.pdml_done_ns, captured.hex_done_ns);
         @constCast(session).loading = .idle;
     }
 
@@ -483,14 +492,46 @@ pub const CaptureLoader = struct {
             .generation = generation,
         };
         argv = .{};
-        try self.workers.ensureUnusedCapacity(self.allocator, 1);
         _ = self.list_inflight.fetchAdd(1, .acq_rel);
-        self.workers.appendAssumeCapacity(std.Thread.spawn(.{}, runLiveList, .{task}) catch |err| {
+        self.spawnWorker(runTrackedLiveList, task) catch |err| {
             _ = self.list_inflight.fetchSub(1, .acq_rel);
             task.argv.deinit(self.allocator);
             self.allocator.destroy(task);
             return err;
-        });
+        };
+    }
+
+    /// Join threads whose worker functions have returned. In-flight work stays
+    /// in `workers` so quit can still cancel it.
+    fn reapFinished(self: *CaptureLoader) void {
+        var index: usize = 0;
+        while (index < self.workers.items.len) {
+            const tracked = self.workers.items[index];
+            if (!tracked.done.load(.acquire)) {
+                index += 1;
+                continue;
+            }
+            tracked.thread.join();
+            self.allocator.destroy(tracked);
+            _ = self.workers.swapRemove(index);
+        }
+    }
+
+    pub fn joinWorkers(self: *CaptureLoader) void {
+        while (self.workers.pop()) |tracked| {
+            tracked.thread.join();
+            self.allocator.destroy(tracked);
+        }
+    }
+
+    fn spawnWorker(self: *CaptureLoader, comptime func: anytype, task: anytype) !void {
+        self.reapFinished();
+        try self.workers.ensureUnusedCapacity(self.allocator, 1);
+        const tracked = try self.allocator.create(LoaderThread);
+        errdefer self.allocator.destroy(tracked);
+        tracked.* = .{};
+        tracked.thread = try std.Thread.spawn(.{}, func, .{ task, tracked });
+        self.workers.appendAssumeCapacity(tracked);
     }
 };
 
@@ -805,6 +846,21 @@ pub fn liveReloadDue(in_flight: bool, size: u64, synced: u64) bool {
     return !in_flight and size != 0 and size != synced;
 }
 
+fn runTrackedPsml(task: *PsmlTask, tracked: *LoaderThread) void {
+    defer tracked.done.store(true, .release);
+    runPsmlWorker(task);
+}
+
+fn runTrackedDetail(task: *DetailTask, tracked: *LoaderThread) void {
+    defer tracked.done.store(true, .release);
+    runDetailWorker(task);
+}
+
+fn runTrackedLiveList(task: *LiveListTask, tracked: *LoaderThread) void {
+    defer tracked.done.store(true, .release);
+    runLiveList(task);
+}
+
 fn runPsmlWorker(task: *PsmlTask) void {
     const loader = task.loader;
     defer {
@@ -973,52 +1029,127 @@ fn runDetailWorker(task: *DetailTask) void {
         loader.allocator.destroy(task);
     }
 
-    const started = std.Io.Timestamp.now(loader.io, .awake).nanoseconds;
-    var pdml_output = process.runCaptureCancellable(
-        loader.allocator,
-        loader.io,
-        task.pdml_argv.slice(),
-        &loader.cancel_token,
-    ) catch |err| {
+    var captured = captureDetailWindow(loader, loader.io, task.pdml_argv.slice(), task.hex_argv.slice()) catch |err| {
         if (err == error.Cancelled or task.generation != loader.detail_generation.load(.acquire)) return;
         emitWorkerError(loader, @errorName(err));
         return;
     };
-    defer pdml_output.deinit(loader.allocator);
-    if (!pdml_output.term.success()) {
-        emitWorkerError(loader, pdml_output.stderr);
-        return;
-    }
-    const pdml_done = std.Io.Timestamp.now(loader.io, .awake).nanoseconds;
-
-    var hex_output = process.runCaptureCancellable(
-        loader.allocator,
-        loader.io,
-        task.hex_argv.slice(),
-        &loader.cancel_token,
-    ) catch |err| {
-        if (err == error.Cancelled or task.generation != loader.detail_generation.load(.acquire)) return;
-        emitWorkerError(loader, @errorName(err));
-        return;
-    };
-    defer hex_output.deinit(loader.allocator);
-    if (!hex_output.term.success()) {
-        emitWorkerError(loader, hex_output.stderr);
-        return;
-    }
-    const hex_done = std.Io.Timestamp.now(loader.io, .awake).nanoseconds;
+    defer captured.deinit(loader.allocator);
     if (loader.cancel_token.isCancelled() or task.generation != loader.detail_generation.load(.acquire)) return;
+    if (!captured.pdml.term.success()) {
+        emitWorkerError(loader, captured.pdml.stderr);
+        return;
+    }
+    if (!captured.hex.term.success()) {
+        emitWorkerError(loader, captured.hex.stderr);
+        return;
+    }
 
-    ingestDetail(loader, pdml_output.stdout, hex_output.stdout, task.frame, task.generation) catch |err| {
+    ingestDetail(loader, captured.pdml.stdout, captured.hex.stdout, task.frame, task.generation) catch |err| {
         if (err == error.Cancelled or task.generation != loader.detail_generation.load(.acquire)) return;
         emitWorkerError(loader, @errorName(err));
         return;
     };
-    logDetailLoad(loader.io, task.frame, started, pdml_done, hex_done);
+    logDetailLoad(loader.io, task.frame, captured.started_ns, captured.pdml_done_ns, captured.hex_done_ns);
+}
+
+const DetailCapture = struct {
+    pdml: process.RunOutput,
+    hex: process.RunOutput,
+    started_ns: i96,
+    pdml_done_ns: i96,
+    hex_done_ns: i96,
+
+    fn deinit(self: *DetailCapture, allocator: std.mem.Allocator) void {
+        self.pdml.deinit(allocator);
+        self.hex.deinit(allocator);
+    }
+};
+
+const DetailSide = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    token: *process.CancellationToken,
+    output: ?process.RunOutput = null,
+    done_ns: i96 = 0,
+    err: ?anyerror = null,
+
+    fn run(self: *DetailSide) void {
+        const output = process.runCaptureCancellable(self.allocator, self.io, self.argv, self.token) catch |err| {
+            self.done_ns = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
+            self.err = err;
+            return;
+        };
+        self.done_ns = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
+        self.output = output;
+    }
+};
+
+/// PDML and hex for one frame window. Both children share `cancel_token`, so a
+/// newer selection kills the pair instead of waiting out the first process.
+fn captureDetailWindow(
+    self: *CaptureLoader,
+    io: std.Io,
+    pdml_argv: []const []const u8,
+    hex_argv: []const []const u8,
+) !DetailCapture {
+    const started_ns = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    var pdml_side = DetailSide{
+        .allocator = self.allocator,
+        .io = io,
+        .argv = pdml_argv,
+        .token = &self.cancel_token,
+    };
+    var hex_side = DetailSide{
+        .allocator = self.allocator,
+        .io = io,
+        .argv = hex_argv,
+        .token = &self.cancel_token,
+    };
+    const pdml_thread = try std.Thread.spawn(.{}, DetailSide.run, .{&pdml_side});
+    const hex_thread = std.Thread.spawn(.{}, DetailSide.run, .{&hex_side}) catch |err| {
+        pdml_thread.join();
+        if (pdml_side.output) |*output| output.deinit(self.allocator);
+        return err;
+    };
+    pdml_thread.join();
+    hex_thread.join();
+    errdefer if (pdml_side.output) |*output| output.deinit(self.allocator);
+    errdefer if (hex_side.output) |*output| output.deinit(self.allocator);
+
+    if (pdml_side.err) |err| return err;
+    if (hex_side.err) |err| return err;
+    return .{
+        .pdml = pdml_side.output orelse return error.Cancelled,
+        .hex = hex_side.output orelse return error.Cancelled,
+        .started_ns = started_ns,
+        .pdml_done_ns = pdml_side.done_ns,
+        .hex_done_ns = hex_side.done_ns,
+    };
 }
 
 fn elapsedMs(start_ns: i96, end_ns: i96) i96 {
     return @divTrunc(end_ns -| start_ns, std.time.ns_per_ms);
+}
+
+const DetailTiming = struct {
+    total_ms: i96,
+    pdml_ms: i96,
+    hex_ms: i96,
+    parse_ms: i96,
+};
+
+/// Each tshark duration is that process's own runtime. Parse starts once both
+/// have finished, which is not the same instant when the runs overlap.
+fn detailTiming(started_ns: i96, pdml_done_ns: i96, hex_done_ns: i96, parsed_ns: i96) DetailTiming {
+    const ready_ns = @max(pdml_done_ns, hex_done_ns);
+    return .{
+        .total_ms = elapsedMs(started_ns, parsed_ns),
+        .pdml_ms = elapsedMs(started_ns, pdml_done_ns),
+        .hex_ms = elapsedMs(started_ns, hex_done_ns),
+        .parse_ms = elapsedMs(ready_ns, parsed_ns),
+    };
 }
 
 fn detailLoadLine(buf: []u8, frame: u32, total_ms: i96, pdml_ms: i96, hex_ms: i96, parse_ms: i96) []const u8 {
@@ -1033,15 +1164,9 @@ fn detailLoadLine(buf: []u8, frame: u32, total_ms: i96, pdml_ms: i96, hex_ms: i9
 
 fn logDetailLoad(io: std.Io, frame: u32, started_ns: i96, pdml_done_ns: i96, hex_done_ns: i96) void {
     const done_ns = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    const timing = detailTiming(started_ns, pdml_done_ns, hex_done_ns, done_ns);
     var buf: [160]u8 = undefined;
-    const line = detailLoadLine(
-        &buf,
-        frame,
-        elapsedMs(started_ns, done_ns),
-        elapsedMs(started_ns, pdml_done_ns),
-        elapsedMs(pdml_done_ns, hex_done_ns),
-        elapsedMs(hex_done_ns, done_ns),
-    );
+    const line = detailLoadLine(&buf, frame, timing.total_ms, timing.pdml_ms, timing.hex_ms, timing.parse_ms);
     log_mod.info("detail", "{s}", .{line});
 }
 
@@ -1264,7 +1389,8 @@ test "asynchronous summary request returns owned event" {
 
     try loader.requestPsml(&session);
     const worker = loader.workers.pop().?;
-    worker.join();
+    worker.thread.join();
+    loader.allocator.destroy(worker);
     const events = try loader.drainEvents();
     defer allocator.free(events);
     var packets: usize = 0;
@@ -1297,9 +1423,6 @@ fn waitForPath(io: std.Io, path: []const u8) !void {
     return error.TimedOut;
 }
 
-fn joinWorkers(loader: *CaptureLoader) void {
-    while (loader.workers.pop()) |worker| worker.join();
-}
 
 fn testingTools(allocator: std.mem.Allocator, tshark: []const u8) !tools_mod.Tools {
     return .{
@@ -1354,7 +1477,7 @@ test "stale psml generation is dropped and a second request cancels the first ch
     defer tools.deinit();
     var loader = CaptureLoader.init(allocator, io, &tools, .{});
     defer {
-        joinWorkers(&loader);
+        loader.joinWorkers();
         loader.deinit(io);
     }
 
@@ -1369,7 +1492,7 @@ test "stale psml generation is dropped and a second request cancels the first ch
     const release = try std.fmt.allocPrint(allocator, "{s}.release", .{hold_path});
     defer allocator.free(release);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = release, .data = "go\n" });
-    joinWorkers(&loader);
+    loader.joinWorkers();
     try std.testing.expect(!loader.listInFlight());
     const dropped = try loader.drainEvents();
     defer {
@@ -1386,7 +1509,7 @@ test "stale psml generation is dropped and a second request cancels the first ch
     const before = std.Io.Timestamp.now(io, .awake).nanoseconds;
     try session.setFileSource(fast_path);
     try loader.requestPsml(&session);
-    joinWorkers(&loader);
+    loader.joinWorkers();
     const after = std.Io.Timestamp.now(io, .awake).nanoseconds;
     try std.testing.expect(after - before < 3 * std.time.ns_per_s);
     const finished = try std.fmt.allocPrint(allocator, "{s}.finished", .{slow_path});
@@ -1424,7 +1547,7 @@ test "a detail load does not cancel the packet list" {
     defer tools.deinit();
     var loader = CaptureLoader.init(allocator, io, &tools, .{});
     defer {
-        joinWorkers(&loader);
+        loader.joinWorkers();
         loader.deinit(io);
     }
 
@@ -1438,7 +1561,7 @@ test "a detail load does not cancel the packet list" {
     const release = try std.fmt.allocPrint(allocator, "{s}.release", .{hold_path});
     defer allocator.free(release);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = release, .data = "go\n" });
-    joinWorkers(&loader);
+    loader.joinWorkers();
 
     const events = try loader.drainEvents();
     defer {
@@ -1478,6 +1601,86 @@ test "deinit returns while a packet-list child is still held" {
     try std.testing.expect(after - before < 3 * std.time.ns_per_s);
 }
 
+test "a finished loader thread is joined before the next request returns" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tool = try fakeTsharkPath(allocator);
+    defer allocator.free(tool);
+    const list_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/quicklist.pcap", .{tmp.sub_path[0..]});
+    defer allocator.free(list_path);
+    const detail_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/bothfast.pcap", .{tmp.sub_path[0..]});
+    defer allocator.free(detail_path);
+
+    var tools = try testingTools(allocator, tool);
+    defer tools.deinit();
+    var loader = CaptureLoader.init(allocator, io, &tools, .{});
+    defer loader.deinit(io);
+    var session = session_mod.Session.init(allocator, .{ .file = list_path });
+    defer session.deinit();
+
+    try loader.requestPsml(&session);
+    try waitUntilWorkerDone(io, &loader);
+    try loader.detail_cache.put(io, 3, try ownedBundle(allocator, 3));
+    try loader.requestDetail(&session, 3);
+    try std.testing.expectEqual(@as(usize, 0), loader.workers.items.len);
+
+    try session.setFileSource(detail_path);
+    try loader.requestDetail(&session, 7);
+    try waitUntilWorkerDone(io, &loader);
+    try loader.requestDetail(&session, 7);
+    try std.testing.expectEqual(@as(usize, 0), loader.workers.items.len);
+}
+
+test "deinit returns while a detail child is still held" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tool = try fakeTsharkPath(allocator);
+    defer allocator.free(tool);
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/bothsleep.pcap", .{tmp.sub_path[0..]});
+    defer allocator.free(path);
+
+    var tools = try testingTools(allocator, tool);
+    defer tools.deinit();
+    var loader = CaptureLoader.init(allocator, io, &tools, .{});
+    errdefer loader.deinit(io);
+    var session = session_mod.Session.init(allocator, .{ .file = path });
+    defer session.deinit();
+
+    try loader.requestDetail(&session, 2);
+    const pdml_started = try std.fmt.allocPrint(allocator, "{s}.pdml.started", .{path});
+    defer allocator.free(pdml_started);
+    const hex_started = try std.fmt.allocPrint(allocator, "{s}.hex.started", .{path});
+    defer allocator.free(hex_started);
+    try waitForPath(io, pdml_started);
+    try waitForPath(io, hex_started);
+
+    const before = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    loader.deinit(io);
+    const after = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    try std.testing.expect(after - before < 3 * std.time.ns_per_s);
+    try expectNoMarker(io, allocator, path, ".pdml.finished");
+    try expectNoMarker(io, allocator, path, ".hex.finished");
+}
+
+fn waitUntilWorkerDone(io: std.Io, loader: *CaptureLoader) !void {
+    var spins: usize = 0;
+    while (spins < 100) : (spins += 1) {
+        if (loader.workers.items.len == 1 and loader.workers.items[0].done.load(.acquire)) return;
+        try std.Io.sleep(io, .fromMilliseconds(20), .awake);
+    }
+    return error.TimedOut;
+}
+
+fn expectNoMarker(io: std.Io, allocator: std.mem.Allocator, path: []const u8, suffix: []const u8) !void {
+    const marker = try std.fmt.allocPrint(allocator, "{s}{s}", .{ path, suffix });
+    defer allocator.free(marker);
+    if (std.Io.Dir.cwd().access(io, marker, .{})) |_| return error.ChildWasNotCancelled else |_| {}
+}
+
 test "detail cache eviction frees the bundle" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
@@ -1501,6 +1704,15 @@ test "detail timing line counts both tshark runs and the parse" {
         "frame 12 loaded in 41 ms (pdml 22 ms, hex 13 ms, parse 5 ms)",
         line,
     );
+}
+
+test "overlapped detail timing keeps each tshark run when hex finishes first" {
+    const ns = std.time.ns_per_ms;
+    const timing = detailTiming(1_000 * ns, 1_030 * ns, 1_010 * ns, 1_035 * ns);
+    try std.testing.expectEqual(@as(i96, 35), timing.total_ms);
+    try std.testing.expectEqual(@as(i96, 30), timing.pdml_ms);
+    try std.testing.expectEqual(@as(i96, 10), timing.hex_ms);
+    try std.testing.expectEqual(@as(i96, 5), timing.parse_ms);
 }
 
 test "detail window keeps the previous and next frame inside the cache" {
@@ -1594,7 +1806,7 @@ test "psml rows arrive before tshark exits and a later chunk appends" {
     defer tools.deinit();
     var loader = CaptureLoader.init(allocator, io, &tools, .{ .bundle_size = 1 });
     defer {
-        joinWorkers(&loader);
+        loader.joinWorkers();
         loader.deinit(io);
     }
     var session = session_mod.Session.init(allocator, .{ .file = capture_path });
@@ -1632,7 +1844,7 @@ test "psml rows arrive before tshark exits and a later chunk appends" {
     const release = try std.fmt.allocPrint(allocator, "{s}.release", .{capture_path});
     defer allocator.free(release);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = release, .data = "go\n" });
-    joinWorkers(&loader);
+    loader.joinWorkers();
     const rest = try loader.drainEvents();
     defer allocator.free(rest);
     var appended = false;

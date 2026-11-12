@@ -1,4 +1,5 @@
 const std = @import("std");
+const process = @import("../shark/process.zig");
 
 pub const TransferError = error{
     WormholeNotFound,
@@ -71,6 +72,7 @@ pub const Job = struct {
     log: std.ArrayList(u8) = .empty,
     finished: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
+    cancel: process.CancellationToken = .{},
 
     pub fn start(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !*Job {
         return startWith(allocator, io, path, .{});
@@ -96,7 +98,7 @@ pub const Job = struct {
         return startArgv(allocator, io, &.{ tool, "send", path });
     }
 
-    fn startArgv(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !*Job {
+    pub fn startArgv(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !*Job {
         const job = try allocator.create(Job);
         errdefer allocator.destroy(job);
         job.* = .{ .allocator = allocator, .io = io };
@@ -126,6 +128,7 @@ pub const Job = struct {
     }
 
     pub fn destroy(self: *Job) void {
+        self.cancel.cancel(self.io);
         if (self.thread) |thread| thread.join();
         self.log.deinit(self.allocator);
         const allocator = self.allocator;
@@ -155,6 +158,9 @@ fn runJob(job: *Job, argv: [][]u8) void {
         job.append("failed to start wormhole\n");
         return;
     };
+    job.cancel.bind(job.io, &child);
+    defer job.cancel.release(job.io, &child);
+    if (child.stdout == null or child.stderr == null) return;
 
     var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
     var multi_reader: std.Io.File.MultiReader = undefined;
@@ -165,6 +171,7 @@ fn runJob(job: *Job, argv: [][]u8) void {
     var stdout_seen: usize = 0;
     var stderr_seen: usize = 0;
     while (multi_reader.fill(256, .none)) |_| {
+        if (job.cancel.isCancelled()) return;
         const out = stdout_reader.buffered();
         if (out.len > stdout_seen) {
             job.append(out[stdout_seen..]);
@@ -176,7 +183,9 @@ fn runJob(job: *Job, argv: [][]u8) void {
             stderr_seen = err.len;
         }
     } else |_| {}
-    const term = child.wait(job.io) catch {
+    if (job.cancel.isCancelled() or child.id == null) return;
+    const term = job.cancel.waitUnlessCancelled(job.io, &child) catch |err| {
+        if (err == error.Cancelled) return;
         if (child.id != null) child.kill(job.io);
         job.append("\nwormhole failed\n");
         return;

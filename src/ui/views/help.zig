@@ -37,9 +37,9 @@ pub const text =
     \\:set name-resolution  tshark -N flags. off clears them
     \\:iograph [secs]   Packets per interval. Enter filters that range
     \\:dns / :http      Name or request rows. Enter filters
-    \\:compare <file>   Frames that differ. Enter selects one here
+    \\:compare <file>   Frames that differ. Enter selects here, or opens the other file
     \\:color            List, save, or delete a coloring rule
-    \\:comment [text]   Read or write this frame's pcapng comment
+    \\:comment [text]   Read or write a comment. :comment list shows every one
     \\:lua <script>     Run a tshark Lua script on this capture
     \\Ctrl-F            Search focused pane
     \\:search-regex     . * + ? [] ^ $ across list, tree, or hex

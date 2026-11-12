@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Linux PTY smoke test for rendering, search, capinfo, and clean Ctrl-C teardown.
+"""Linux PTY smoke test for rendering, search, the tree, hex, and a ZZ quit.
 
 vaxis paints by diff. A later frame often rewrites a single changed cell, so the
 PTY byte stream does not contain the text a person would read. Assertions about
@@ -290,8 +290,36 @@ def main() -> int:
     if waited_pid:
         return fail("Ctrl-C terminated zigshark while copy mode was active", screen)
 
-    # Outside copy mode Ctrl-C exits and must restore the terminal.
-    os.write(fd, b"\x03")
+    # Focus the protocol tree and expand the selected frame node.
+    os.write(fd, b"\t")
+    if not wait_until(fd, output, screen, "= field filter", 3):
+        os.kill(pid, signal.SIGTERM)
+        os.waitpid(pid, 0)
+        return fail("Tab did not focus the protocol tree", screen)
+    if screen.contains("Encapsulation type"):
+        os.kill(pid, signal.SIGTERM)
+        os.waitpid(pid, 0)
+        return fail("the frame node was already expanded", screen)
+    os.write(fd, b"l")
+    if not wait_until(fd, output, screen, "Encapsulation type", 3):
+        os.kill(pid, signal.SIGTERM)
+        os.waitpid(pid, 0)
+        return fail("the protocol tree did not expand a node", screen)
+
+    # Focus the hex pane and move the cursor so the tree follows that byte.
+    os.write(fd, b"\t")
+    if not wait_until(fd, output, screen, "hjkl byte", 3):
+        os.kill(pid, signal.SIGTERM)
+        os.waitpid(pid, 0)
+        return fail("Tab did not focus the hex pane", screen)
+    os.write(fd, b"l")
+    if not wait_until(fd, output, screen, "LG bit", 3):
+        os.kill(pid, signal.SIGTERM)
+        os.waitpid(pid, 0)
+        return fail("the hex cursor did not move onto a new field", screen)
+
+    # ZZ quits immediately and must restore the terminal.
+    os.write(fd, b"ZZ")
     status = None
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
@@ -304,7 +332,7 @@ def main() -> int:
     if status is None:
         os.kill(pid, signal.SIGTERM)
         _, status = os.waitpid(pid, 0)
-        return fail("zigshark did not exit after Ctrl-C", screen)
+        return fail("zigshark did not exit after ZZ", screen)
 
     exit_code = os.waitstatus_to_exitcode(status)
     forbidden = (
@@ -324,7 +352,7 @@ def main() -> int:
         sys.stderr.write(screen.text() + "\n")
         return 1
 
-    print("PTY smoke: rendered fixture and restored terminal cleanly")
+    print("PTY smoke: rendered the tree and hex pane, then quit with ZZ")
     return 0
 
 

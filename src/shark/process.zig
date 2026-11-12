@@ -19,15 +19,21 @@ pub const RunOutput = struct {
 pub const Runner = *const fn (std.mem.Allocator, std.Io, []const []const u8) anyerror!RunOutput;
 
 pub const CancellationToken = struct {
+    /// A detail load binds the PDML child and the hex child at the same time.
+    /// The next selection can bind its pair before the first pair releases.
+    const slot_count = 8;
+
     cancelled: std.atomic.Value(bool) = .init(false),
     mutex: std.Io.Mutex = .init,
-    child: ?*std.process.Child = null,
+    children: [slot_count]?*std.process.Child = @splat(null),
 
     pub fn cancel(self: *CancellationToken, io: std.Io) void {
         self.cancelled.store(true, .release);
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        if (self.child) |child| reap(child, io);
+        for (self.children) |child| {
+            if (child) |live| reap(live, io);
+        }
     }
 
     pub fn isCancelled(self: *const CancellationToken) bool {
@@ -41,7 +47,7 @@ pub const CancellationToken = struct {
     pub fn bind(self: *CancellationToken, io: std.Io, child: *std.process.Child) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        self.child = child;
+        self.track(child);
         if (self.cancelled.load(.acquire)) reap(child, io);
     }
 
@@ -50,7 +56,11 @@ pub const CancellationToken = struct {
     pub fn release(self: *CancellationToken, io: std.Io, child: *std.process.Child) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        if (self.child == child) self.child = null;
+        for (&self.children) |*slot| {
+            if (slot.*) |existing| {
+                if (existing == child) slot.* = null;
+            }
+        }
         reap(child, io);
     }
 
@@ -62,6 +72,23 @@ pub const CancellationToken = struct {
             return error.Cancelled;
         }
         return try child.wait(io);
+    }
+
+    fn track(self: *CancellationToken, child: *std.process.Child) void {
+        var free: ?usize = null;
+        for (&self.children, 0..) |*slot, index| {
+            if (slot.*) |existing| {
+                if (existing == child) return;
+                if (existing.id == null) slot.* = null;
+            }
+            if (slot.* == null and free == null) free = index;
+        }
+        if (free) |index| {
+            self.children[index] = child;
+            return;
+        }
+        // Every slot still has a live child. Keep this one cancellable.
+        self.children[0] = child;
     }
 };
 

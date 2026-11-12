@@ -277,8 +277,24 @@ pub fn showCompare(self: *AppModel, args: []const u8) !void {
         }
         self.allocator.free(rows);
     }
+    for (rows) |*row| {
+        if (row.filter.len != 0) continue;
+        const frame = frameFromOnlyThere(row.label) orelse continue;
+        const encoded = try std.fmt.allocPrint(self.allocator, "other\t{d}\t{s}", .{ frame, other });
+        self.allocator.free(row.filter);
+        row.filter = encoded;
+    }
     const shown = @min(rows.len, process_mod.view_row_cap);
-    try installStatRows(self, rows[0..shown], here.truncated or there.truncated or shown < rows.len, "Compare  Enter selects a frame from this file", .compare);
+    try installStatRows(self, rows[0..shown], here.truncated or there.truncated or shown < rows.len, "Compare  Enter selects the frame", .compare);
+}
+
+fn frameFromOnlyThere(label: []const u8) ?u32 {
+    const prefix = "only there  ";
+    if (!std.mem.startsWith(u8, label, prefix)) return null;
+    const rest = label[prefix.len..];
+    const end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+    if (end == 0) return null;
+    return std.fmt.parseInt(u32, rest[0..end], 10) catch null;
 }
 
 fn installStatRows(self: *AppModel, rows: []const stats_mod.TableRow, truncated: bool, title: []const u8, kind: OverlayKind) !void {
@@ -346,6 +362,11 @@ pub fn runColorCommand(self: *AppModel, args: []const u8) !void {
 }
 
 pub fn runCommentCommand(self: *AppModel, args: []const u8) !void {
+    const note = std.mem.trim(u8, args, " \t");
+    if (std.mem.eql(u8, note, "list")) {
+        try listPacketComments(self);
+        return;
+    }
     const path = self.capturePath() orelse {
         try self.showMessage("No capture file loaded");
         return;
@@ -354,7 +375,6 @@ pub fn runCommentCommand(self: *AppModel, args: []const u8) !void {
         try self.showMessage("Select a packet first");
         return;
     };
-    const note = std.mem.trim(u8, args, " \t");
     if (note.len == 0) {
         const filter = try std.fmt.allocPrint(self.allocator, "frame.number == {d}", .{frame});
         defer self.allocator.free(filter);
@@ -388,6 +408,71 @@ pub fn runCommentCommand(self: *AppModel, args: []const u8) !void {
     const message = try std.fmt.allocPrint(self.allocator, "Wrote the comment and opened {s}", .{dest});
     defer self.allocator.free(message);
     try self.showMessage(message);
+}
+
+fn listPacketComments(self: *AppModel) !void {
+    const path = self.capturePath() orelse {
+        try self.showMessage("No capture file loaded");
+        return;
+    };
+    var argv = try process_mod.argvFieldDump(
+        self.allocator,
+        self.tools.tshark,
+        path,
+        "frame.comment",
+        &.{ "frame.number", "frame.comment" },
+    );
+    defer argv.deinit(self.allocator);
+    var out = try self.runProcessLimited(argv.slice(), process_mod.view_stdout_cap);
+    defer out.deinit(self.allocator);
+    if (!out.term.success() and out.stdout.len == 0) {
+        try self.showMessage(if (out.stderr.len != 0) out.stderr else "Could not list packet comments");
+        return;
+    }
+
+    self.freeStringList(&self.stat_filters);
+    var frames: std.ArrayList([]u8) = .empty;
+    var stored = false;
+    errdefer if (!stored) {
+        for (frames.items) |item| self.allocator.free(item);
+        frames.deinit(self.allocator);
+    };
+    var text: std.Io.Writer.Allocating = .init(self.allocator);
+    defer text.deinit();
+    var rows: usize = 0;
+    var skipped_extra = false;
+    var lines = std.mem.splitScalar(u8, out.stdout, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        const tab = std.mem.indexOfScalar(u8, line, '\t') orelse continue;
+        const frame_text = std.mem.trim(u8, line[0..tab], " \t");
+        const comment = std.mem.trim(u8, line[tab + 1 ..], " \t");
+        if (frame_text.len == 0 or comment.len == 0) continue;
+        _ = std.fmt.parseInt(u32, frame_text, 10) catch continue;
+        if (rows >= process_mod.view_row_cap) {
+            skipped_extra = true;
+            break;
+        }
+        const copy = try self.allocator.dupe(u8, frame_text);
+        frames.append(self.allocator, copy) catch |err| {
+            self.allocator.free(copy);
+            return err;
+        };
+        if (rows != 0) try text.writer.writeByte('\n');
+        try text.writer.print("{s}  {s}", .{ frame_text, comment });
+        rows += 1;
+    }
+    if (rows == 0) {
+        try self.showMessage("No packet comments");
+        return;
+    }
+    try writeCapNote(&text.writer, out.truncated, skipped_extra);
+    self.stat_filters = try frames.toOwnedSlice(self.allocator);
+    stored = true;
+    const owned = try text.toOwnedSlice();
+    defer self.allocator.free(owned);
+    try self.showPick("Comments  Enter selects the frame", owned, .comment_list);
 }
 
 pub fn runLuaCommand(self: *AppModel, args: []const u8) !void {

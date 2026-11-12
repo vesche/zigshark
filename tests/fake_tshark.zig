@@ -16,6 +16,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     const path = capture.?;
+    if (try detailStandIn(allocator, io, args, path)) return;
     if (std.mem.indexOf(u8, path, "hold") != null) {
         try writeMarker(allocator, io, path, ".started", "started\n");
         try waitFor(allocator, io, path, ".release");
@@ -37,6 +38,71 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     try writeStdout(io, "<psml><packet><section>9</section></packet></psml>\n");
+}
+
+const DetailMode = enum { wait, sleep, fast };
+
+fn detailMode(path: []const u8) ?DetailMode {
+    if (std.mem.indexOf(u8, path, "bothwait") != null) return .wait;
+    if (std.mem.indexOf(u8, path, "bothsleep") != null) return .sleep;
+    if (std.mem.indexOf(u8, path, "bothfast") != null) return .fast;
+    return null;
+}
+
+fn outputKind(args: []const []const u8) []const u8 {
+    if (argAfter(args, "-T")) |format| {
+        if (std.mem.eql(u8, format, "pdml")) return "pdml";
+    }
+    if (hasArg(args, "-x")) return "hex";
+    return "psml";
+}
+
+fn hasArg(args: []const []const u8, flag: []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, flag)) return true;
+    }
+    return false;
+}
+
+/// Detail-load stand-in. `bothwait` blocks until `<path>.release`. `bothsleep`
+/// sleeps long enough that a test fails if the child is not killed. `bothfast`
+/// prints one frame and exits. PDML and hex each write their own marker.
+fn detailStandIn(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    args: []const []const u8,
+    path: []const u8,
+) !bool {
+    const mode = detailMode(path) orelse return false;
+    const kind = outputKind(args);
+    var suffix_buf: [32]u8 = undefined;
+    const started = std.fmt.bufPrint(&suffix_buf, ".{s}.started", .{kind}) catch return error.Unexpected;
+    try writeMarker(allocator, io, path, started, "started\n");
+    switch (mode) {
+        .wait => try waitFor(allocator, io, path, ".release"),
+        .sleep => try std.Io.sleep(io, .fromSeconds(8), .awake),
+        .fast => {},
+    }
+    try writeDetail(io, path, kind);
+    const finished = std.fmt.bufPrint(&suffix_buf, ".{s}.finished", .{kind}) catch return error.Unexpected;
+    try writeMarker(allocator, io, path, finished, "finished\n");
+    return true;
+}
+
+fn writeDetail(io: std.Io, path: []const u8, kind: []const u8) !void {
+    const frame: u32 = if (std.mem.indexOf(u8, path, "bothfast") != null) 7 else 2;
+    var buf: [320]u8 = undefined;
+    if (std.mem.eql(u8, kind, "pdml")) {
+        const xml = std.fmt.bufPrint(&buf, "<pdml><packet><proto name=\"frame\" showname=\"Frame {d}\" size=\"1\" pos=\"0\"><field name=\"frame.number\" show=\"{d}\" showname=\"Frame Number: {d}\" size=\"0\" pos=\"0\"/></proto></packet></pdml>\n", .{ frame, frame, frame }) catch return error.Unexpected;
+        try writeStdout(io, xml);
+        return;
+    }
+    if (std.mem.eql(u8, kind, "hex")) {
+        try writeStdout(io, "0000  aa\n");
+        return;
+    }
+    const xml = std.fmt.bufPrint(&buf, "<psml><packet><section>{d}</section></packet></psml>\n", .{frame}) catch return error.Unexpected;
+    try writeStdout(io, xml);
 }
 
 fn argAfter(args: []const []const u8, flag: []const u8) ?[]const u8 {

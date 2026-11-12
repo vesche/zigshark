@@ -7,23 +7,24 @@ const text_util = @import("text_util.zig");
 pub const menu_text = "[Analysis] [Misc] [Help]";
 
 pub const analysis_menu =
-    \\Filter field
-    \\Go to frame
-    \\Streams
-    \\Conversations
-    \\Capture info
-    \\Expert
-    \\Protocol hierarchy
-    \\Endpoints
-    \\Export
+    \\=
+    \\goto
+    \\streams
+    \\convs
+    \\capinfo
+    \\expert
+    \\hierarchy
+    \\endpoints
+    \\export
+    \\comment list
 ;
 
 pub const misc_menu =
-    \\Columns
-    \\Theme
-    \\Profile
-    \\Marks
-    \\Tail
+    \\columns
+    \\theme
+    \\profile
+    \\marks
+    \\tail
 ;
 
 pub const help_menu = "Keyboard shortcuts";
@@ -180,6 +181,6 @@ test "header menus sit on the right edge" {
     try std.testing.expectEqual(HeaderBar.Menu.help, menuAt(80, start + 18).?);
     try std.testing.expectEqual(start, menuAnchor(80, .analysis));
     try std.testing.expectEqual(start + 11, menuAnchor(80, .misc));
-    try std.testing.expectEqual(@as(usize, 9), std.mem.count(u8, analysis_menu, "\n") + 1);
+    try std.testing.expectEqual(@as(usize, 10), std.mem.count(u8, analysis_menu, "\n") + 1);
     try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, misc_menu, "\n") + 1);
 }

@@ -104,14 +104,14 @@ Header menus: Analysis (field filter, go to frame, streams, conversations, captu
 | `:set name-resolution <flags>` | tshark `-N` flags (`d`, `m`, `n`, `N`, `t`, `v`). `off` clears it. The status line shows `names` |
 | `:iograph [seconds]` | Packets per interval. Enter filters that time range |
 | `:dns` / `:http` | Query or request rows. Enter filters that name, host, or method |
-| `:compare <file>` | Frames whose address, ports, and length differ. Enter selects one from this file |
+| `:compare <file>` | Frames whose address, ports, and length differ. Enter selects one from this file, or opens the other file and selects its frame. The file you left stays in recent files |
 | `:color` | List rules. `:color <name> <filter>\|#fg\|#bg` saves one. `:color delete <name>` removes it |
-| `:comment [text]` | Read this frame's pcapng comment, or write it to a new `.commented.pcapng` |
+| `:comment [text]` | Read this frame's pcapng comment, or write it to a new `.commented.pcapng`. `:comment list` lists commented frames; Enter selects one |
 | `:lua <script.lua>` | Run that tshark Lua script on the open capture |
 | `:capinfo`, `:marks`, `:recents`, `:config`, `:logs`, `:help`, `:quit` | As named |
 | `:wormhole [file]` | Send a file with the wormhole CLI. `wormhole-length`, `wormhole-rendezvous-url`, and `wormhole-transit-relay` become `--code-length`, `--relay-url`, and `--transit-helper` |
 
-`:convs`, `:streams`, and `:expert all` stop after 200 rows, or after 1 MiB of tshark output. The overlay says when that happens. `:expert` with no arguments reads the open packet and is not capped that way.
+`:convs`, `:streams`, `:expert all`, and `:comment list` stop after 200 rows, or after 1 MiB of tshark output. The overlay says when that happens. `:expert` and `:comment` with no arguments read the open packet and are not capped that way.
 
 Capture filters are `-f` on the command line. Display-filter checks use `tshark -Y` against an empty pcap.
 
