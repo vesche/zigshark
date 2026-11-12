@@ -66,6 +66,7 @@ pub const OverlayKind = enum {
     saved_filters,
     recent_filters,
     expert,
+    expert_file,
     hierarchy,
     endpoints,
     iograph,
@@ -134,7 +135,7 @@ pub const AppModel = struct {
     fields: [][]u8 = &.{},
     fields_worker: ?std.Thread = null,
     fields_ready: std.atomic.Value(bool) = .init(false),
-    fields_cancelled: std.atomic.Value(bool) = .init(false),
+    fields_token: process_mod.CancellationToken = .{},
     fields_tshark_path: []u8 = &.{},
     byte_search_offset: usize = 0,
     pending_global_frame: ?u32 = null,
@@ -147,6 +148,8 @@ pub const AppModel = struct {
     conversations: []convs_shark.Conversation = &.{},
     conversation_proto: []u8 = &.{},
     stream_filter: []u8 = &.{},
+    /// `tcp.stream == N` or `udp.stream == N` for the open stream. Enter does not apply this.
+    stream_list_filter: []u8 = &.{},
     stream_chunks: []streams_shark.Chunk = &.{},
     tailing: bool = false,
     tail_size: u64 = 0,
@@ -163,6 +166,7 @@ pub const AppModel = struct {
     filter_seen_ticks: u8 = 0,
     filter_check_inflight: std.atomic.Value(bool) = .init(false),
     filter_check_worker: ?std.Thread = null,
+    filter_check_token: process_mod.CancellationToken = .{},
     filter_check_mutex: std.Io.Mutex = .init,
     filter_check_box: ?FilterVerdictBox = null,
     filter_error_text: []u8 = &.{},
@@ -261,7 +265,7 @@ pub const AppModel = struct {
         self.fields = &.{};
         self.fields_worker = null;
         self.fields_ready = .init(false);
-        self.fields_cancelled = .init(false);
+        self.fields_token = .{};
         self.fields_tshark_path = try self.allocator.dupe(u8, self.tools.tshark);
         self.byte_search_offset = 0;
         self.pending_global_frame = null;
@@ -274,6 +278,7 @@ pub const AppModel = struct {
         self.conversations = &.{};
         self.conversation_proto = &.{};
         self.stream_filter = &.{};
+        self.stream_list_filter = &.{};
         self.stream_chunks = &.{};
         self.tailing = false;
         self.tail_size = 0;
@@ -289,6 +294,7 @@ pub const AppModel = struct {
         self.filter_seen_ticks = 0;
         self.filter_check_inflight = .init(false);
         self.filter_check_worker = null;
+        self.filter_check_token = .{};
         self.filter_check_mutex = .init;
         self.filter_check_box = null;
         self.filter_error_text = &.{};
@@ -387,13 +393,22 @@ pub const AppModel = struct {
         self.syncFromSession();
     }
 
+    /// Kill the field dump and the display-filter check, then join them.
+    /// Quit uses this so a running tshark does not hold the process open.
+    pub fn cancelToolChildren(self: *AppModel) void {
+        self.fields_token.cancel(self.io);
+        self.filter_check_token.cancel(self.io);
+        if (self.fields_worker) |worker| worker.join();
+        self.fields_worker = null;
+        if (self.filter_check_worker) |worker| worker.join();
+        self.filter_check_worker = null;
+    }
+
     pub fn deinit(self: *AppModel) void {
+        self.cancelToolChildren();
         if (self.overlay_body_owned.len != 0) self.allocator.free(self.overlay_body_owned);
         if (self.detail_bundle) |*b| b.deinit(self.allocator);
         if (self.empty_pcap.len != 0) self.allocator.free(self.empty_pcap);
-        self.fields_cancelled.store(true, .release);
-        if (self.fields_worker) |worker| worker.join();
-        if (self.filter_check_worker) |worker| worker.join();
         if (self.filter_check_box) |*box| {
             self.allocator.free(box.text);
             self.allocator.free(box.detail);
@@ -417,6 +432,7 @@ pub const AppModel = struct {
         self.clearConversations();
         if (self.conversation_proto.len != 0) self.allocator.free(self.conversation_proto);
         if (self.stream_filter.len != 0) self.allocator.free(self.stream_filter);
+        if (self.stream_list_filter.len != 0) self.allocator.free(self.stream_list_filter);
         self.clearStreamChunks();
         if (self.transfer_job) |job| job.destroy();
         if (self.completion_prefix.len != 0) self.allocator.free(self.completion_prefix);
@@ -700,10 +716,17 @@ pub const AppModel = struct {
     fn activateHeaderItem(self: *AppModel, index: usize) void {
         const menu = self.header_menu orelse return;
         self.closeHeaderMenu();
-        switch (menu) {
-            .analysis, .misc => self.runMenuChoice(index) catch {},
-            .help => self.openHelp() catch {},
-        }
+        const result = switch (menu) {
+            .analysis, .misc => self.runMenuChoice(index),
+            .help => self.openHelp(),
+        };
+        result catch |err| self.reportMenuError(err);
+    }
+
+    fn reportMenuError(self: *AppModel, err: anyerror) void {
+        var buf: [80]u8 = undefined;
+        const message = std.fmt.bufPrint(&buf, "Menu action failed: {s}", .{@errorName(err)}) catch "Menu action failed";
+        self.showMessage(message) catch {};
     }
 
     fn openHelp(self: *AppModel) !void {
@@ -938,12 +961,12 @@ pub const AppModel = struct {
         try self.showPick("Saved filters  Enter applies", owned, .saved_filters);
     }
 
-    fn runProcess(self: *AppModel, argv: []const []const u8) !process_mod.RunOutput {
+    pub fn runProcess(self: *AppModel, argv: []const []const u8) !process_mod.RunOutput {
         if (self.process_runner) |run| return run(self.allocator, self.io, argv);
         return process_mod.runCapture(self.allocator, self.io, argv);
     }
 
-    fn runProcessLimited(self: *AppModel, argv: []const []const u8, limit: usize) !process_mod.RunOutput {
+    pub fn runProcessLimited(self: *AppModel, argv: []const []const u8, limit: usize) !process_mod.RunOutput {
         if (self.process_runner) |run| {
             var out = try run(self.allocator, self.io, argv);
             if (try process_mod.clipStdout(self.allocator, &out.stdout, limit)) out.truncated = true;
@@ -1212,8 +1235,14 @@ pub const AppModel = struct {
         ) catch blk: {
             var argv = try process_mod.argvFieldsDump(self.allocator, self.fields_tshark_path);
             defer argv.deinit(self.allocator);
-            var output = try process_mod.runCapture(self.allocator, self.io, argv.slice());
+            var output = try process_mod.runCaptureCancellable(
+                self.allocator,
+                self.io,
+                argv.slice(),
+                &self.fields_token,
+            );
             defer output.deinit(self.allocator);
+            if (self.fields_token.isCancelled()) return error.Cancelled;
             if (!output.term.success()) return error.FieldsUnavailable;
             try cwd.writeFile(self.io, .{
                 .sub_path = cache_path,
@@ -1229,7 +1258,7 @@ pub const AppModel = struct {
         }
         var lines = std.mem.splitScalar(u8, contents, '\n');
         while (lines.next()) |line| {
-            if (self.fields_cancelled.load(.acquire)) return error.Cancelled;
+            if (self.fields_token.isCancelled()) return error.Cancelled;
             var parts = std.mem.splitScalar(u8, line, '\t');
             const kind = parts.next() orelse continue;
             if (!std.mem.eql(u8, kind, "F")) continue;
@@ -1309,13 +1338,13 @@ pub const AppModel = struct {
         return true;
     }
 
-    fn ensureFieldCompletions(self: *AppModel) !void {
+    pub fn ensureFieldCompletions(self: *AppModel) !void {
         if (self.fields_ready.load(.acquire) or self.fields_worker != null) return;
         self.fields_worker = try std.Thread.spawn(.{}, loadFieldCompletionsWorker, .{self});
     }
 
     fn resetFieldCompletions(self: *AppModel) !void {
-        self.fields_cancelled.store(true, .release);
+        self.fields_token.cancel(self.io);
         if (self.fields_worker) |worker| worker.join();
         self.fields_worker = null;
         for (self.fields) |field| self.allocator.free(field);
@@ -1324,7 +1353,7 @@ pub const AppModel = struct {
         if (self.fields_tshark_path.len != 0) self.allocator.free(self.fields_tshark_path);
         self.fields_tshark_path = try self.allocator.dupe(u8, self.tools.tshark);
         self.fields_ready.store(false, .release);
-        self.fields_cancelled.store(false, .release);
+        self.fields_token.reset();
     }
 
     pub fn processLoaderEvents(self: *AppModel) !void {
@@ -1334,44 +1363,44 @@ pub const AppModel = struct {
             switch (ev.*) {
                 .packets_loaded => |*table| {
                     if (table.generation == 0 or table.generation == self.loader.list_generation.load(.acquire)) {
-                    const follow_live = self.live_capture and self.follow_tail and self.config.auto_scroll;
-                    const previous = if (follow_live) null else self.session.selectedFrame();
-                    if (table.headers.len != 0) {
-                        self.session.setListHeaders(table.headers);
-                        table.headers = &.{};
-                    }
-                    if (self.hide_through_frame != 0) {
-                        table.packets = try packet.retainFramesAfter(
-                            self.allocator,
-                            table.packets,
-                            self.hide_through_frame,
-                        );
-                    }
-                    const appending = table.append and self.session.packets.len != 0;
-                    if (appending) {
-                        try self.session.appendPackets(table.packets);
-                    } else {
-                        self.session.setPackets(table.packets);
-                    }
-                    table.packets = &.{};
-                    if (follow_live and self.session.packets.len > 0) {
-                        _ = self.session.select(self.session.packets.len - 1);
-                        self.packet_table.scroll_free = false;
-                    } else if (previous) |frame| {
-                        for (self.session.packets, 0..) |summary, index| {
-                            if (summary.frame == frame) {
-                                _ = self.session.select(index);
-                                break;
+                        const follow_live = self.live_capture and self.follow_tail and self.config.auto_scroll;
+                        const previous = if (follow_live) null else self.session.selectedFrame();
+                        if (table.headers.len != 0) {
+                            self.session.setListHeaders(table.headers);
+                            table.headers = &.{};
+                        }
+                        if (self.hide_through_frame != 0) {
+                            table.packets = try packet.retainFramesAfter(
+                                self.allocator,
+                                table.packets,
+                                self.hide_through_frame,
+                            );
+                        }
+                        const appending = table.append and self.session.packets.len != 0;
+                        if (appending) {
+                            try self.session.appendPackets(table.packets);
+                        } else {
+                            self.session.setPackets(table.packets);
+                        }
+                        table.packets = &.{};
+                        if (follow_live and self.session.packets.len > 0) {
+                            _ = self.session.select(self.session.packets.len - 1);
+                            self.packet_table.scroll_free = false;
+                        } else if (previous) |frame| {
+                            for (self.session.packets, 0..) |summary, index| {
+                                if (summary.frame == frame) {
+                                    _ = self.session.select(index);
+                                    break;
+                                }
                             }
                         }
-                    }
-                    if (self.pending_global_frame) |frame| {
-                        _ = self.selectFrame(frame);
-                        self.pending_global_frame = null;
-                    }
-                    self.session.loading = if (self.live_capture) .capturing else .loading_list;
-                    self.syncFromSession();
-                    ev.* = .done;
+                        if (self.pending_global_frame) |frame| {
+                            _ = self.selectFrame(frame);
+                            self.pending_global_frame = null;
+                        }
+                        self.session.loading = if (self.live_capture) .capturing else .loading_list;
+                        self.syncFromSession();
+                        ev.* = .done;
                     }
                 },
                 .detail_loaded => |*bundle| {
@@ -1498,7 +1527,6 @@ pub const AppModel = struct {
     pub fn runCommand(self: *AppModel, cmd: []const u8, args: []const u8) !void {
         return commands.run(self, cmd, args);
     }
-
 
     pub fn findNextSearch(self: *AppModel, forward: bool) !bool {
         switch (self.search.target) {
@@ -1689,32 +1717,22 @@ pub const AppModel = struct {
         return field.name;
     }
 
-    fn clearExpert(self: *AppModel) void {
+    pub fn clearExpert(self: *AppModel) void {
         for (self.expert_items) |*item| item.deinit(self.allocator);
         if (self.expert_items.len != 0) self.allocator.free(self.expert_items);
         self.expert_items = &.{};
     }
 
-    pub fn showExpert(self: *AppModel) !void {
-        const bundle = self.detail_bundle orelse {
-            try self.showMessage("Select a packet to see its expert info");
-            return;
-        };
-        self.clearExpert();
-        self.expert_items = try expert_mod.collect(self.allocator, &bundle.pdml.root);
-        if (self.expert_items.len == 0) {
-            try self.showMessage("This packet has no expert info");
-            return;
-        }
-        var text: std.Io.Writer.Allocating = .init(self.allocator);
-        defer text.deinit();
-        for (self.expert_items, 0..) |item, index| {
-            if (index != 0) try text.writer.writeByte('\n');
-            try text.writer.print("{s}  {s}  {s}", .{ expert_mod.label(item.severity), item.group, item.message });
-        }
-        const owned = try text.toOwnedSlice();
-        defer self.allocator.free(owned);
-        try self.showPick("Expert  Enter opens the field", owned, .expert);
+    pub fn acceptExport(self: *AppModel) !void {
+        return @import("views/analysis.zig").acceptExport(self);
+    }
+
+    pub fn applyOpenStreamFilter(self: *AppModel) !void {
+        return @import("views/analysis.zig").applyOpenStreamFilter(self);
+    }
+
+    pub fn showStream(self: *AppModel, proto: []const u8, index: u32, body: []const u8, capped: bool) !void {
+        return @import("views/analysis.zig").showStream(self, proto, index, body, capped);
     }
 
     pub fn toggleTimeReference(self: *AppModel) !void {
@@ -1742,390 +1760,10 @@ pub const AppModel = struct {
         self.packet_table.time_base = seconds;
     }
 
-    fn freeStringList(self: *AppModel, list: *[][]u8) void {
+    pub fn freeStringList(self: *AppModel, list: *[][]u8) void {
         for (list.*) |item| self.allocator.free(item);
         if (list.len != 0) self.allocator.free(list.*);
         list.* = &.{};
-    }
-
-    pub fn showIoGraph(self: *AppModel, args: []const u8) !void {
-        const requested = if (args.len == 0) "1" else std.mem.trim(u8, args, " \t");
-        const seconds = std.fmt.parseFloat(f64, requested) catch {
-            try self.showMessage("Usage: :iograph [seconds]");
-            return;
-        };
-        if (!(seconds > 0) or seconds > 3600) {
-            try self.showMessage("Interval must be between 0 and 3600 seconds");
-            return;
-        }
-        const interval = try std.fmt.allocPrint(self.allocator, "{d}", .{seconds});
-        defer self.allocator.free(interval);
-        const path = self.capturePath() orelse {
-            try self.showMessage("No capture file loaded");
-            return;
-        };
-        var argv = try process_mod.argvIoStat(self.allocator, self.tools.tshark, path, interval);
-        defer argv.deinit(self.allocator);
-        var out = try self.runProcessLimited(argv.slice(), process_mod.view_stdout_cap);
-        defer out.deinit(self.allocator);
-        if (!out.term.success() and out.stdout.len == 0) {
-            try self.showMessage(if (out.stderr.len != 0) out.stderr else "IO graph failed");
-            return;
-        }
-        const buckets = try stats_mod.parseIoStat(self.allocator, out.stdout);
-        defer self.allocator.free(buckets);
-        const shown = @min(buckets.len, process_mod.view_row_cap);
-        var max_frames: u64 = 0;
-        for (buckets[0..shown]) |bucket| max_frames = @max(max_frames, bucket.frames);
-        self.freeStringList(&self.stat_filters);
-        const filters = try self.allocator.alloc([]u8, shown);
-        var filled: usize = 0;
-        errdefer {
-            for (filters[0..filled]) |filter| self.allocator.free(filter);
-            self.allocator.free(filters);
-        }
-        var text: std.Io.Writer.Allocating = .init(self.allocator);
-        defer text.deinit();
-        if (shown == 0) try text.writer.writeAll("No IO statistics");
-        for (buckets[0..shown], 0..) |bucket, index| {
-            filters[index] = try std.fmt.allocPrint(
-                self.allocator,
-                "frame.time_relative >= {d} and frame.time_relative < {d}",
-                .{ bucket.start, bucket.end },
-            );
-            filled += 1;
-            if (index != 0) try text.writer.writeByte('\n');
-            var marks: [16]u8 = @splat(' ');
-            const count = stats_mod.ioMarks(bucket.frames, max_frames, marks.len);
-            for (marks[0..count]) |*cell| cell.* = '#';
-            try text.writer.print("{d:.1}-{d:.1}  {s}  {d}  {d} bytes", .{
-                bucket.start,
-                bucket.end,
-                marks,
-                bucket.frames,
-                bucket.bytes,
-            });
-        }
-        try writeCapNote(&text.writer, out.truncated, shown < buckets.len);
-        self.stat_filters = filters;
-        const owned = try text.toOwnedSlice();
-        defer self.allocator.free(owned);
-        try self.showPick("IO graph  Enter filters that interval", owned, .iograph);
-    }
-
-    pub fn showDns(self: *AppModel) !void {
-        try self.showFieldTable(
-            &.{ "frame.number", "dns.qry.name", "dns.flags.rcode" },
-            "",
-            stats_mod.parseDnsTable,
-            "DNS  Enter filters that name",
-            .dns,
-        );
-    }
-
-    pub fn showHttp(self: *AppModel) !void {
-        try self.showFieldTable(
-            &.{ "frame.number", "http.request.method", "http.host", "http.request.uri", "http.response.code" },
-            "http",
-            stats_mod.parseHttpTable,
-            "HTTP  Enter filters that row",
-            .http,
-        );
-    }
-
-    fn showFieldTable(
-        self: *AppModel,
-        fields: []const []const u8,
-        display_filter: []const u8,
-        parse: *const fn (std.mem.Allocator, []const u8) anyerror![]stats_mod.TableRow,
-        title: []const u8,
-        kind: OverlayKind,
-    ) !void {
-        const path = self.capturePath() orelse {
-            try self.showMessage("No capture file loaded");
-            return;
-        };
-        var argv = try process_mod.argvFieldDump(self.allocator, self.tools.tshark, path, display_filter, fields);
-        defer argv.deinit(self.allocator);
-        var out = try self.runProcessLimited(argv.slice(), process_mod.view_stdout_cap);
-        defer out.deinit(self.allocator);
-        if (!out.term.success() and out.stdout.len == 0) {
-            try self.showMessage(if (out.stderr.len != 0) out.stderr else "Field table failed");
-            return;
-        }
-        const rows = try parse(self.allocator, out.stdout);
-        defer {
-            for (rows) |*row| {
-                var copy = row.*;
-                copy.deinit(self.allocator);
-            }
-            self.allocator.free(rows);
-        }
-        try self.installStatRows(rows, out.truncated, title, kind);
-    }
-
-    pub fn showCompare(self: *AppModel, args: []const u8) !void {
-        const other = std.mem.trim(u8, args, " \t");
-        if (other.len == 0) {
-            try self.showMessage("Usage: :compare <file.pcap>");
-            return;
-        }
-        const path = self.capturePath() orelse {
-            try self.showMessage("No capture file loaded");
-            return;
-        };
-        const fields = [_][]const u8{ "frame.number", "ip.src", "ip.dst", "tcp.srcport", "tcp.dstport", "udp.srcport", "udp.dstport", "frame.len" };
-        var here_argv = try process_mod.argvFieldDump(self.allocator, self.tools.tshark, path, "", &fields);
-        defer here_argv.deinit(self.allocator);
-        var there_argv = try process_mod.argvFieldDump(self.allocator, self.tools.tshark, other, "", &fields);
-        defer there_argv.deinit(self.allocator);
-        var here = try self.runProcessLimited(here_argv.slice(), process_mod.view_stdout_cap);
-        defer here.deinit(self.allocator);
-        var there = try self.runProcessLimited(there_argv.slice(), process_mod.view_stdout_cap);
-        defer there.deinit(self.allocator);
-        if ((!here.term.success() and here.stdout.len == 0) or (!there.term.success() and there.stdout.len == 0)) {
-            const err = if (there.stderr.len != 0) there.stderr else here.stderr;
-            try self.showMessage(if (err.len != 0) err else "Compare failed");
-            return;
-        }
-        const rows = try stats_mod.compareIdentities(self.allocator, here.stdout, there.stdout);
-        defer {
-            for (rows) |*row| {
-                var copy = row.*;
-                copy.deinit(self.allocator);
-            }
-            self.allocator.free(rows);
-        }
-        const shown = @min(rows.len, process_mod.view_row_cap);
-        try self.installStatRows(rows[0..shown], here.truncated or there.truncated or shown < rows.len, "Compare  Enter selects a frame from this file", .compare);
-    }
-
-    fn installStatRows(self: *AppModel, rows: []const stats_mod.TableRow, truncated: bool, title: []const u8, kind: OverlayKind) !void {
-        self.freeStringList(&self.stat_filters);
-        const filters = try self.allocator.alloc([]u8, rows.len);
-        var filled: usize = 0;
-        errdefer {
-            for (filters[0..filled]) |filter| self.allocator.free(filter);
-            self.allocator.free(filters);
-        }
-        var text: std.Io.Writer.Allocating = .init(self.allocator);
-        defer text.deinit();
-        if (rows.len == 0) try text.writer.writeAll("Nothing to show");
-        for (rows, 0..) |row, index| {
-            filters[index] = try self.allocator.dupe(u8, row.filter);
-            filled += 1;
-            if (index != 0) try text.writer.writeByte('\n');
-            try text.writer.writeAll(row.label);
-        }
-        if (truncated) try writeCapNote(&text.writer, false, true);
-        self.stat_filters = filters;
-        const owned = try text.toOwnedSlice();
-        defer self.allocator.free(owned);
-        try self.showPick(title, owned, kind);
-    }
-
-    pub fn runColorCommand(self: *AppModel, args: []const u8) !void {
-        const trimmed = std.mem.trim(u8, args, " \t");
-        if (trimmed.len == 0) {
-            var text: std.Io.Writer.Allocating = .init(self.allocator);
-            defer text.deinit();
-            if (self.config.color_rules.items.len == 0) try text.writer.writeAll("No coloring rules. :color <name> <filter>|#fg|#bg");
-            for (self.config.color_rules.items, 0..) |rule, index| {
-                if (index != 0) try text.writer.writeByte('\n');
-                try text.writer.print("{s}  {s}", .{ rule.name, rule.filter });
-            }
-            const owned = try text.toOwnedSlice();
-            defer self.allocator.free(owned);
-            try self.showMessage(owned);
-            return;
-        }
-        if (std.mem.startsWith(u8, trimmed, "delete ")) {
-            const name = std.mem.trim(u8, trimmed["delete ".len..], " \t");
-            if (!self.config.deleteColorRule(name)) {
-                try self.showMessage("No coloring rule with that name");
-                return;
-            }
-            self.persistConfig();
-            try self.showMessage("Coloring rule deleted");
-            return;
-        }
-        const space = std.mem.indexOfScalar(u8, trimmed, ' ') orelse {
-            try self.showMessage("Usage: :color <name> <filter>|#fg|#bg");
-            return;
-        };
-        const name = std.mem.trim(u8, trimmed[0..space], " \t");
-        const value = std.mem.trim(u8, trimmed[space + 1 ..], " \t");
-        if (name.len == 0 or std.mem.indexOfScalar(u8, value, '|') == null) {
-            try self.showMessage("Usage: :color <name> <filter>|#fg|#bg");
-            return;
-        }
-        try self.config.upsertColorRule(name, value);
-        self.persistConfig();
-        try self.showMessage("Coloring rule saved");
-    }
-
-    pub fn runCommentCommand(self: *AppModel, args: []const u8) !void {
-        const path = self.capturePath() orelse {
-            try self.showMessage("No capture file loaded");
-            return;
-        };
-        const frame = self.session.selectedFrame() orelse {
-            try self.showMessage("Select a packet first");
-            return;
-        };
-        const note = std.mem.trim(u8, args, " \t");
-        if (note.len == 0) {
-            const filter = try std.fmt.allocPrint(self.allocator, "frame.number == {d}", .{frame});
-            defer self.allocator.free(filter);
-            var argv = try process_mod.argvFieldDump(self.allocator, self.tools.tshark, path, filter, &.{ "frame.comment" });
-            defer argv.deinit(self.allocator);
-            var out = try self.runProcess(argv.slice());
-            defer out.deinit(self.allocator);
-            const text = std.mem.trim(u8, out.stdout, " \t\r\n");
-            if (!out.term.success() and text.len == 0) {
-                try self.showMessage(if (out.stderr.len != 0) out.stderr else "Could not read the packet comment");
-                return;
-            }
-            try self.showMessage(if (text.len == 0) "(no comment)" else text);
-            return;
-        }
-        if (std.mem.indexOfAny(u8, note, "\r\n") != null) {
-            try self.showMessage("A packet comment is one line");
-            return;
-        }
-        const dest = try std.fmt.allocPrint(self.allocator, "{s}.commented.pcapng", .{path});
-        defer self.allocator.free(dest);
-        var argv = try process_mod.argvEditcapComment(self.allocator, "editcap", path, dest, frame, note);
-        defer argv.deinit(self.allocator);
-        var out = try self.runProcess(argv.slice());
-        defer out.deinit(self.allocator);
-        if (!out.term.success()) {
-            try self.showMessage(if (out.stderr.len != 0) out.stderr else "editcap could not write the comment. The mark note is still available.");
-            return;
-        }
-        try self.openCapture(dest);
-        const message = try std.fmt.allocPrint(self.allocator, "Wrote the comment and opened {s}", .{dest});
-        defer self.allocator.free(message);
-        try self.showMessage(message);
-    }
-
-    pub fn runLuaCommand(self: *AppModel, args: []const u8) !void {
-        const script = std.mem.trim(u8, args, " \t");
-        if (script.len == 0) {
-            try self.showMessage("Usage: :lua <script.lua>");
-            return;
-        }
-        const path = self.capturePath() orelse {
-            try self.showMessage("No capture file loaded");
-            return;
-        };
-        var argv = try process_mod.argvLua(self.allocator, self.tools.tshark, path, script);
-        defer argv.deinit(self.allocator);
-        var out = try self.runProcessLimited(argv.slice(), process_mod.view_stdout_cap);
-        defer out.deinit(self.allocator);
-        const body = if (out.stdout.len != 0) out.stdout else out.stderr;
-        if (body.len == 0) {
-            try self.showMessage(if (out.term.success()) "Lua script produced no output" else "Lua script failed");
-            return;
-        }
-        const shown = try capText(self.allocator, body, out.truncated, false);
-        defer self.allocator.free(shown);
-        try self.showMessage(shown);
-    }
-
-    pub fn showHierarchy(self: *AppModel) !void {
-        const path = self.capturePath() orelse {
-            try self.showMessage("No capture file loaded");
-            return;
-        };
-        var argv = try process_mod.argvHierarchy(self.allocator, self.tools.tshark, path);
-        defer argv.deinit(self.allocator);
-        var out = try self.runProcessLimited(argv.slice(), process_mod.view_stdout_cap);
-        defer out.deinit(self.allocator);
-        if (!out.term.success() and out.stdout.len == 0) {
-            try self.showMessage(if (out.stderr.len != 0) out.stderr else "Protocol hierarchy failed");
-            return;
-        }
-        const rows = try stats_mod.parseHierarchy(self.allocator, out.stdout);
-        defer {
-            for (rows) |*row| {
-                var copy = row.*;
-                copy.deinit(self.allocator);
-            }
-            self.allocator.free(rows);
-        }
-        self.freeStringList(&self.hierarchy_names);
-        const names = try self.allocator.alloc([]u8, rows.len);
-        var filled: usize = 0;
-        errdefer {
-            for (names[0..filled]) |name| self.allocator.free(name);
-            self.allocator.free(names);
-        }
-        var text: std.Io.Writer.Allocating = .init(self.allocator);
-        defer text.deinit();
-        if (rows.len == 0) try text.writer.writeAll("No protocol hierarchy");
-        for (rows, 0..) |row, index| {
-            names[index] = try self.allocator.dupe(u8, row.name);
-            filled += 1;
-            if (index != 0) try text.writer.writeByte('\n');
-            try text.writer.print("{s}  {d} frames  {d} bytes", .{ row.name, row.frames, row.bytes });
-        }
-        self.hierarchy_names = names;
-        const owned = try text.toOwnedSlice();
-        defer self.allocator.free(owned);
-        try self.showPick("Hierarchy  Enter filters that protocol", owned, .hierarchy);
-    }
-
-    pub fn showEndpoints(self: *AppModel, args: []const u8) !void {
-        const kind_name = if (args.len == 0) "tcp" else std.mem.trim(u8, args, " \t");
-        const kind = std.meta.stringToEnum(stats_mod.Kind, kind_name) orelse {
-            try self.showMessage("Usage: :endpoints [tcp|udp|ip|ipv6|eth]");
-            return;
-        };
-        const path = self.capturePath() orelse {
-            try self.showMessage("No capture file loaded");
-            return;
-        };
-        var argv = try process_mod.argvEndpoints(self.allocator, self.tools.tshark, path, kind_name);
-        defer argv.deinit(self.allocator);
-        var out = try self.runProcessLimited(argv.slice(), process_mod.view_stdout_cap);
-        defer out.deinit(self.allocator);
-        if (!out.term.success() and out.stdout.len == 0) {
-            try self.showMessage(if (out.stderr.len != 0) out.stderr else "Endpoints failed");
-            return;
-        }
-        const rows = try stats_mod.parseEndpoints(self.allocator, out.stdout, kind);
-        defer {
-            for (rows) |*row| {
-                var copy = row.*;
-                copy.deinit(self.allocator);
-            }
-            self.allocator.free(rows);
-        }
-        const shown = @min(rows.len, process_mod.view_row_cap);
-        self.freeStringList(&self.endpoint_filters);
-        const filters = try self.allocator.alloc([]u8, shown);
-        var filled: usize = 0;
-        errdefer {
-            for (filters[0..filled]) |filter| self.allocator.free(filter);
-            self.allocator.free(filters);
-        }
-        var text: std.Io.Writer.Allocating = .init(self.allocator);
-        defer text.deinit();
-        if (shown == 0) try text.writer.print("No {s} endpoints", .{kind_name});
-        for (rows[0..shown], 0..) |row, index| {
-            filters[index] = try stats_mod.endpointFilter(self.allocator, kind, row);
-            filled += 1;
-            if (index != 0) try text.writer.writeByte('\n');
-            try text.writer.print("{s}", .{row.address});
-            if (row.port) |port| try text.writer.print(":{d}", .{port});
-            try text.writer.print("  {d} packets  {d} bytes", .{ row.packets, row.bytes });
-        }
-        self.endpoint_filters = filters;
-        try writeCapNote(&text.writer, out.truncated, shown < rows.len);
-        const owned = try text.toOwnedSlice();
-        defer self.allocator.free(owned);
-        try self.showPick("Endpoints  Enter filters that address", owned, .endpoints);
     }
 
     fn appendDisplayFilter(self: *AppModel, atom: []const u8) !void {
@@ -2189,188 +1827,10 @@ pub const AppModel = struct {
         try self.showPick("Decode as  choose a protocol", owned, .decode_protocol);
     }
 
-    pub fn acceptExport(self: *AppModel) !void {
-        const args = self.export_request;
-        self.export_request = &.{};
-        self.export_confirm = false;
-        self.dismissOverlays();
-        defer self.allocator.free(args);
-        try self.runExport(args, true);
-    }
-
     fn clearExportConfirm(self: *AppModel) void {
         self.export_confirm = false;
         if (self.export_request.len != 0) self.allocator.free(self.export_request);
         self.export_request = &.{};
-    }
-
-    pub fn runExport(self: *AppModel, args: []const u8, force: bool) !void {
-        const trimmed = std.mem.trim(u8, args, " \t");
-        if (trimmed.len == 0) {
-            try self.showMessage("Usage: :export packets|packet|json|csv <path>    or    :export objects http|smb <dir>");
-            return;
-        }
-        var parts = std.mem.tokenizeAny(u8, trimmed, " \t");
-        const command = parts.next() orelse return;
-        if (std.mem.eql(u8, command, "objects")) {
-            const protocol = parts.next() orelse {
-                try self.showMessage("Usage: :export objects http|smb <dir>");
-                return;
-            };
-            const directory = parts.next() orelse {
-                try self.showMessage("Usage: :export objects http|smb <dir>");
-                return;
-            };
-            if (!std.mem.eql(u8, protocol, "http") and !std.mem.eql(u8, protocol, "smb")) {
-                try self.showMessage("Object export supports http or smb");
-                return;
-            }
-            try self.exportObjects(protocol, directory);
-            return;
-        }
-        const out_path = parts.next() orelse {
-            try self.showMessage("Usage: :export packets|packet|json|csv <path>");
-            return;
-        };
-        if (!force and try self.pathExists(out_path)) {
-            try self.askOverwrite(trimmed);
-            return;
-        }
-        if (std.mem.eql(u8, command, "json")) {
-            try self.writeDisplayed(out_path, true);
-        } else if (std.mem.eql(u8, command, "csv")) {
-            try self.writeDisplayed(out_path, false);
-        } else if (std.mem.eql(u8, command, "packets")) {
-            try self.exportPcap(out_path, null);
-        } else if (std.mem.eql(u8, command, "packet")) {
-            const frame = self.session.selectedFrame() orelse {
-                try self.showMessage("Select a packet first");
-                return;
-            };
-            try self.exportPcap(out_path, frame);
-        } else {
-            try self.showMessage("Usage: :export packets|packet|json|csv <path>    or    :export objects http|smb <dir>");
-        }
-    }
-
-    fn askOverwrite(self: *AppModel, args: []const u8) !void {
-        if (self.export_request.len != 0) self.allocator.free(self.export_request);
-        self.export_request = try self.allocator.dupe(u8, args);
-        self.export_confirm = true;
-        const message = try std.fmt.allocPrint(self.allocator, "That file already exists.\nPress y to overwrite it, n to cancel.", .{});
-        defer self.allocator.free(message);
-        if (self.overlay_body_owned.len != 0) self.allocator.free(self.overlay_body_owned);
-        self.overlay_body_owned = try self.allocator.dupe(u8, message);
-        self.help_overlay.title = "Overwrite?";
-        self.help_overlay.body = self.overlay_body_owned;
-        self.help_overlay.visible = true;
-        self.help_overlay.pick = false;
-        self.msg_overlay.visible = false;
-        self.overlay = .message;
-    }
-
-    fn pathExists(self: *AppModel, path: []const u8) !bool {
-        const cwd = std.Io.Dir.cwd();
-        if (cwd.access(self.io, path, .{})) |_| return true else |_| return false;
-    }
-
-    fn exportPcap(self: *AppModel, out_path: []const u8, frame: ?u32) !void {
-        const path = self.capturePath() orelse {
-            try self.showMessage("No capture file loaded");
-            return;
-        };
-        var argv = try process_mod.argvExportPcap(
-            self.allocator,
-            self.tools.tshark,
-            path,
-            self.session.display_filter,
-            out_path,
-            frame,
-        );
-        defer argv.deinit(self.allocator);
-        var out = try self.runProcess(argv.slice());
-        defer out.deinit(self.allocator);
-        if (!out.term.success()) {
-            try self.showMessage(if (out.stderr.len != 0) out.stderr else "Export failed");
-            return;
-        }
-        const message = try std.fmt.allocPrint(self.allocator, "Wrote {s}", .{out_path});
-        defer self.allocator.free(message);
-        try self.showMessage(message);
-    }
-
-    fn exportObjects(self: *AppModel, protocol: []const u8, directory: []const u8) !void {
-        const path = self.capturePath() orelse {
-            try self.showMessage("No capture file loaded");
-            return;
-        };
-        std.Io.Dir.cwd().createDirPath(self.io, directory) catch {
-            try self.showMessage("Could not create that directory");
-            return;
-        };
-        var argv = try process_mod.argvExportObjects(
-            self.allocator,
-            self.tools.tshark,
-            path,
-            self.session.display_filter,
-            protocol,
-            directory,
-        );
-        defer argv.deinit(self.allocator);
-        var out = try self.runProcess(argv.slice());
-        defer out.deinit(self.allocator);
-        if (!out.term.success()) {
-            try self.showMessage(if (out.stderr.len != 0) out.stderr else "Export failed");
-            return;
-        }
-        const message = try std.fmt.allocPrint(self.allocator, "Exported {s} objects to {s}", .{ protocol, directory });
-        defer self.allocator.free(message);
-        try self.showMessage(message);
-    }
-
-    fn writeDisplayed(self: *AppModel, path: []const u8, json: bool) !void {
-        var text: std.Io.Writer.Allocating = .init(self.allocator);
-        errdefer text.deinit();
-        const headers = self.session.list_headers;
-        const packets = self.session.packets;
-        if (json) {
-            try text.writer.writeByte('[');
-            for (packets, 0..) |row, row_index| {
-                if (row_index != 0) try text.writer.writeByte(',');
-                try text.writer.writeByte('{');
-                for (row.columns, 0..) |column, column_index| {
-                    if (column_index != 0) try text.writer.writeByte(',');
-                    const key = if (column_index < headers.len) headers[column_index] else "column";
-                    try writeJsonString(&text.writer, key);
-                    try text.writer.writeByte(':');
-                    try writeJsonString(&text.writer, column);
-                }
-                try text.writer.writeByte('}');
-            }
-            try text.writer.writeByte(']');
-        } else {
-            const width = if (packets.len == 0) headers.len else packets[0].columns.len;
-            var column_index: usize = 0;
-            while (column_index < width) : (column_index += 1) {
-                if (column_index != 0) try text.writer.writeByte(',');
-                const key = if (column_index < headers.len) headers[column_index] else "column";
-                try writeCsvField(&text.writer, key);
-            }
-            if (width != 0) try text.writer.writeByte('\n');
-            for (packets) |row| {
-                for (row.columns, 0..) |column, index| {
-                    if (index != 0) try text.writer.writeByte(',');
-                    try writeCsvField(&text.writer, column);
-                }
-                try text.writer.writeByte('\n');
-            }
-        }
-        const bytes = try text.toOwnedSlice();
-        defer self.allocator.free(bytes);
-        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = bytes });
-        const message = try std.fmt.allocPrint(self.allocator, "Wrote {s}", .{path});
-        defer self.allocator.free(message);
-        try self.showMessage(message);
     }
 
     pub fn applyColumns(self: *AppModel, args: []const u8) !void {
@@ -2491,6 +1951,7 @@ pub const AppModel = struct {
         }
 
         const owned = self.allocator.dupe(u8, self.filter_seen) catch return;
+        self.filter_check_token.reset();
         self.filter_check_inflight.store(true, .release);
         if (self.filter_check_sync) {
             self.runFilterCheck(owned);
@@ -2523,10 +1984,17 @@ pub const AppModel = struct {
             self.empty_pcap,
             expanded,
             self.process_runner,
+            &self.filter_check_token,
         ) catch {
             self.allocator.free(text);
             return;
         };
+        if (self.filter_check_token.isCancelled()) {
+            self.allocator.free(text);
+            var dropped = verdict;
+            dropped.deinit(self.allocator);
+            return;
+        }
         const elapsed_ms = @divTrunc(std.Io.Timestamp.now(self.io, .awake).nanoseconds -| started, std.time.ns_per_ms);
         log_mod.info("filter", "checked in {d} ms", .{elapsed_ms});
         self.filter_check_mutex.lockUncancelable(self.io);
@@ -2622,25 +2090,25 @@ pub const AppModel = struct {
         self.overlay = .message;
     }
 
-    fn persistConfig(self: *AppModel) void {
+    pub fn persistConfig(self: *AppModel) void {
         const path = self.paths.configFile(self.allocator) catch return;
         defer self.allocator.free(path);
         self.config.save(self.io, path) catch {};
     }
 
-    fn clearStreamChunks(self: *AppModel) void {
+    pub fn clearStreamChunks(self: *AppModel) void {
         for (self.stream_chunks) |*chunk| chunk.deinit(self.allocator);
         if (self.stream_chunks.len != 0) self.allocator.free(self.stream_chunks);
         self.stream_chunks = &.{};
     }
 
-    fn clearConversations(self: *AppModel) void {
+    pub fn clearConversations(self: *AppModel) void {
         for (self.conversations) |*conversation| conversation.deinit(self.allocator);
         if (self.conversations.len != 0) self.allocator.free(self.conversations);
         self.conversations = &.{};
     }
 
-    fn showPick(self: *AppModel, title: []const u8, body: []const u8, kind: OverlayKind) !void {
+    pub fn showPick(self: *AppModel, title: []const u8, body: []const u8, kind: OverlayKind) !void {
         if (self.overlay_body_owned.len != 0) self.allocator.free(self.overlay_body_owned);
         self.overlay_body_owned = try self.allocator.dupe(u8, body);
         self.help_overlay.title = title;
@@ -2652,139 +2120,6 @@ pub const AppModel = struct {
         self.help_overlay.line_count = std.mem.count(u8, body, "\n") + if (body.len > 0 and !std.mem.endsWith(u8, body, "\n")) @as(usize, 1) else 0;
         self.msg_overlay.visible = false;
         self.overlay = kind;
-    }
-
-    pub fn showStream(self: *AppModel, proto: []const u8, index: u32, body: []const u8, capped: bool) !void {
-        if (self.stream_filter.len != 0) self.allocator.free(self.stream_filter);
-        self.stream_filter = try std.fmt.allocPrint(self.allocator, "{s}.stream == {d}", .{ proto, index });
-        var parsed = streams_shark.parseYaml(self.allocator, body) catch streams_shark.parse(self.allocator, body) catch {
-            const shown = try capText(self.allocator, body, capped, false);
-            defer self.allocator.free(shown);
-            try self.showPick("Stream", shown, .streams);
-            return;
-        };
-        self.clearStreamChunks();
-        self.stream_chunks = parsed.chunks;
-        parsed.chunks = &.{};
-        defer parsed.deinit(self.allocator);
-        if (parsed.filter.len != 0) {
-            self.allocator.free(self.stream_filter);
-            self.stream_filter = try self.allocator.dupe(u8, parsed.filter);
-        }
-        const row_capped = try self.trimStreamChunks();
-        var text: std.Io.Writer.Allocating = .init(self.allocator);
-        defer text.deinit();
-        if (self.stream_chunks.len == 0) {
-            try text.writer.writeAll(body);
-        } else {
-            for (self.stream_chunks, 0..) |chunk, i| {
-                if (i != 0) try text.writer.writeByte('\n');
-                const preview = std.mem.sliceTo(chunk.data, 0);
-                const shown = if (preview.len > 48) preview[0..48] else preview;
-                const way = if (chunk.direction == .client) "client -> server" else "server -> client";
-                if (chunk.frame) |frame| {
-                    try text.writer.print("{d: >3}  frame {d}  {s}  {d} bytes  {s}", .{
-                        i,
-                        frame,
-                        way,
-                        chunk.data.len,
-                        shown,
-                    });
-                } else {
-                    try text.writer.print("{d: >3}  {s}  {d} bytes  {s}", .{
-                        i,
-                        way,
-                        chunk.data.len,
-                        shown,
-                    });
-                }
-            }
-        }
-        try writeCapNote(&text.writer, capped, row_capped);
-        const owned = try text.toOwnedSlice();
-        defer self.allocator.free(owned);
-        var known_frame = false;
-        for (self.stream_chunks) |chunk| {
-            if (chunk.frame != null) known_frame = true;
-        }
-        try self.showPick(if (known_frame)
-            "Stream  Enter jumps to that frame"
-        else
-            "Stream  Enter guesses the packet", owned, .streams);
-    }
-
-    fn trimStreamChunks(self: *AppModel) !bool {
-        if (self.stream_chunks.len <= process_mod.view_row_cap) return false;
-        for (self.stream_chunks[process_mod.view_row_cap..]) |*chunk| chunk.deinit(self.allocator);
-        const kept = try self.allocator.alloc(streams_shark.Chunk, process_mod.view_row_cap);
-        @memcpy(kept, self.stream_chunks[0..process_mod.view_row_cap]);
-        self.allocator.free(self.stream_chunks);
-        self.stream_chunks = kept;
-        return true;
-    }
-
-    pub fn showConversations(self: *AppModel, path: []const u8, proto: []const u8) !void {
-        var argv = try process_mod.argvConversations(self.allocator, self.tools.tshark, path, proto);
-        defer argv.deinit(self.allocator);
-        var out = try self.runProcessLimited(argv.slice(), process_mod.view_stdout_cap);
-        defer out.deinit(self.allocator);
-        self.clearConversations();
-        if (self.conversation_proto.len != 0) self.allocator.free(self.conversation_proto);
-        self.conversation_proto = try self.allocator.dupe(u8, proto);
-        self.conversations = convs_shark.parse(self.allocator, out.stdout) catch {
-            const shown = try capText(self.allocator, if (out.stdout.len != 0) out.stdout else out.stderr, out.truncated, false);
-            defer self.allocator.free(shown);
-            try self.showPick("Conversations", shown, .convs);
-            return;
-        };
-        const row_capped = try self.trimConversations();
-        var text: std.Io.Writer.Allocating = .init(self.allocator);
-        defer text.deinit();
-        if (self.conversations.len == 0) {
-            try text.writer.print("No {s} conversations\n{s}", .{ proto, out.stderr });
-        }
-        for (self.conversations, 0..) |conversation, i| {
-            if (i != 0) try text.writer.writeByte('\n');
-            try text.writer.print("{d: >3}  {s}", .{ i + 1, conversation.addr_a });
-            if (conversation.port_a) |port| try text.writer.print(":{d}", .{port});
-            try text.writer.print(" <-> {s}", .{conversation.addr_b});
-            if (conversation.port_b) |port| try text.writer.print(":{d}", .{port});
-            try text.writer.print("   {d} frames  {d} bytes", .{ conversation.frames_total, conversation.bytes_total });
-            if (self.config.conv_absolute_time) {
-                try text.writer.print("  start {d:.3}s", .{conversation.rel_start});
-            }
-        }
-        try writeCapNote(&text.writer, out.truncated, row_capped);
-        const owned = try text.toOwnedSlice();
-        defer self.allocator.free(owned);
-        try self.showPick("Conversations  Enter filters the list", owned, .convs);
-    }
-
-    fn trimConversations(self: *AppModel) !bool {
-        if (self.conversations.len <= process_mod.view_row_cap) return false;
-        for (self.conversations[process_mod.view_row_cap..]) |*conversation| conversation.deinit(self.allocator);
-        const kept = try self.allocator.alloc(convs_shark.Conversation, process_mod.view_row_cap);
-        @memcpy(kept, self.conversations[0..process_mod.view_row_cap]);
-        self.allocator.free(self.conversations);
-        self.conversations = kept;
-        return true;
-    }
-
-    fn writeCapNote(writer: *std.Io.Writer, bytes: bool, rows: bool) !void {
-        if (!bytes and !rows) return;
-        try writer.writeByte('\n');
-        if (rows) try writer.print("Stopped after {d} rows. ", .{process_mod.view_row_cap});
-        if (bytes) try writer.writeAll("Stopped at the 1 MiB output cap. ");
-        try writer.writeAll("The rest was not loaded.");
-    }
-
-    fn capText(allocator: std.mem.Allocator, body: []const u8, bytes: bool, rows: bool) ![]u8 {
-        if (!bytes and !rows) return allocator.dupe(u8, body);
-        var text: std.Io.Writer.Allocating = .init(allocator);
-        errdefer text.deinit();
-        try text.writer.writeAll(body);
-        try writeCapNote(&text.writer, bytes, rows);
-        return text.toOwnedSlice();
     }
 
     pub fn activatePick(self: *AppModel) !void {
@@ -2868,6 +2203,25 @@ pub const AppModel = struct {
                 self.focus = .protocol;
                 if (!self.protocol_tree.selectNamed("_ws.expert", occurrence)) {
                     try self.showMessage("That expert field is not in the open packet");
+                }
+            },
+            .expert_file => {
+                const index = self.help_overlay.selected;
+                if (index >= self.stat_filters.len) return;
+                const summary = try self.allocator.dupe(u8, self.stat_filters[index]);
+                defer self.allocator.free(summary);
+                self.dismissOverlays();
+                const frame = (try @import("views/analysis.zig").firstExpertFrame(self, summary)) orelse {
+                    try self.showMessage("That expert item is not on a frame in this capture");
+                    return;
+                };
+                if (self.selectFrame(frame)) {
+                    self.syncFromSession();
+                    try self.loadDetailForSelection();
+                } else {
+                    const message = try std.fmt.allocPrint(self.allocator, "Frame {d} is not in the list", .{frame});
+                    defer self.allocator.free(message);
+                    try self.showMessage(message);
                 }
             },
             .hierarchy => {
@@ -3207,7 +2561,7 @@ pub const AppModel = struct {
         try ctx.sendNotification("zigshark", "Copied selection");
     }
 
-    fn dismissOverlays(self: *AppModel) void {
+    pub fn dismissOverlays(self: *AppModel) void {
         self.help_overlay.visible = false;
         self.help_overlay.pick = false;
         self.msg_overlay.visible = false;
@@ -3252,6 +2606,10 @@ pub const AppModel = struct {
                 if (self.help_overlay.visible or self.msg_overlay.visible) {
                     if (key.matches('q', .{}) or key.matches(vaxis.Key.escape, .{})) {
                         self.dismissOverlays();
+                        return ctx.consumeAndRedraw();
+                    }
+                    if (self.overlay == .streams and self.help_overlay.visible and key.matches('f', .{})) {
+                        try self.applyOpenStreamFilter();
                         return ctx.consumeAndRedraw();
                     }
                     if (self.help_overlay.visible and self.help_overlay.pick and key.matches(vaxis.Key.enter, .{})) {
@@ -3406,6 +2764,10 @@ pub const AppModel = struct {
                 if (self.help_overlay.visible or self.msg_overlay.visible) {
                     if (key.matches('q', .{}) or key.matches(vaxis.Key.escape, .{})) {
                         self.dismissOverlays();
+                        return ctx.consumeAndRedraw();
+                    }
+                    if (self.overlay == .streams and self.help_overlay.visible and key.matches('f', .{})) {
+                        try self.applyOpenStreamFilter();
                         return ctx.consumeAndRedraw();
                     }
                     if (self.help_overlay.visible and self.help_overlay.pick and key.matches(vaxis.Key.enter, .{})) {
@@ -3997,25 +3359,4 @@ fn collectDecodeSelectors(
         }
     }
     for (node.children) |*child| try collectDecodeSelectors(allocator, child, choices);
-}
-
-fn writeJsonString(writer: *std.Io.Writer, text: []const u8) !void {
-    try writer.writeByte('"');
-    for (text) |char| switch (char) {
-        '"' => try writer.writeAll("\\\""),
-        '\\' => try writer.writeAll("\\\\"),
-        '\n' => try writer.writeAll("\\n"),
-        '\r' => try writer.writeAll("\\r"),
-        else => try writer.writeByte(char),
-    };
-    try writer.writeByte('"');
-}
-
-fn writeCsvField(writer: *std.Io.Writer, text: []const u8) !void {
-    try writer.writeByte('"');
-    for (text) |char| {
-        if (char == '"') try writer.writeByte('"');
-        try writer.writeByte(char);
-    }
-    try writer.writeByte('"');
 }

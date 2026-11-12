@@ -28,6 +28,7 @@ pub fn explainDisplayFilter(
     empty_pcap: []const u8,
     filter: []const u8,
     runner: ?process.Runner,
+    token: ?*process.CancellationToken,
 ) !FilterVerdict {
     if (filter.len == 0) return .{ .ok = true, .detail = try allocator.dupe(u8, "") };
 
@@ -37,7 +38,7 @@ pub fn explainDisplayFilter(
     var out = if (runner) |run|
         try run(allocator, io, argv.slice())
     else
-        try process.runCapture(allocator, io, argv.slice());
+        try process.runCaptureCancellable(allocator, io, argv.slice(), token);
     defer out.deinit(allocator);
 
     if (out.term.success()) return .{ .ok = true, .detail = try allocator.dupe(u8, "") };
@@ -52,7 +53,7 @@ pub fn validateDisplayFilterRun(
     filter: []const u8,
     runner: ?process.Runner,
 ) !bool {
-    var verdict = try explainDisplayFilter(allocator, io, tshark, empty_pcap, filter, runner);
+    var verdict = try explainDisplayFilter(allocator, io, tshark, empty_pcap, filter, runner, null);
     defer verdict.deinit(allocator);
     return verdict.ok;
 }
@@ -88,7 +89,7 @@ test "invalid filter keeps the tshark error line" {
             };
         }
     }.run;
-    var verdict = try explainDisplayFilter(allocator, std.testing.io, "tshark", "empty.pcap", "nope", runner);
+    var verdict = try explainDisplayFilter(allocator, std.testing.io, "tshark", "empty.pcap", "nope", runner, null);
     defer verdict.deinit(allocator);
     try std.testing.expect(!verdict.ok);
     try std.testing.expectEqualStrings("\"nope\" was unexpected in this context", verdict.detail);

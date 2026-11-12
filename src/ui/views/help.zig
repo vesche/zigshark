@@ -14,7 +14,7 @@ pub const text =
     \\=                 Field filter in the tree, conversation filter in the list
     \\g / :goto         Go to a frame number
     \\Ctrl-T / :time-ref  Time zero on this frame. Press again to clear
-    \\:expert           Expert info on this packet. Enter opens the field
+    \\:expert [all]     This packet, or every expert item. Enter opens the field or frame
     \\:hierarchy        Protocol hierarchy. Enter filters that protocol
     \\:endpoints        Loudest addresses. Enter filters that address
     \\:export           packets, packet, json, csv, or objects http|smb
@@ -33,7 +33,7 @@ pub const text =
     \\{ }               Previous / next packet with this source address
     \\p                 Other side of a request/response
     \\Ctrl-P / :back    Previous display filter
-    \\:streams          Follow a stream. Enter jumps to the frame, or guesses
+    \\:streams          Client left, server right. f filters. Enter selects the frame
     \\:set name-resolution  tshark -N flags. off clears them
     \\:iograph [secs]   Packets per interval. Enter filters that range
     \\:dns / :http      Name or request rows. Enter filters

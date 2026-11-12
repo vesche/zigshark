@@ -35,11 +35,11 @@ pub const defaultCommands = [_]CommandDef{
     .{ .name = "clear-filter", .description = "Clear display filter", .usage = ":clear-filter" },
     .{ .name = "clear-packets", .description = "Clear the packet list", .usage = ":clear-packets" },
     .{ .name = "load", .description = "Load a capture file", .usage = ":load <path>" },
-    .{ .name = "streams", .description = "Follow the current TCP/UDP stream", .usage = ":streams [tcp|udp] [index] [ascii|hex|raw]" },
+    .{ .name = "streams", .description = "Follow the current TCP/UDP stream", .usage = ":streams [tcp|udp] [index] [ascii|hex|raw] | filter" },
     .{ .name = "convs", .description = "List conversations; Enter filters", .usage = ":convs [tcp|udp|ip|ipv6|eth]" },
     .{ .name = "capinfo", .description = "Capture file info", .usage = ":capinfo" },
     .{ .name = "columns", .description = "Choose the packet-list columns", .usage = ":columns [default|delta|absolute|set <format>|add <field>|drop <field>]" },
-    .{ .name = "expert", .description = "Expert info on the open packet", .usage = ":expert" },
+    .{ .name = "expert", .description = "Expert info for this packet, or the whole file", .usage = ":expert [all]" },
     .{ .name = "time-ref", .description = "Set or clear time zero on the selected frame", .usage = ":time-ref" },
     .{ .name = "tail", .description = "Follow a growing capture", .usage = ":tail" },
     .{ .name = "stop", .description = "Stop the live capture and keep the saved file", .usage = ":stop" },
@@ -267,7 +267,7 @@ test "fuzzy match" {
 }
 
 test "selected commands show their arguments" {
-    try std.testing.expectEqualStrings(":streams [tcp|udp] [index] [ascii|hex|raw]", commandUsage("streams"));
+    try std.testing.expectEqualStrings(":streams [tcp|udp] [index] [ascii|hex|raw] | filter", commandUsage("streams"));
     try std.testing.expect(std.mem.indexOf(u8, commandUsage("columns"), "set <format>") != null);
     try std.testing.expectEqualStrings(":decode-as [layer==selector,protocol]", commandUsage("decode-as"));
 }

@@ -7,6 +7,11 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(allocator);
     const capture = argAfter(args, "-r");
     if (capture == null) {
+        if (argAfter(args, "-G") != null) {
+            try std.Io.sleep(io, .fromSeconds(8), .awake);
+            try writeStdout(io, "F\tField name\ttcp.port\n");
+            return;
+        }
         try flood(io);
         return;
     }

@@ -212,6 +212,69 @@ fn decodeBase64(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
     return out;
 }
 
+pub const sequence_line_width: usize = 40;
+
+/// One fixed-width line. The client is on the left and ends in `>`. The server
+/// is on the right and starts with `<`. A missing frame number leaves that
+/// side unlabeled. Payload bytes that are not printable ASCII become `.`.
+pub fn writeSequenceLine(
+    writer: *std.Io.Writer,
+    direction: Direction,
+    data: []const u8,
+    frame: ?u32,
+) !void {
+    var line: [sequence_line_width]u8 = @splat(' ');
+    var preview_buf: [12]u8 = undefined;
+    const preview = sequencePreview(data, &preview_buf);
+    if (direction == .client) {
+        const frame_width = 10;
+        if (frame) |number| {
+            var frame_buf: [10]u8 = undefined;
+            const printed = try std.fmt.bufPrint(&frame_buf, "{d:>10}", .{number});
+            const n = @min(printed.len, frame_width);
+            @memcpy(line[0..n], printed[0..n]);
+        }
+        const start: usize = frame_width + 1;
+        const arrow: usize = sequence_line_width - 1;
+        const n = @min(preview.len, arrow - start);
+        @memcpy(line[start..][0..n], preview[0..n]);
+        for (line[start + n .. arrow]) |*cell| cell.* = '-';
+        line[arrow] = '>';
+    } else {
+        var suffix_buf: [24]u8 = undefined;
+        const suffix = if (frame) |number|
+            try std.fmt.bufPrint(&suffix_buf, "{s} {d}", .{ preview, number })
+        else
+            preview;
+        const n = @min(suffix.len, sequence_line_width - 1);
+        const shown = suffix[suffix.len - n ..];
+        const at = sequence_line_width - n;
+        line[0] = '<';
+        var index: usize = 1;
+        while (index < at) : (index += 1) line[index] = '-';
+        if (n != 0) @memcpy(line[at..][0..n], shown);
+    }
+    try writer.writeAll(&line);
+}
+
+pub fn sequenceDiagram(allocator: std.mem.Allocator, chunks: []const Chunk) ![]u8 {
+    var text: std.Io.Writer.Allocating = .init(allocator);
+    errdefer text.deinit();
+    for (chunks, 0..) |chunk, index| {
+        if (index != 0) try text.writer.writeByte('\n');
+        try writeSequenceLine(&text.writer, chunk.direction, chunk.data, chunk.frame);
+    }
+    return text.toOwnedSlice();
+}
+
+fn sequencePreview(data: []const u8, buf: []u8) []const u8 {
+    const n = @min(data.len, buf.len);
+    for (data[0..n], 0..) |byte, index| {
+        buf[index] = if (std.ascii.isPrint(byte)) byte else '.';
+    }
+    return buf[0..n];
+}
+
 pub fn frameContainsFilter(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     errdefer writer.deinit();
@@ -222,6 +285,46 @@ pub fn frameContainsFilter(allocator: std.mem.Allocator, bytes: []const u8) ![]u
         try writer.writer.print("{x:0>2}", .{byte});
     }
     return writer.toOwnedSlice();
+}
+
+test "sequence diagram keeps the client on the left" {
+    const alloc = std.testing.allocator;
+    const hello = try alloc.dupe(u8, "Hello");
+    defer alloc.free(hello);
+    const world = try alloc.dupe(u8, "World");
+    defer alloc.free(world);
+    const bang = try alloc.dupe(u8, "!\nb");
+    defer alloc.free(bang);
+    const chunks = [_]Chunk{
+        .{ .direction = .client, .data = hello, .frame = 12 },
+        .{ .direction = .server, .data = world, .frame = 13 },
+        .{ .direction = .client, .data = bang, .frame = null },
+    };
+
+    const body = try sequenceDiagram(alloc, &chunks);
+    defer alloc.free(body);
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    const client = lines.next() orelse return error.MissingLine;
+    const server = lines.next() orelse return error.MissingLine;
+    const unlabeled = lines.next() orelse return error.MissingLine;
+    try std.testing.expect(lines.next() == null);
+
+    try std.testing.expectEqual(sequence_line_width, client.len);
+    try std.testing.expectEqual(sequence_line_width, server.len);
+    try std.testing.expectEqual(sequence_line_width, unlabeled.len);
+    try std.testing.expect(client[client.len - 1] == '>');
+    try std.testing.expect(server[0] == '<');
+    try std.testing.expect(unlabeled[unlabeled.len - 1] == '>');
+
+    const hello_at = std.mem.indexOf(u8, client, "Hello") orelse return error.MissingPayload;
+    const world_at = std.mem.indexOf(u8, server, "World") orelse return error.MissingPayload;
+    try std.testing.expect(hello_at < sequence_line_width / 2);
+    try std.testing.expect(world_at > sequence_line_width / 2);
+    try std.testing.expect(std.mem.indexOf(u8, client, "12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, server, "13") != null);
+    try std.testing.expect(std.mem.indexOfAny(u8, unlabeled, "0123456789") == null);
+    try std.testing.expect(std.mem.indexOf(u8, unlabeled, "!.b") != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, unlabeled, '\n') == null);
 }
 
 test "frame contains filter uses the first bytes" {

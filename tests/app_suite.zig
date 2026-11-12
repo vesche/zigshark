@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const zigshark = @import("zigshark");
 
 const app_mod = zigshark.ui.app;
@@ -54,6 +55,19 @@ const endpoint_text =
     \\10.0.0.9                  443            4   900 bytes           2      400 bytes            2      500 bytes
     \\10.0.0.1                  80             2   100 bytes           1      40 bytes             1      60 bytes
 ;
+const expert_stat =
+    \\
+    \\Errors (1)
+    \\=============
+    \\   Frequency      Group           Protocol  Summary
+    \\           1   Malformed               TCP  Bad checksum
+    \\
+    \\Notes (1)
+    \\=============
+    \\   Frequency      Group           Protocol  Summary
+    \\           4       Sequence               TCP  Previous segment not captured
+    \\
+;
 const protocol_text = "Hypertext Transfer Protocol\tHTTP\thttp\tT\tT\tT\n" ++
     "Transport Layer Security\tTLS\ttls\tT\tT\tT\n" ++
     "Domain Name System\tDNS\tdns\tT\tT\tT\n";
@@ -93,6 +107,9 @@ fn scriptedRun(
     argv: []const []const u8,
 ) !process.RunOutput {
     _ = io;
+    for (argv) |arg| {
+        if (std.mem.eql(u8, arg, "boom")) return error.ToolFailed;
+    }
     const script = active_script orelse return error.NoScript;
     try script.note(argv);
     var failed = false;
@@ -136,6 +153,8 @@ fn replyFor(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
         if (std.mem.startsWith(u8, arg, "lua_script:")) return allocator.dupe(u8, "lua ok\n");
         if (std.mem.startsWith(u8, arg, "endpoints,")) return allocator.dupe(u8, endpoint_text);
         if (std.mem.eql(u8, arg, "protocols")) return allocator.dupe(u8, protocol_text);
+        if (std.mem.indexOf(u8, arg, "_ws.expert.message") != null) return allocator.dupe(u8, "12\n");
+        if (std.mem.eql(u8, arg, "expert")) return allocator.dupe(u8, expert_stat);
         if (std.mem.eql(u8, arg, "frame.number")) return allocator.dupe(u8, "1\n4\n9\n");
     }
     return allocator.dupe(u8, "");
@@ -882,6 +901,7 @@ test "expert info comes from the open packet and time zero is local" {
     try installDetail(&h, children, "");
     try h.app.runCommand("expert", "");
     try std.testing.expectEqual(@as(usize, 2), h.app.expert_items.len);
+    try std.testing.expect(h.app.overlay == .expert);
     try std.testing.expect(std.mem.startsWith(u8, h.app.help_overlay.body, "warning"));
     try h.app.activatePick();
     const selected = h.app.protocol_tree.selectedField() orelse return error.MissingField;
@@ -903,6 +923,17 @@ test "expert info comes from the open packet and time zero is local" {
     try std.testing.expectEqual(@as(?u32, 2), h.app.time_reference_frame);
     try h.app.toggleTimeReference();
     try std.testing.expect(h.app.time_reference_frame == null);
+
+    try h.setFrames(&.{ 4, 12 });
+    try h.app.runCommand("expert", "all");
+    try std.testing.expect(h.app.overlay == .expert_file);
+    try std.testing.expect(std.mem.startsWith(u8, h.app.help_overlay.body, "error"));
+    try std.testing.expect(std.mem.indexOf(u8, h.app.help_overlay.body, "Bad checksum") != null);
+    try std.testing.expectEqual(@as(usize, 0), h.app.expert_items.len);
+    h.app.help_overlay.selected = 0;
+    try h.app.activatePick();
+    try std.testing.expectEqual(@as(?u32, 12), h.app.session.selectedFrame());
+    try std.testing.expectEqual(@as(usize, 0), h.app.session.display_filter.len);
 }
 
 fn timedRow(allocator: std.mem.Allocator, frame: u32, time: []const u8) !packet.PacketSummary {
@@ -1055,7 +1086,7 @@ test "color rules, packet comments, and lua scripts" {
     try h.app.runCommand("color", "delete dns");
     try std.testing.expectEqual(@as(usize, 0), h.app.config.color_rules.items.len);
 
-    try h.setFrames(&.{ 7 });
+    try h.setFrames(&.{7});
     try h.app.runCommand("comment", "");
     try std.testing.expect(std.mem.indexOf(u8, h.app.msg_overlay.body, "saved note") != null);
     try h.app.runCommand("comment", "hello");
@@ -1146,7 +1177,7 @@ test "name resolution reaches tshark and a mark keeps its note" {
     var h: Harness = undefined;
     try h.setup();
     defer h.teardown();
-    try h.setFrames(&.{ 7 });
+    try h.setFrames(&.{7});
     try h.app.runCommand("set", "name-resolution dmN");
     try std.testing.expectEqualStrings("dmN", h.app.session.name_resolution);
     var saw_flag = false;
@@ -1195,6 +1226,37 @@ test "selecting a packet pauses live tail and End resumes it" {
     try std.testing.expectEqual(@as(?usize, 2), h.app.session.selected_index);
 }
 
+const yaml_follow =
+    \\  - packet: 12
+    \\    peer: 0
+    \\    data: !!binary |
+    \\      SGVsbG8=
+    \\  - packet: 13
+    \\    peer: 1
+    \\    data: !!binary |
+    \\      V29ybGQ=
+    \\  - packet:
+    \\    peer: 0
+    \\    data: !!binary |
+    \\      IQ==
+;
+
+fn fakeTsharkPath(allocator: std.mem.Allocator) ![]u8 {
+    const name = if (builtin.os.tag == .windows) "fake-tshark.exe" else "fake-tshark";
+    return std.fmt.allocPrint(allocator, "zig-out/bin/{s}", .{name});
+}
+
+fn waitForFile(io: std.Io, path: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    var spins: usize = 0;
+    while (spins < 150) : (spins += 1) {
+        if (cwd.access(io, path, .{})) |_| return else |_| {
+            try std.Io.sleep(io, .fromMilliseconds(20), .awake);
+        }
+    }
+    return error.NotStarted;
+}
+
 test "stop ends a live capture and names the saved file" {
     var h: Harness = undefined;
     try h.setup();
@@ -1206,4 +1268,103 @@ test "stop ends a live capture and names the saved file" {
     try std.testing.expect(!h.app.live_capture);
     try std.testing.expect(!h.app.follow_tail);
     try std.testing.expect(std.mem.indexOf(u8, h.app.msg_overlay.body, "/tmp/keep.pcap") != null);
+}
+
+test "a failed analysis menu item is shown" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    try h.app.openCapture("boom");
+    h.app.header_menu = .analysis;
+    h.app.menu_analysis = true;
+    const activate = h.app.dropdown.on_activate orelse return error.MissingMenu;
+    activate(h.app.dropdown.userdata, 2);
+    try std.testing.expect(h.app.header_menu == null);
+    try std.testing.expect(std.mem.indexOf(u8, h.app.msg_overlay.body, "ToolFailed") != null);
+}
+
+test "stream diagram selects the frame and f filters the list" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    try h.app.runCommand("streams", "filter");
+    try std.testing.expect(std.mem.indexOf(u8, h.app.msg_overlay.body, "Follow a stream") != null);
+
+    try h.setFrames(&.{ 12, 13 });
+    try h.app.showStream("TCP", 2, yaml_follow, false);
+    try std.testing.expectEqualStrings("tcp.stream == 2", h.app.stream_list_filter);
+    try std.testing.expect(std.mem.indexOf(u8, h.app.help_overlay.title, "Enter selects") != null);
+
+    var lines = std.mem.splitScalar(u8, h.app.help_overlay.body, '\n');
+    const client = lines.next() orelse return error.MissingLine;
+    const server = lines.next() orelse return error.MissingLine;
+    const unlabeled = lines.next() orelse return error.MissingLine;
+    try std.testing.expect(client[client.len - 1] == '>');
+    try std.testing.expect(std.mem.indexOf(u8, client, "Hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, client, "12") != null);
+    try std.testing.expect(server[0] == '<');
+    try std.testing.expect(std.mem.indexOf(u8, server, "World") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unlabeled, "!") != null);
+    try std.testing.expect(std.mem.indexOfAny(u8, unlabeled, "0123456789") == null);
+
+    h.app.help_overlay.selected = 0;
+    try h.app.activatePick();
+    try std.testing.expectEqual(@as(?u32, 12), h.app.session.selectedFrame());
+    try std.testing.expectEqual(@as(usize, 0), h.app.session.display_filter.len);
+
+    try h.app.runCommand("streams", "filter");
+    try std.testing.expectEqualStrings("tcp.stream == 2", h.app.session.display_filter);
+    try std.testing.expect(!h.script.saw("frame contains"));
+}
+
+test "quit kills a running field dump" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    const tool = try fakeTsharkPath(h.allocator);
+    defer h.allocator.free(tool);
+    const owned = try h.allocator.dupe(u8, tool);
+    h.allocator.free(h.app.fields_tshark_path);
+    h.app.fields_tshark_path = owned;
+
+    try h.app.ensureFieldCompletions();
+    try std.Io.sleep(h.io, .fromMilliseconds(100), .awake);
+    const before = std.Io.Timestamp.now(h.io, .awake).nanoseconds;
+    h.app.cancelToolChildren();
+    const elapsed = std.Io.Timestamp.now(h.io, .awake).nanoseconds - before;
+    if (elapsed >= 3 * std.time.ns_per_s) return error.QuitWaitedOnTshark;
+}
+
+test "quit kills a running filter check" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    h.app.process_runner = null;
+    const tool = try fakeTsharkPath(h.allocator);
+    defer h.allocator.free(tool);
+    const owned = try h.allocator.dupe(u8, tool);
+    h.allocator.free(h.tools.tshark);
+    h.tools.tshark = owned;
+
+    const slow = try std.fs.path.join(h.allocator, &.{ h.paths.cache_dir, "slow.pcap" });
+    h.allocator.free(h.app.empty_pcap);
+    h.app.empty_pcap = slow;
+    const started = try std.fmt.allocPrint(h.allocator, "{s}.started", .{slow});
+    defer h.allocator.free(started);
+    const finished = try std.fmt.allocPrint(h.allocator, "{s}.finished", .{slow});
+    defer h.allocator.free(finished);
+
+    try h.app.filter.setText("tcp");
+    var i: usize = 0;
+    while (i < 4) : (i += 1) h.app.pollFilterFeedback();
+    try waitForFile(h.io, started);
+
+    const before = std.Io.Timestamp.now(h.io, .awake).nanoseconds;
+    h.app.cancelToolChildren();
+    const elapsed = std.Io.Timestamp.now(h.io, .awake).nanoseconds - before;
+    if (elapsed >= 3 * std.time.ns_per_s) return error.QuitWaitedOnTshark;
+    if (std.Io.Dir.cwd().access(h.io, finished, .{})) |_| {
+        return error.FilterCheckRanToCompletion;
+    } else |_| {}
+    try std.testing.expectEqual(@as(usize, 0), h.app.session.display_filter.len);
 }

@@ -1,116 +1,260 @@
 # zigshark roadmap
 
-What to build after the parity-through-audit pass. That pass is the record in [roadmap-1.md](roadmap-1.md). [parity.md](parity.md) stays the termshark baseline. This file is the living plan.
+This file is the work queue. It is the only plan an agent should follow. [roadmap-1.md](roadmap-1.md) is the archive of the parity pass. [parity.md](parity.md) is the termshark baseline, not a queue. Do not edit either of those unless a blocked item below says to record a host result in parity.md.
 
-Dissection stays in tshark. zigshark should be the fastest way to drive that dissection from a terminal: filter, jump, compare, export, and keep your place in a large capture. A feature earns a place here when it removes a reason to open the Wireshark GUI.
+Prompt that starts a session:
 
-Legend:
+```text
+Read docs/roadmap.md and carry out the agent contract from the top. Keep going until the contract tells you to stop. Update the roadmap as you go.
+```
 
-- **now** — highest leverage, no new machines required
-- **next** — do after the now items
-- **blocked** — waiting on a capture host
-- **later** — worth doing, not on the critical path
-- **out of scope** — will not be built
+## Agent contract
 
-Suggested order: cancel tshark on quit, then correct the detail timing log, then the stream sequence diagram, then measure one large capture and only then change how detail or the packet list is stored. The capture screen waits for a host that can run dumpcap. Each feature ships with tests. `zig build` and `zig build test` stay the bar.
+Follow these steps in order. Do not ask which item to do.
 
-## 1. Still open
+1. Read this file. Trust it over memory of an older roadmap.
+2. If an item has status `active`, resume it from its **Resume** note. Otherwise start the first item under Ready.
+3. Set that item to `active` and write a one-line **Resume** note (`where you are`) before changing code. That is the checkpoint if the session dies.
+4. Do that item only. If you discover other work, add a new item. Do not start it.
+5. Stay inside the item's **Touch** list and **Do not** list. A file outside **Touch** may change only when the compiler or an existing test forces it.
+6. Verify with `zig build` and `zig build test`. An item that names another check runs that check too.
+7. When the **Done when** lines are true, move the whole item into Done, newest first, with the date, what changed, and the checks you ran. Delete it from Ready. Clear `active`.
+8. Start the next Ready item at step 3.
+9. Stop when any of these is true:
+   - The next item is under Blocked, or Ready is empty.
+   - `zig build test` fails and the failure is not in the files this item touched. Record it under Hazards. Re-run once. If it fails again, add a Ready item ranked by the priority rule and stop.
+   - Finishing the item would require breaking its **Do not** list or a rule under Do not build. Mark the item `blocked`, name the gate, and stop.
+10. Before you stop, the roadmap must match the tree: no `active` item without a **Resume** note, no finished work still sitting in Ready.
 
-Carried from [roadmap-1.md](roadmap-1.md). These are the only unfinished items from that pass.
+Do not create a git commit unless the user asked. Do not push. Do not weaken a test, a cap, or a **Do not** line to make an item look done.
 
-### Blocked on a capture host
+New work discovered during an item is inserted into Ready or Blocked. Give it the next free id (`R-` or `B-`). Place a Ready item by the priority rule and write one sentence on why it sits above the item under it. Do not renumber existing ids.
 
-The code paths exist. Nothing here is a bug to start on a machine that cannot capture.
+## Product
 
-| Item | Status | What "done" requires |
-|------|--------|----------------------|
-| Privileged live capture | **blocked** | dumpcap, the tshark fallback, multi-interface selection, growing-file refresh, and `:clear-packets` are implemented. Verify on Linux as a user in the capture group, including a permission failure that stays a message instead of a hang. |
-| Platform live capture | **blocked** | Same code paths on macOS, FreeBSD, and Windows. Cover interface names, promiscuous mode, a non-root failure, and stopping a capture without leaving dumpcap behind. |
-| In-UI capture screen | **blocked** | After the rows above are verified. Interface multi-select, capture filter, snaplen, promiscuous, ring buffer (`-b`), stop conditions, and a display filter that does not change what is written. |
-| Extcap sources | **blocked** | sshdump, ciscodump, and the rest show up in `tshark -D`. Treat them as interfaces with extra fields, after local capture is verified. |
-| File sets | **later** | `mergecap` a directory of ring-buffer files into the session, and next/previous file when the capture was `-b`. Skip until someone has a real ring buffer to open. |
+zigshark is a terminal UI that drives tshark. Dissection stays in tshark. zigshark is worth opening when it is the fastest way to filter, jump, compare, export, and keep your place. A change belongs in Ready only when it removes a hang, a leak, a wrong answer, a wait on the selection or quit path, or a repeated reason to open the Wireshark GUI.
 
-VM checklist, for whenever those hosts exist:
+A change is done when a person can observe the outcome, `zig build test` passes, and the user-guide plus the in-app help text match the binary if a key or command changed.
 
-- [ ] Linux: dumpcap as a `wireshark` group member, one interface, `-f` capture filter, stop, reopen the written file
-- [ ] Linux: dumpcap missing or unprivileged, tshark fallback, error text when both fail
-- [ ] Linux: two interfaces in one capture, `:clear-packets` hides frames already shown
-- [ ] macOS: interface list and a short capture without a panic on Ctrl-C
-- [ ] FreeBSD: same
-- [ ] Windows: interface list, file open, and a capture if Npcap is present; Ctrl-Z is a no-op
-- [ ] Record the host, Wireshark version, and result in [parity.md](parity.md), then move the deferred rows to **done** or file the real bug
+## Priority rule
 
-### Unblocked leftovers
+Use this order when inserting an item. Higher bands outrank lower bands. Inside a band, the item that hits more sessions ranks first. A dependency ranks above the item that needs it.
 
-- [ ] **now** — Compact sequence diagram for the followed stream. Yaml follow already stores a frame number on each chunk. Draw client left, server right, one line per chunk, and Enter selects that frame. A chunk with no frame number stays unlabeled. `docs/user-guide.md` still says this diagram is waiting on frame numbers. That sentence is stale and goes away with the feature.
-- [ ] **next** — File-wide expert info. `:expert` reads `_ws.expert` on the open packet. A full-file `tshark -z expert` list is the missing half: severity, summary, and Enter selects the frame. Keep the open-packet view.
-- [ ] **later** — A capture large enough to record time-to-first-row and time-to-detail. Check the numbers in. Do not assert a laptop-specific millisecond. See section 4 before changing the loader from those numbers.
-- [ ] **later** — PTY script that opens `tests/fixtures/1.pcap`, focuses the tree, expands a node, moves in the hex view, and quits with `ZZ`. Linux CI only, next to `tests/pty_smoke.py`. The current smoke test draws and dies on Ctrl-C. It does not press keys. vaxis paints by cell diff, so assertions go through the terminal in that script, not a search of the raw PTY bytes.
-- [ ] **later** — Windows CI installs tshark so `tests/integration_tools.zig` does not skip there. macOS already tries Homebrew and ignores failure. `.github/workflows/ci.yml` installs tshark on Linux only.
+1. Hang, leak, lost write, or a frame that is not the frame the UI named.
+2. Time the user waits on every packet selection, filter reload, or quit.
+3. A workflow that still sends a person to the Wireshark GUI on an ordinary capture.
+4. A missing test on a path that already exists.
+5. Structure that the next Ready item would otherwise duplicate.
+6. Polish.
 
-### Out of scope
+Host-gated work is Blocked, not a low Ready rank. Do not generate stand-in captures, skip checks, or "simulate" a host to unblock it.
 
-- Reimplementing dissectors, or reading libwireshark in-process
-- A bit-level packet diagram that needs a mouse-pixel layout
-- Android, Termux, and termshark config import
-- Cloning every Wireshark statistics dialog. A new protocol table has to earn a command the way `:dns` and `:http` did
+## Do not build
 
-## 2. New features
+- Dissectors, or reading libwireshark in-process.
+- A second in-memory copy of the unfiltered packet list. `:back` reloads. That was a choice.
+- A file-backed packet list, until B-01 has numbers that show the list, not tshark, is what forces swapping.
+- JSON instead of PDML. That was measured and rejected.
+- Fewer redraws, or virtualizing the packet list. The table already draws the visible window.
+- A new protocol statistics table. `:dns` and `:http` earned their commands. Another one needs a repeated workflow written into Ready first.
+- The in-UI capture screen, extcap sources, or ring-buffer file sets, until the blocked capture checks say the current capture paths work.
+- Android, Termux, and importing termshark config.
+- A bit-level packet diagram.
 
-Ordered by how often they come up in a session, after the carried items in section 1. The sequence diagram and the file-wide expert list are the two features already named. These are the ones that are not on that list yet.
+Leave these alone unless a failing test forces a change: the PSML, PDML, and hex parsers; the stacked layout, focus model, and floating dialogs; the filter reload path; the separate list and detail cancel tokens.
 
-| Item | Status | Notes |
-|------|--------|-------|
-| Filter the list to this stream | **now** | `:streams` jumps to a chunk's frame and does not change the display filter. That split is right. The missing action is applying `tcp.stream == N` or `udp.stream == N` from the open stream, as its own key or command, then reloading the list. Enter keeps selecting the frame. |
-| Packets with a comment | **next** | `:comment` reads and writes one frame. There is no way to find the other commented frames without opening them. A short list from `frame.comment`, Enter selects the frame. |
-| Compare opens the other file | **later** | `:compare` lists identities only in this file and only in the other file, and Enter selects a frame that is in this file. An identity that exists only in the other file cannot be opened. Do this after the list and detail paths are cheap enough that a second capture is not a second full dissection of both files. |
+## Ready
 
-Leave the header menus as they are. Analysis already runs expert, hierarchy, endpoints, and streams. Export fills the command palette with `export ` because the command needs a path.
+Items are in rank order. Take the first one.
 
-## 3. Bugs
+### R-01 Overlap the two detail tshark runs
 
-Confirmed in the current tree. Each one is a behavior a person can hit.
+- Status: ready
+- Outcome: Choosing an uncached frame no longer waits for the PDML process to exit before the hex process starts. The detail log still reports one total and the pdml, hex, and parse parts.
+- Why first: Every cache miss pays two process startups, one after the other, in `runDetailWorker`. That is the wait on the hottest path. The log already includes both runs, so this is not a guess.
+- Touch: `src/model/loader.zig`, `src/shark/process.zig` only if argv must change, `tests/model_suite.zig`
+- Done when:
+  - PDML and hex for the same frame window run at the same time, or in one tshark invocation if that invocation's stdout is still the PDML and hex the current parsers accept.
+  - Both children, or the single child, use the detail `cancel_token`. A newer selection cancels the in-flight window and its result is not cached.
+  - The log line is still `frame N loaded in M ms (pdml A ms, hex B ms, parse C ms)`. The total starts before the dissection work and ends after the parse.
+  - A test shows a second selection cancels the first window, and a test shows one window still fills the detail cache for the requested frame.
+- Do not: Change `parsePdmlPackets` or `parseHexdumpPackets`. Do not switch the detail format to JSON. Do not cache the unfiltered packet list.
 
-| Item | Where | What is wrong |
-|------|--------|----------------|
-| Quit waits on the first field dump | `AppModel.loadFieldCompletions` | `fields_cancelled` is checked while splitting lines, after `runCapture` returns. `tshark -G fields` is not on a cancel token. Quitting during that first dump joins the thread until tshark exits. The on-disk field cache is already the fast path. The running child is the gap. |
-| Quit waits on filter validation | `AppModel.runFilterCheck` | The check calls tshark and the worker is joined in `deinit`. A slow `-Y` check holds quit. The list and detail children are already killed from their cancel tokens. These two should use that same kill. |
-| A menu click can fail silently | `AppModel.activateHeaderItem` | Analysis and Misc call `runMenuChoice(index) catch {}`. An error from opening a field filter, a stream, or a conversation becomes a click that does nothing. |
-| Detail timing hides the wait | `runDetailWorker` in `src/model/loader.zig` | The "frame N loaded in M ms" line starts after both tshark processes have returned. It measures the parse. The log understates the time the UI waited. Fix the clock before using it to decide section 4. |
+### R-02 Join loader threads when they finish
 
-Watch, and do not treat a single sighting as a regression: `model_suite` once panicked in `runOnce` because stdout was already null when a child had exited. It did not reproduce on a fresh test run. If it shows up again, the null pipe is the bug to fix.
+- Status: ready
+- Outcome: A finished list or detail thread is joined and dropped while the session continues. Quit cancels work that is still running and joins only that work.
+- Why here: `CaptureLoader.workers` keeps every thread until `deinit`. A long session of selections holds a thread handle per selection. Quit then joins the whole history. R-01 adds more concurrent children, so the leak gets worse if this stays.
+- Touch: `src/model/loader.zig`, `tests/model_suite.zig`
+- Done when:
+  - After a list or detail worker returns, its thread has been joined and is no longer in `workers`.
+  - `deinit` cancels the list and detail tokens, then joins only threads that have not been reaped yet.
+  - A test with a child that exits immediately shows the handle is gone before the next request returns.
+  - A test with a child that would sleep past the test shows `deinit` returns because the child was killed, not because the test waited out the sleep.
+- Do not: Change PSML streaming, the packet array, or the cancel-token rules. Do not start R-01's overlap design here if R-01 is already done; call the existing worker.
 
-## 4. Efficiency
+### R-03 List packets that have a comment
 
-The UI is not the bottleneck. tshark is, and the way zigshark starts it. Measure before swapping formats or storing the packet list on disk. `tests/fixtures/1.pcap` stays the correctness fixture.
+- Status: ready
+- Outcome: A person can see every commented frame and press Enter to select one, without opening each packet.
+- Why here: `:comment` reads and writes a single frame. Finding the other comments is a reason to open Wireshark. The read and write paths already exist.
+- Touch: `src/ui/views/analysis.zig`, `src/ui/commands.zig`, `src/ui/views/help.zig`, `docs/user-guide.md`, `tests/app_suite.zig`, `src/shark/process.zig` only if a new argv helper is required
+- Done when:
+  - `:comment` with no text still shows the selected frame's `frame.comment`. `:comment <text>` still writes with editcap to a new `<file>.commented.pcapng` and opens that file. The original file stays in place.
+  - `:comment list` shows frames whose `frame.comment` is non-empty: frame number and the comment text, one line each. The list stops at 200 rows or 1 MiB and the overlay says so.
+  - Enter selects that frame and does not change the display filter. A frame that is not in the current list is a message, not a filter change.
+  - A headless test supplies tshark stdout through the scripted runner. It does not need a real editcap or a real capture.
+  - The user-guide and the in-app help name `:comment list`.
+- Do not: Add a menu arm inside `runMenuChoice`. R-04 attaches commands to the menu. Do not open each packet in the UI to hunt for comments.
 
-What the code does today:
+### R-04 Menu rows name commands
 
-- The packet list appends PSML rows while tshark is still running, in `pcap-bundle-size` chunks. Every summary stays in `Session.packets` until the file is closed or the filter reloads.
-- A display-filter change runs PSML again for the whole file. `:back` does too. The unfiltered list is not cached. That was a choice. Do not add a second in-memory copy of the list unless a measured capture says the reload is the wait.
-- Selecting an uncached frame runs two tshark processes, one after the other, on the same frame window: PDML (`-T pdml`), then hex (`-x`). The detail cache then serves the previous and next frames from that window.
-- `:convs`, `:streams`, `:hierarchy`, `:endpoints`, `:iograph`, `:dns`, `:http`, and `:compare` each spawn their own tshark and stop at 200 rows or 1 MiB. That cap stays.
+- Status: ready
+- Outcome: A header menu row runs a command that already exists. Adding an analysis command does not require a second switch.
+- Why here: `runMenuChoice` is a parallel switch beside `commands.zig`. R-03 must not grow that switch. This item removes it before the next analysis command.
+- Touch: `src/ui/app.zig`, `src/ui/commands.zig`, `src/ui/widgets/header_bar.zig`, `tests/app_suite.zig`
+- Done when:
+  - Analysis and Misc menu rows are command names resolved through `runCommand`, except the rows that are not commands today: field filter (`=`) and the export palette prefill.
+  - Export still only fills the palette with `export ` and waits for a path. It does not gain a menu implementation of its own.
+  - `:comment list` is a menu row if R-03 is done. If R-03 is not done, do not invent the comment list here.
+  - A test activates an analysis menu row and observes the same outcome as the command.
+- Do not: Add a menu row for every command. Do not move filter reload or the cancel tokens. Do not redesign the header.
 
-| Item | Status | Notes |
-|------|--------|-------|
-| Time the whole detail load | **now** | Include both tshark runs and the parse. Log one line a person can compare across captures. |
-| One detail spawn for the window | **next** | After the log is honest. PDML and hex for the same frame range should be one tshark invocation, or two that overlap, still on `cancel_token`. The parsers stay. A new selection still cancels the in-flight request. |
-| Reap finished loader threads | **next** | `CaptureLoader.workers` appends every list and detail thread and joins them all in `deinit`. Finished threads only need a join so the handle can be dropped. Quit should join work that is still running. |
-| File-backed packet list | **later** | Streaming PSML is in place. Start this only when a real capture forces the process to swap, and only after the large-capture numbers in section 1 exist. |
+### R-05 Lock quit against the remaining children
 
-What not to chase: redrawing fewer cells, a custom dissector, or a packet-list virtualization pass. The table already draws the visible window. JSON instead of PDML was measured on the fixture and rejected. Do not reopen it without a capture where PDML parse time dominates the two tshark runs.
+- Status: ready
+- Outcome: Quitting while a detail load or a wormhole job is in flight returns because those children were cancelled, and tests keep it that way.
+- Why here: Field-dump cancel, filter-check cancel, and the held PSML child are already tested. Detail children and wormhole are the quit paths still untested. R-01 and R-02 change the loader, so the tests belong after them.
+- Touch: `tests/app_suite.zig`, `tests/model_suite.zig`, and the cancel call site only if a test proves quit still waits
+- Done when:
+  - A test starts a detail child that would sleep, cancels it the way quit does, and returns well before that sleep ends.
+  - A test starts a wormhole job with a stand-in that would sleep, destroys or cancels it the way `AppModel.deinit` does, and returns well before that sleep ends. No network.
+  - Existing field-dump, filter-check, and PSML-hold tests still pass.
+- Do not: Rewrite `deinit`. Do not add a new cancellation mechanism if the current tokens already kill the child.
 
-## 5. Code audit
+### R-06 PTY script covers the tree, the hex pane, and ZZ
 
-`src/ui/app.zig` is still about 4,000 lines. Command dispatch lives in `src/ui/commands.zig` and `runCommand` forwards there. Filter apply, the analysis views, and drawing stayed on `AppModel` because they share the session. The next feature will land in `app.zig` again unless the analysis views move first.
+- Status: ready
+- Outcome: Linux CI drives the fixture through the protocol tree and the hex pane, then quits with `ZZ`.
+- Why here: `tests/pty_smoke.py` already renders the fixture, searches, opens `:capinfo`, checks copy-mode Ctrl-C, and checks a clean Ctrl-C. It does not expand the tree, move in hex, or quit with `ZZ`. Headless tests do not see vaxis.
+- Touch: `tests/pty_smoke.py`, `.github/workflows/ci.yml` only if the script is not already the Linux step
+- Done when:
+  - The script opens `tests/fixtures/1.pcap`, focuses the tree, expands a node, moves in the hex view, and quits with `ZZ`.
+  - Assertions use the terminal model already in that file. They do not search the raw PTY byte stream for pane text.
+  - The script stays Linux-only, next to the existing smoke test, and CI runs it on Linux.
+- Do not: Add a second PTY harness. Do not assert colors or timing.
 
-- [ ] **now** — Move the analysis views into their own file: expert, hierarchy, endpoints, conversations, streams, IO graph, DNS, HTTP, compare, export, color, comment, and lua. `commands.zig` keeps the switch and calls those functions. Filter reload timing and the two cancel tokens stay where they are.
-- [ ] **next** — Menu actions and palette commands share one path. Export is the exception, and it should stay a palette command because it needs a path. A new analysis view is a command first and a menu row second.
-- [ ] **next** — Read `AppModel.deinit` against a quit during field completion, filter validation, a held PSML child, a detail child, and a wormhole job. The PSML hold is already tested. The other four are joins. Section 3 is the missing cancel.
+### R-07 Compare can open the other capture
 
-Leave alone:
+- Status: ready
+- Outcome: An identity that exists only in the other file can be opened, instead of stopping at "only in the other capture".
+- Why here: `:compare` can select a frame only when it is in the file already open. This is a real gap, and it is a second dissection of both files, so it waits until R-01 has made a detail load cheaper.
+- Touch: `src/ui/views/analysis.zig`, `src/ui/commands.zig`, `docs/user-guide.md`, `src/ui/views/help.zig`, `tests/app_suite.zig`
+- Done when:
+  - Enter on a row that exists only in the other file opens that file and selects the frame. The current file is left as the previous capture the user can reopen, or the message names the path if opening fails.
+  - Enter on a row in the current file still selects that frame and does not change the display filter.
+  - A headless test covers both rows with the scripted runner. It does not dissect two real files.
+- Do not: Dissect both files a second time for the packet list. Do not cache a full second PSML table.
 
-- The PSML, PDML, and hex parsers, unless a fixture fails
-- The stacked layout, the focus model, and the floating dialogs
-- The filter reload path and the separate list and detail cancel tokens
-- `termshark_reference/`. It is a reference tree, not a source of patches
+### R-08 Windows CI installs tshark
+
+- Status: ready
+- Outcome: `tests/integration_tools.zig` runs on Windows CI instead of skipping for a missing tshark.
+- Why here: Linux CI installs tshark. macOS tries Homebrew and ignores failure. Windows skips the integration tests. This is confidence, not a session workflow, so it ranks last among Ready.
+- Touch: `.github/workflows/ci.yml`
+- Done when:
+  - The Windows job installs tshark, or Wireshark's tshark, non-interactively.
+  - `zig build test` on that job does not skip `tests/integration_tools.zig` for a missing binary.
+  - If the image cannot install tshark, move this item to Blocked with the exact error and the command that failed. Do not leave a red CI hack in the workflow.
+- Do not: Change the tests to pass without tshark. Do not fail the macOS job when Homebrew fails.
+
+## Blocked
+
+Do not start these. Do not build a fake host, a generated multi-gig capture, or a partial capture UI to get around the gate.
+
+### B-01 Record one large capture
+
+- Unblock when: A capture file is already in the repo or the user names a path. Do not download one and do not synthesize one.
+- Outcome: Time-to-first-row and time-to-detail are written under this item, from the existing log lines. No millisecond assertion.
+- Next decision: Only if those numbers show the packet list, not tshark, is what forces swapping, B-02 becomes Ready. Otherwise B-02 stays blocked and the note says which number was tshark.
+
+### B-02 File-backed packet list
+
+- Unblock when: B-01's note says the in-memory list is the problem.
+- Outcome: The session does not hold every PSML row in RAM. Streaming PSML stays. `tests/fixtures/1.pcap` stays the correctness fixture.
+- Do not start this from a hunch about memory.
+
+### B-03 Verify Linux live capture
+
+- Unblock when: The user says this machine, or a named host, can capture as a member of the capture group.
+- Check, in order, and write the host, the Wireshark version, and the result into [parity.md](parity.md):
+  - dumpcap as a group member, one interface, `-f` capture filter, stop, reopen the written file.
+  - dumpcap missing or unprivileged, tshark fallback, and an error message when both fail. The failure must be a message, not a hang.
+  - Two interfaces in one capture. `:clear-packets` hides frames already shown.
+- The code paths already exist. A failure becomes a Ready bug ranked by the priority rule. Do not redesign capture while verifying it.
+
+### B-04 Verify macOS, FreeBSD, and Windows capture
+
+- Unblock when: B-03 is done and the user names that host.
+- Check: interface names, promiscuous mode, a non-root failure that is a message, and stopping a capture without leaving dumpcap behind. On Windows, also open a file, and capture only if Npcap is present. Ctrl-Z is a no-op there.
+- Record the result in [parity.md](parity.md).
+
+### B-05 In-UI capture screen
+
+- Unblock when: B-03 is recorded as passing.
+- Outcome: A capture screen for interface multi-select, capture filter, snaplen, promiscuous mode, ring buffer (`-b`), and stop conditions. The display filter does not change what is written.
+- Do not build this before the gate. The CLI capture path is the one B-03 checks.
+
+### B-06 Extcap sources
+
+- Unblock when: B-03 is recorded as passing.
+- Outcome: sshdump, ciscodump, and the other sources `tshark -D` lists are interfaces with extra fields.
+- Do not build this before local capture is verified.
+
+### B-07 Ring-buffer file sets
+
+- Unblock when: The user has a directory of `-b` ring-buffer files.
+- Outcome: `mergecap` that directory into the session, and next or previous file when the capture used `-b`.
+
+## Hazards
+
+These are not Ready items. If one happens twice in a session, add a Ready item. If it happens once and a re-run passes, leave it here.
+
+- `model_suite` once panicked in `runOnce` because stdout was already null after a child had exited. It did not reproduce on a fresh run. The null pipe is the bug if it returns. Do not rewrite process spawning from a single sighting.
+
+## Done
+
+Newest first. One short entry. Do not move these back to Ready.
+
+### 2026-11-12 — File-wide expert info
+
+`:expert` still reads `_ws.expert` on the open packet and Enter opens that field. `:expert all` lists `tshark -z expert` (severity and summary, 200 rows or 1 MiB) and Enter selects the frame. Verified with `zig build test`.
+
+### 2026-11-12 — Analysis views left app.zig
+
+Expert, hierarchy, endpoints, conversations, streams, IO graph, DNS, HTTP, compare, export, color, comment, and Lua live in `src/ui/views/analysis.zig`. `commands.zig` calls those functions. Filter reload and the cancel tokens stayed in `src/ui/app.zig`. Verified with `zig build test`.
+
+### 2026-11-12 — Quit, detail timing, stream diagram
+
+Quit kills the field dump and the display-filter check. Menu failures show `Menu action failed: …`. The detail log includes both tshark runs and the parse. `:streams` draws client left and server right; `f` or `:streams filter` applies `tcp.stream == N` or `udp.stream == N`. Enter still selects the frame. Verified with `zig build test`.
+
+## How to edit this file
+
+When an item finishes:
+
+1. Cut it from Ready or Blocked.
+2. Paste it under Done with the date and the checks.
+3. Drop the **Touch**, **Done when**, and **Do not** bullets from the Done copy. Keep the outcome sentence.
+4. If the work revealed a follow-up, add that follow-up under Ready or Blocked before you start it.
+
+When an item blocks:
+
+1. Move it under Blocked.
+2. Replace **Why** with **Unblock when**.
+3. Leave the code compiling and the tests passing. Do not leave a half-command in the binary.
+
+When you add an item:
+
+1. Use the next free `R-` or `B-` id.
+2. Put a Ready item in rank order and say which priority-rule band put it there.
+3. Keep **Done when** observable. "Improve" and "clean up" are not outcomes.

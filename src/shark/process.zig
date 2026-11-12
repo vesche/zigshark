@@ -617,6 +617,18 @@ pub fn argvEndpoints(allocator: std.mem.Allocator, tshark: []const u8, path: []c
     return a;
 }
 
+pub fn argvExpert(allocator: std.mem.Allocator, tshark: []const u8, path: []const u8) !Argv {
+    var a: Argv = .{};
+    errdefer a.deinit(allocator);
+    try a.append(allocator, tshark);
+    try a.append(allocator, "-r");
+    try a.append(allocator, path);
+    try a.append(allocator, "-q");
+    try a.append(allocator, "-z");
+    try a.append(allocator, "expert");
+    return a;
+}
+
 pub fn argvIoStat(allocator: std.mem.Allocator, tshark: []const u8, path: []const u8, interval: []const u8) !Argv {
     var a: Argv = .{};
     errdefer a.deinit(allocator);

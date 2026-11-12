@@ -59,13 +59,14 @@ zigshark capture -i eth0 -f 'port 53' -w /tmp/out.pcap
 | `q` / `ZZ` | Quit, with or without confirmation |
 | `Ctrl-Z` | Suspend. `fg` resumes |
 | `Esc` | Dismiss an overlay |
+| `f` | In the stream view, reload the packet list with this stream's filter |
 | Home / `G` | First or last packet. Hex has an offset ruler, a gap after 8 bytes, and the cursor stays distinct inside the selected field |
 
 The filter bar is neutral while empty, green when tshark accepts the expression, and red when it does not. The tshark error line is on the status line. The check runs after a short pause so typing does not wait on tshark, and a valid expression then reloads the packet list. Enter applies it immediately. `<Clear>` removes the filter and reloads the full capture. `<Recent>` lists recent filters; j/k and Enter, or a click, apply one. `Ctrl-P` or `:back` restores the previous expression. After an unfiltered load, a later filter shows `frame n/shown of total`. A `$name` macro shows its expansion on the status line before it is applied. A display filter applied while `:tail` is on keeps the tail and the `:clear-packets` cutoff.
 
 `:filters` lists saved filters and Enter applies one. `:filters save <name>` stores the current expression, separate from the recent list. `:filters <name>` applies that saved filter.
 
-Rows painted by tshark `--color` use those colors. Profile coloring rules in `[coloring]` are checked in file order and the first match overrides that layer. A rule filter is a protocol name, `contains text` against any column, or empty to match every remaining row. It is not a tshark display filter. The protocol tint is only the fallback when neither tshark nor a profile rule painted the row. A compact stream sequence diagram waits until a followed chunk knows its frame number.
+Rows painted by tshark `--color` use those colors. Profile coloring rules in `[coloring]` are checked in file order and the first match overrides that layer. A rule filter is a protocol name, `contains text` against any column, or empty to match every remaining row. It is not a tshark display filter. The protocol tint is only the fallback when neither tshark nor a profile rule painted the row.
 
 Header menus: Analysis (field filter, go to frame, streams, conversations, capture info) and Misc (columns, theme, profile, marks, tail). `:expert`, `:hierarchy`, `:endpoints`, and `:export` are commands.
 
@@ -76,7 +77,7 @@ Header menus: Analysis (field filter, go to frame, streams, conversations, captu
 | `:goto <frame>` | Select a frame |
 | `:convs [tcp\|udp\|ip\|ipv6\|eth]` | Conversations. Enter filters. `:set conv-absolute-time true` adds each row's relative start |
 | `:columns default\|delta\|absolute\|set <format>\|add <field>\|drop <field>` | Packet-list columns. `add` uses the selected field |
-| `:expert` | Expert info on the open packet. Enter opens the field |
+| `:expert [all]` | Expert info on the open packet. `:expert all` lists `tshark -z expert` for the file. Enter opens the field, or selects the frame |
 | `:hierarchy` | Protocol hierarchy. Enter adds that protocol to the filter |
 | `:endpoints [tcp\|udp\|ip\|ipv6\|eth]` | Loudest addresses, sorted by bytes. Enter filters |
 | `:export packets\|packet\|json\|csv <path>` | Write the displayed packets. `y` confirms an overwrite |
@@ -94,7 +95,8 @@ Header menus: Analysis (field filter, go to frame, streams, conversations, captu
 | `:theme [list\|<name>]` | Theme. `:no-theme` restores the built-in theme |
 | `:recent <number>` / `:recent-filter <number>` | Open a recent file or filter |
 | `:filters [name\|save <name>\|delete <name>]` | Saved filters, separate from the recent list |
-| `:streams [tcp\|udp] [index] [ascii\|hex\|raw]` | Follow this packet's stream. Enter jumps to the chunk's frame when tshark's yaml follow provides one |
+| `:streams [tcp\|udp] [index] [ascii\|hex\|raw]` | Follow this packet's stream. One line per chunk, client on the left and server on the right. Enter selects that frame. A chunk with no frame number stays unlabeled |
+| `:streams filter` | Reload the list with `tcp.stream == N` or `udp.stream == N` for the open stream. `f` does this from the stream view |
 | `:related [conv\|addr\|pair] [next\|prev]` | Move to a related packet without changing the display filter |
 | `:mark <label> [note]` | Mark this frame. `:marks` lists the note. Global notes are saved |
 | `:back` | Restore the previous display filter. `Ctrl-P` does the same |
@@ -109,7 +111,7 @@ Header menus: Analysis (field filter, go to frame, streams, conversations, captu
 | `:capinfo`, `:marks`, `:recents`, `:config`, `:logs`, `:help`, `:quit` | As named |
 | `:wormhole [file]` | Send a file with the wormhole CLI. `wormhole-length`, `wormhole-rendezvous-url`, and `wormhole-transit-relay` become `--code-length`, `--relay-url`, and `--transit-helper` |
 
-`:convs` and `:streams` stop after 200 rows, or after 1 MiB of tshark output. The overlay says when that happens. `:expert` reads the open packet and is not capped that way.
+`:convs`, `:streams`, and `:expert all` stop after 200 rows, or after 1 MiB of tshark output. The overlay says when that happens. `:expert` with no arguments reads the open packet and is not capped that way.
 
 Capture filters are `-f` on the command line. Display-filter checks use `tshark -Y` against an empty pcap.
 

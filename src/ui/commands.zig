@@ -9,6 +9,7 @@ const transfer = @import("../features/transfer.zig");
 const AppModel = @import("app.zig").AppModel;
 
 pub fn run(self: *AppModel, cmd: []const u8, args: []const u8) !void {
+    const analysis = @import("views/analysis.zig");
     if (std.mem.eql(u8, cmd, "quit")) {
         self.quit_confirm = true;
         self.overlay = .quit;
@@ -29,7 +30,7 @@ pub fn run(self: *AppModel, cmd: []const u8, args: []const u8) !void {
             try self.commitFilter(expression, true);
         }
     } else if (std.mem.eql(u8, cmd, "expert")) {
-        try self.showExpert();
+        try analysis.showExpert(self, args);
     } else if (std.mem.eql(u8, cmd, "time-ref")) {
         try self.toggleTimeReference();
     } else if (std.mem.eql(u8, cmd, "goto")) {
@@ -44,25 +45,25 @@ pub fn run(self: *AppModel, cmd: []const u8, args: []const u8) !void {
         self.loader.clearDetailCache(self.io);
         try self.loader.requestPsml(self.session);
     } else if (std.mem.eql(u8, cmd, "hierarchy")) {
-        try self.showHierarchy();
+        try analysis.showHierarchy(self);
     } else if (std.mem.eql(u8, cmd, "endpoints")) {
-        try self.showEndpoints(args);
+        try analysis.showEndpoints(self, args);
     } else if (std.mem.eql(u8, cmd, "iograph")) {
-        try self.showIoGraph(args);
+        try analysis.showIoGraph(self, args);
     } else if (std.mem.eql(u8, cmd, "dns")) {
-        try self.showDns();
+        try analysis.showDns(self);
     } else if (std.mem.eql(u8, cmd, "http")) {
-        try self.showHttp();
+        try analysis.showHttp(self);
     } else if (std.mem.eql(u8, cmd, "compare")) {
-        try self.showCompare(args);
+        try analysis.showCompare(self, args);
     } else if (std.mem.eql(u8, cmd, "color")) {
-        try self.runColorCommand(args);
+        try analysis.runColorCommand(self, args);
     } else if (std.mem.eql(u8, cmd, "comment")) {
-        try self.runCommentCommand(args);
+        try analysis.runCommentCommand(self, args);
     } else if (std.mem.eql(u8, cmd, "lua")) {
-        try self.runLuaCommand(args);
+        try analysis.runLuaCommand(self, args);
     } else if (std.mem.eql(u8, cmd, "export")) {
-        try self.runExport(args, false);
+        try analysis.runExport(self, args, false);
     } else if (std.mem.eql(u8, cmd, "timestamp")) {
         if (args.len == 0) {
             try self.showMessage("Usage: :timestamp a|ad|adoy|d|dd|e|r|u|ud|udoy");
@@ -128,6 +129,10 @@ pub fn run(self: *AppModel, cmd: []const u8, args: []const u8) !void {
     } else if (std.mem.eql(u8, cmd, "load")) {
         if (args.len != 0) try self.openCapture(args);
     } else if (std.mem.eql(u8, cmd, "streams")) {
+        if (std.mem.eql(u8, std.mem.trim(u8, args, " \t"), "filter")) {
+            try analysis.applyOpenStreamFilter(self);
+            return;
+        }
         const path = self.capturePath() orelse {
             try self.showMessage("No capture file loaded");
             return;
@@ -178,7 +183,7 @@ pub fn run(self: *AppModel, cmd: []const u8, args: []const u8) !void {
         var follow_result = streams_shark.parseYaml(self.allocator, yaml.body);
         if (follow_result) |*follow| {
             follow.deinit(self.allocator);
-            try self.showStream(proto, index, yaml.body, yaml.capped);
+            try analysis.showStream(self, proto, index, yaml.body, yaml.capped);
         } else |_| {
             const loaded = try streams_view.loadFollow(
                 self.allocator,
@@ -191,7 +196,7 @@ pub fn run(self: *AppModel, cmd: []const u8, args: []const u8) !void {
                 self.process_runner,
             );
             defer self.allocator.free(loaded.body);
-            try self.showStream(proto, index, loaded.body, loaded.capped);
+            try analysis.showStream(self, proto, index, loaded.body, loaded.capped);
         }
     } else if (std.mem.eql(u8, cmd, "convs")) {
         const path = self.capturePath() orelse {
@@ -199,7 +204,7 @@ pub fn run(self: *AppModel, cmd: []const u8, args: []const u8) !void {
             return;
         };
         const ctype = if (args.len != 0) args else "tcp";
-        try self.showConversations(path, ctype);
+        try analysis.showConversations(self, path, ctype);
     } else if (std.mem.eql(u8, cmd, "capinfo")) {
         const path = self.capturePath() orelse {
             try self.showMessage("No capture file loaded");
@@ -323,10 +328,10 @@ pub fn run(self: *AppModel, cmd: []const u8, args: []const u8) !void {
         }
         if (self.transfer_job) |job| job.destroy();
         self.transfer_job = transfer.Job.startWith(self.allocator, self.io, path, .{
-                .code_length = self.config.wormhole_length,
-                .relay_url = self.config.wormhole_rendezvous_url,
-                .transit_helper = self.config.wormhole_transit_relay,
-            }) catch |err| {
+            .code_length = self.config.wormhole_length,
+            .relay_url = self.config.wormhole_rendezvous_url,
+            .transit_helper = self.config.wormhole_transit_relay,
+        }) catch |err| {
             switch (err) {
                 error.WormholeNotFound => try self.showMessage("wormhole CLI not found"),
                 else => try self.showMessage("Could not start wormhole"),

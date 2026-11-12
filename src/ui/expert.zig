@@ -1,7 +1,7 @@
 const std = @import("std");
 const packet = @import("../model/packet.zig");
 
-pub const Severity = enum { err, warning, note, chat, other };
+pub const Severity = enum { err, warning, note, chat, comment, other };
 
 pub const Item = struct {
     severity: Severity,
@@ -32,8 +32,8 @@ pub fn collect(allocator: std.mem.Allocator, root: *const packet.DetailNode) ![]
     try walkCollect(allocator, root, &items, &occurrence);
     std.mem.sort(Item, items.items, {}, struct {
         fn less(_: void, a: Item, b: Item) bool {
-            const ar = @intFromEnum(a.severity);
-            const br = @intFromEnum(b.severity);
+            const ar = @backingInt(a.severity);
+            const br = @backingInt(b.severity);
             if (ar != br) return ar < br;
             return a.occurrence < b.occurrence;
         }
@@ -47,8 +47,94 @@ pub fn label(severity: Severity) []const u8 {
         .warning => "warning",
         .note => "note",
         .chat => "chat",
+        .comment => "comment",
         .other => "expert",
     };
+}
+
+pub const FileRow = struct {
+    severity: Severity,
+    summary: []u8,
+
+    pub fn deinit(self: *FileRow, allocator: std.mem.Allocator) void {
+        allocator.free(self.summary);
+    }
+};
+
+/// Rows from `tshark -z expert`. The stat groups by severity and does not
+/// include frame numbers; the summary is what a later lookup selects.
+pub fn parseFile(allocator: std.mem.Allocator, text: []const u8) ![]FileRow {
+    var rows: std.ArrayList(FileRow) = .empty;
+    errdefer {
+        for (rows.items) |*row| row.deinit(allocator);
+        rows.deinit(allocator);
+    }
+    var severity: Severity = .other;
+    var lines = std.mem.splitAny(u8, text, "\n\r");
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t");
+        if (line.len == 0) continue;
+        if (sectionSeverity(line)) |next| {
+            severity = next;
+            continue;
+        }
+        const summary = summaryFromStatLine(line) orelse continue;
+        try rows.append(allocator, .{
+            .severity = severity,
+            .summary = try allocator.dupe(u8, summary),
+        });
+    }
+    return rows.toOwnedSlice(allocator);
+}
+
+fn sectionSeverity(line: []const u8) ?Severity {
+    const name = std.mem.sliceTo(line, ' ');
+    if (std.mem.eql(u8, name, "Errors")) return .err;
+    if (std.mem.eql(u8, name, "Warns")) return .warning;
+    if (std.mem.eql(u8, name, "Notes")) return .note;
+    if (std.mem.eql(u8, name, "Chats")) return .chat;
+    if (std.mem.eql(u8, name, "Comments")) return .comment;
+    return null;
+}
+
+fn summaryFromStatLine(line: []const u8) ?[]const u8 {
+    if (line.len == 0 or !std.ascii.isDigit(line[0])) return null;
+    var index: usize = 0;
+    while (index < line.len and std.ascii.isDigit(line[index])) index += 1;
+    while (index < line.len and line[index] == ' ') index += 1;
+    const rest = line[index..];
+    if (rest.len == 0) return null;
+    var parts: [3][]const u8 = .{ "", "", "" };
+    const columns = splitWideColumns(rest, &parts);
+    const summary = switch (columns) {
+        0 => return null,
+        1 => parts[0],
+        2 => parts[1],
+        else => parts[2],
+    };
+    if (summary.len == 0) return null;
+    return summary;
+}
+
+fn splitWideColumns(line: []const u8, out: *[3][]const u8) usize {
+    var columns: usize = 0;
+    var index: usize = 0;
+    while (index < line.len and columns < 3) {
+        while (index < line.len and line[index] == ' ') index += 1;
+        if (index >= line.len) break;
+        if (columns == 2) {
+            out[2] = std.mem.trim(u8, line[index..], " ");
+            return 3;
+        }
+        const start = index;
+        while (index < line.len) {
+            if (line[index] == ' ' and index + 1 < line.len and line[index + 1] == ' ') break;
+            index += 1;
+        }
+        out[columns] = std.mem.trim(u8, line[start..index], " ");
+        columns += 1;
+    }
+    return columns;
 }
 
 fn walkCount(node: *const packet.DetailNode, total: *usize) void {
@@ -193,6 +279,51 @@ test "expert items keep tree order inside a severity and sort errors first" {
     try std.testing.expectEqual(Severity.chat, items[1].severity);
     try std.testing.expectEqualStrings("M-SEARCH * HTTP/1.1", items[1].message);
     try std.testing.expectEqual(@as(usize, 0), items[1].occurrence);
+}
+
+test "file expert stat keeps severity and summary" {
+    const allocator = std.testing.allocator;
+    const malformed = std.fmt.allocPrint(allocator, "{d: >12} {s: >10} {s: >18}  {s}", .{
+        1,
+        "Malformed",
+        "TCP",
+        "Bad checksum",
+    }) catch unreachable;
+    defer allocator.free(malformed);
+    const bug = std.fmt.allocPrint(allocator, "{d: >12} {s: >10} {s: >18}  {s}", .{
+        2,
+        "Dissector bug",
+        "HTTP",
+        "Bad header",
+    }) catch unreachable;
+    defer allocator.free(bug);
+    const text = std.fmt.allocPrint(allocator,
+        \\
+        \\Errors (1)
+        \\=============
+        \\   Frequency      Group           Protocol  Summary
+        \\{s}
+        \\
+        \\Warns (2)
+        \\=============
+        \\   Frequency      Group           Protocol  Summary
+        \\{s}
+        \\
+    , .{ malformed, bug }) catch unreachable;
+    defer allocator.free(text);
+    const rows = try parseFile(allocator, text);
+    defer {
+        for (rows) |*row| {
+            var copy = row.*;
+            copy.deinit(allocator);
+        }
+        allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqual(Severity.err, rows[0].severity);
+    try std.testing.expectEqualStrings("Bad checksum", rows[0].summary);
+    try std.testing.expectEqual(Severity.warning, rows[1].severity);
+    try std.testing.expectEqualStrings("Bad header", rows[1].summary);
 }
 
 test "a severity child overrides the expert banner" {

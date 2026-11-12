@@ -321,20 +321,21 @@ pub const CaptureLoader = struct {
         defer hex_argv.deinit(self.allocator);
         try appendDissectionOptions(self.allocator, &hex_argv, session, self.config.tshark_args);
 
+        const started = std.Io.Timestamp.now(io, .awake).nanoseconds;
         var pdml_out = try process.runCapture(self.allocator, io, pdml_argv.slice());
         defer pdml_out.deinit(self.allocator);
+        const pdml_done = std.Io.Timestamp.now(io, .awake).nanoseconds;
         var hex_out = try process.runCapture(self.allocator, io, hex_argv.slice());
         defer hex_out.deinit(self.allocator);
+        const hex_done = std.Io.Timestamp.now(io, .awake).nanoseconds;
         if (self.cancel_token.isCancelled()) return;
         if (!pdml_out.term.success()) {
             try self.pushEvent(.{ .error_msg = try self.allocator.dupe(u8, pdml_out.stderr) });
             return;
         }
 
-        const started = std.Io.Timestamp.now(io, .awake).nanoseconds;
         try ingestDetail(self, pdml_out.stdout, hex_out.stdout, frame, null);
-        const elapsed_ms = @divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds -| started, std.time.ns_per_ms);
-        log_mod.info("detail", "frame {d} loaded in {d} ms", .{ frame, elapsed_ms });
+        logDetailLoad(io, frame, started, pdml_done, hex_done);
         @constCast(session).loading = .idle;
     }
 
@@ -495,7 +496,7 @@ pub const CaptureLoader = struct {
 
 fn signalStop(id: std.process.Child.Id) void {
     if (builtin.os.tag == .windows) {
-        const status: std.os.windows.NTSTATUS = @enumFromInt(1);
+        const status: std.os.windows.NTSTATUS = @fromBackingInt(@intCast(1));
         _ = std.os.windows.ntdll.NtTerminateProcess(id, status);
     } else if (builtin.os.tag != .wasi) {
         std.posix.kill(id, std.posix.SIG.TERM) catch {};
@@ -972,6 +973,7 @@ fn runDetailWorker(task: *DetailTask) void {
         loader.allocator.destroy(task);
     }
 
+    const started = std.Io.Timestamp.now(loader.io, .awake).nanoseconds;
     var pdml_output = process.runCaptureCancellable(
         loader.allocator,
         loader.io,
@@ -987,6 +989,7 @@ fn runDetailWorker(task: *DetailTask) void {
         emitWorkerError(loader, pdml_output.stderr);
         return;
     }
+    const pdml_done = std.Io.Timestamp.now(loader.io, .awake).nanoseconds;
 
     var hex_output = process.runCaptureCancellable(
         loader.allocator,
@@ -1003,16 +1006,43 @@ fn runDetailWorker(task: *DetailTask) void {
         emitWorkerError(loader, hex_output.stderr);
         return;
     }
+    const hex_done = std.Io.Timestamp.now(loader.io, .awake).nanoseconds;
     if (loader.cancel_token.isCancelled() or task.generation != loader.detail_generation.load(.acquire)) return;
 
-    const started = std.Io.Timestamp.now(loader.io, .awake).nanoseconds;
     ingestDetail(loader, pdml_output.stdout, hex_output.stdout, task.frame, task.generation) catch |err| {
         if (err == error.Cancelled or task.generation != loader.detail_generation.load(.acquire)) return;
         emitWorkerError(loader, @errorName(err));
         return;
     };
-    const elapsed_ms = @divTrunc(std.Io.Timestamp.now(loader.io, .awake).nanoseconds -| started, std.time.ns_per_ms);
-    log_mod.info("detail", "frame {d} loaded in {d} ms", .{ task.frame, elapsed_ms });
+    logDetailLoad(loader.io, task.frame, started, pdml_done, hex_done);
+}
+
+fn elapsedMs(start_ns: i96, end_ns: i96) i96 {
+    return @divTrunc(end_ns -| start_ns, std.time.ns_per_ms);
+}
+
+fn detailLoadLine(buf: []u8, frame: u32, total_ms: i96, pdml_ms: i96, hex_ms: i96, parse_ms: i96) []const u8 {
+    return std.fmt.bufPrint(buf, "frame {d} loaded in {d} ms (pdml {d} ms, hex {d} ms, parse {d} ms)", .{
+        frame,
+        total_ms,
+        pdml_ms,
+        hex_ms,
+        parse_ms,
+    }) catch buf[0..0];
+}
+
+fn logDetailLoad(io: std.Io, frame: u32, started_ns: i96, pdml_done_ns: i96, hex_done_ns: i96) void {
+    const done_ns = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    var buf: [160]u8 = undefined;
+    const line = detailLoadLine(
+        &buf,
+        frame,
+        elapsedMs(started_ns, done_ns),
+        elapsedMs(started_ns, pdml_done_ns),
+        elapsedMs(pdml_done_ns, hex_done_ns),
+        elapsedMs(hex_done_ns, done_ns),
+    );
+    log_mod.info("detail", "{s}", .{line});
 }
 
 fn ingestDetail(
@@ -1462,6 +1492,15 @@ test "detail cache eviction frees the bundle" {
     try std.testing.expect(loader.detail_cache.get(io, 1) == null);
     const kept = loader.detail_cache.get(io, 2) orelse return error.MissingBundle;
     try std.testing.expectEqual(@as(u32, 2), kept.pdml.frame);
+}
+
+test "detail timing line counts both tshark runs and the parse" {
+    var buf: [160]u8 = undefined;
+    const line = detailLoadLine(&buf, 12, 41, 22, 13, 5);
+    try std.testing.expectEqualStrings(
+        "frame 12 loaded in 41 ms (pdml 22 ms, hex 13 ms, parse 5 ms)",
+        line,
+    );
 }
 
 test "detail window keeps the previous and next frame inside the cache" {
