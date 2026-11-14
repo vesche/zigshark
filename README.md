@@ -4,7 +4,7 @@ A terminal UI for [tshark](https://www.wireshark.org/), written in [Zig](https:/
 
 zigshark is a lightning-fast terminal packet analyzer, in the spirit of [termshark](https://github.com/gcla/termshark). Packets show up immediately, the next packet is already loaded, and filters, streams, experts, compare, and comments stay in the terminal.
 
-<https://github.com/vesche/zigshark/raw/main/demo.mp4>
+<https://github.com/user-attachments/assets/a009996c-3ed3-44ed-8d60-37d122b9dd41>
 
 ## Requirements
 
