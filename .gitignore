@@ -11,6 +11,5 @@ zig-pkg/
 *.log
 /tmp/
 
-termshark_reference/
 __pycache__/
 *.pyc

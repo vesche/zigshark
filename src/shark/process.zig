@@ -100,6 +100,21 @@ fn reap(child: *std.process.Child, io: std.Io) void {
     child.kill(io);
 }
 
+/// `Child.kill` closes and clears the pipes. Take them under the cancel lock
+/// so a concurrent kill cannot free them before the read starts.
+fn claimOutputPipes(token: *CancellationToken, io: std.Io, child: *std.process.Child) ?[2]std.Io.File {
+    token.mutex.lockUncancelable(io);
+    defer token.mutex.unlock(io);
+    if (token.cancelled.load(.acquire) or child.stdout == null or child.stderr == null) {
+        reap(child, io);
+        return null;
+    }
+    const pipes = [2]std.Io.File{ child.stdout.?, child.stderr.? };
+    child.stdout = null;
+    child.stderr = null;
+    return pipes;
+}
+
 pub const Source = union(enum) {
     file: []const u8,
     interfaces: [][]const u8,
@@ -259,9 +274,18 @@ fn runOnce(
         child.kill(io);
     };
 
+    const pipes: [2]std.Io.File = if (token) |cancel|
+        claimOutputPipes(cancel, io, &child) orelse return error.Cancelled
+    else
+        .{ child.stdout.?, child.stderr.? };
+    defer if (token != null) {
+        pipes[0].close(io);
+        pipes[1].close(io);
+    };
+
     var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
     var multi_reader: std.Io.File.MultiReader = undefined;
-    multi_reader.init(allocator, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    multi_reader.init(allocator, io, multi_reader_buffer.toStreams(), &pipes);
     defer multi_reader.deinit();
 
     var truncated = false;
@@ -331,9 +355,18 @@ fn runStdoutOnce(
         child.kill(io);
     };
 
+    const pipes: [2]std.Io.File = if (token) |cancel|
+        claimOutputPipes(cancel, io, &child) orelse return error.Cancelled
+    else
+        .{ child.stdout.?, child.stderr.? };
+    defer if (token != null) {
+        pipes[0].close(io);
+        pipes[1].close(io);
+    };
+
     var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
     var multi_reader: std.Io.File.MultiReader = undefined;
-    multi_reader.init(allocator, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    multi_reader.init(allocator, io, multi_reader_buffer.toStreams(), &pipes);
     defer multi_reader.deinit();
 
     while (multi_reader.fill(4096, .none)) |_| {
