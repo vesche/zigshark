@@ -4,6 +4,8 @@ A terminal UI for [tshark](https://www.wireshark.org/), written in [Zig](https:/
 
 zigshark is an active clean-room rewrite of [termshark](https://github.com/gcla/termshark). The offline analysis path is usable today: aligned packet list, nested protocol tree, highlighted hex view, filters, search, marks, streams, conversations, profiles, and live-capture orchestration. [docs/parity.md](docs/parity.md) is the termshark baseline. [docs/roadmap.md](docs/roadmap.md) is what to build next. [docs/roadmap-1.md](docs/roadmap-1.md) is the finished pass.
 
+https://github.com/vesche/zigshark/raw/main/demo.mp4
+
 ## Requirements
 
 - Zig **0.17.x**

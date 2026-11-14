@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const min_tshark_version = "1.11.0";
 
@@ -188,15 +189,18 @@ pub fn listInterfaces(allocator: std.mem.Allocator, io: std.Io, tshark: []const 
 }
 
 fn resolveExecutable(allocator: std.mem.Allocator, io: std.Io, name: []const u8) ![]u8 {
-    const cwd = std.Io.Dir.cwd();
-    if (std.fs.path.isAbsolute(name) or std.mem.indexOfScalar(u8, name, std.fs.path.sep) != null) {
-        cwd.access(io, name, .{}) catch return error.ToolNotFound;
+    if (explicitToolPath(name)) {
+        std.Io.Dir.cwd().access(io, name, .{}) catch return error.ToolNotFound;
         return try allocator.dupe(u8, name);
     }
 
-    // Prefer which(1); fall back to leaving the bare name for PATH lookup at spawn.
+    // Git for Windows ships an MSYS `which` that prints `/c/Program Files/...`.
+    // Zig treats a leading slash as absolute and then does not search PATH.
+    // `where` prints a native path. A missing locator, or a path that does not
+    // exist, leaves the bare name for PATH lookup at spawn.
+    const locator = if (builtin.os.tag == .windows) "where" else "which";
     const result = std.process.run(allocator, io, .{
-        .argv = &.{ "which", name },
+        .argv = &.{ locator, name },
         .stdout_limit = .limited(4096),
         .stderr_limit = .limited(4096),
     }) catch return try allocator.dupe(u8, name);
@@ -204,9 +208,28 @@ fn resolveExecutable(allocator: std.mem.Allocator, io: std.Io, name: []const u8)
     defer allocator.free(result.stderr);
     if (!result.term.success()) return try allocator.dupe(u8, name);
 
-    const path = std.mem.trim(u8, result.stdout, " \t\r\n");
+    const path = firstLocatorPath(result.stdout);
     if (path.len == 0) return try allocator.dupe(u8, name);
+    std.Io.Dir.cwd().access(io, path, .{}) catch return try allocator.dupe(u8, name);
     return try allocator.dupe(u8, path);
+}
+
+fn explicitToolPath(name: []const u8) bool {
+    if (std.fs.path.isAbsolute(name)) return true;
+    if (std.mem.indexOfScalar(u8, name, std.fs.path.sep) != null) return true;
+    // Windows accepts `/` as a separator. Do not hand those paths to `where`.
+    if (builtin.os.tag == .windows and std.mem.indexOfScalar(u8, name, '/') != null) return true;
+    return false;
+}
+
+/// `where` prints every PATH match, one per line. The first is the one spawn would run.
+fn firstLocatorPath(text: []const u8) []const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len != 0) return trimmed;
+    }
+    return "";
 }
 
 fn versionString(allocator: std.mem.Allocator, io: std.Io, exe: []const u8) ![]u8 {
@@ -297,6 +320,15 @@ test "discover tshark when available" {
     try std.testing.expect(parseVersion(tools.tshark_version) != null);
 }
 
+test "locator output uses the first path" {
+    try std.testing.expectEqualStrings(
+        "C:\\Program Files\\Wireshark\\tshark.exe",
+        firstLocatorPath("C:\\Program Files\\Wireshark\\tshark.exe\r\nC:\\other\\tshark.exe\r\n"),
+    );
+    try std.testing.expectEqualStrings("/usr/bin/tshark", firstLocatorPath("/usr/bin/tshark\n"));
+    try std.testing.expectEqualStrings("", firstLocatorPath(" \r\n\t\r\n"));
+}
+
 test "list interfaces when tshark available" {
     if (!tsharkAvailable(std.testing.io)) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -307,7 +339,11 @@ test "list interfaces when tshark available" {
         .capinfos = "capinfos",
     });
     defer tools.deinit();
-    const ifaces = try listInterfaces(allocator, io, tools.tshark);
+    const ifaces = listInterfaces(allocator, io, tools.tshark) catch |err| switch (err) {
+        // Windows CI has tshark but no Npcap, so `tshark -D` prints nothing.
+        error.ToolNotFound => return error.SkipZigTest,
+        else => return err,
+    };
     defer {
         for (ifaces) |*i| {
             allocator.free(i.name);
