@@ -5,6 +5,16 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    // Shell scripts are not Windows executables. Tests spawn this binary instead.
+    if (argAfter(args, "--sleep-marker")) |marker| {
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = marker, .data = "started\n" });
+        try std.Io.sleep(io, .fromSeconds(8), .awake);
+        return;
+    }
+    if (argAfter(args, "-r") == null and argAfter(args, "-w") != null) {
+        try dumpcapStandIn(allocator, io, args);
+        return;
+    }
     const capture = argAfter(args, "-r");
     if (capture == null) {
         if (argAfter(args, "-G") != null) {
@@ -111,6 +121,30 @@ fn argAfter(args: []const []const u8, flag: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, args[i], flag)) return args[i + 1];
     }
     return null;
+}
+
+/// Stand-in for `dumpcap -q -i … -w -`. Stderr is filled before any capture
+/// bytes, so the parent must drain it or the pcap never reaches stdout.
+fn dumpcapStandIn(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    if (hasArg(args, "-D")) {
+        try writeStdout(io, "1. fake0\n");
+        return;
+    }
+    const out = argAfter(args, "-w") orelse "-";
+    if (!std.mem.eql(u8, out, "-")) std.process.exit(2);
+
+    var line: [81]u8 = undefined;
+    @memset(line[0..80], 'x');
+    line[80] = '\n';
+    var buffer: [1024]u8 = undefined;
+    var writer: std.Io.File.Writer = .init(.stderr(), io, &buffer);
+    var row: usize = 0;
+    while (row < 4000) : (row += 1) try writer.interface.writeAll(&line);
+    try writer.interface.flush();
+
+    const pcap = try std.Io.Dir.cwd().readFileAlloc(io, "tests/fixtures/1.pcap", allocator, .limited(1024 * 1024));
+    defer allocator.free(pcap);
+    try writeStdout(io, pcap);
 }
 
 fn flood(io: std.Io) !void {

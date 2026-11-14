@@ -1423,7 +1423,6 @@ fn waitForPath(io: std.Io, path: []const u8) !void {
     return error.TimedOut;
 }
 
-
 fn testingTools(allocator: std.mem.Allocator, tshark: []const u8) !tools_mod.Tools {
     return .{
         .allocator = allocator,
@@ -1901,50 +1900,15 @@ test "dumpcap stderr is drained so the capture file is written" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const script_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/dumpcap", .{tmp.sub_path[0..]});
-    defer allocator.free(script_path);
     const out_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/live.pcap", .{tmp.sub_path[0..]});
     defer allocator.free(out_path);
 
-    const script =
-        \\#!/usr/bin/env python3
-        \\import sys
-        \\args = sys.argv[1:]
-        \\if "-D" in args:
-        \\    sys.stdout.write("1. fake0\\n")
-        \\    raise SystemExit(0)
-        \\out = None
-        \\i = 0
-        \\while i < len(args):
-        \\    if args[i] == "-w" and i + 1 < len(args):
-        \\        out = args[i + 1]
-        \\        i += 2
-        \\        continue
-        \\    i += 1
-        \\if out != "-":
-        \\    sys.exit(2)
-        \\sys.stderr.write(("x" * 80 + "\\n") * 4000)
-        \\sys.stderr.flush()
-        \\with open("tests/fixtures/1.pcap", "rb") as src:
-        \\    sys.stdout.buffer.write(src.read())
-        \\    sys.stdout.buffer.flush()
-        \\
-    ;
     const cwd = std.Io.Dir.cwd();
-    {
-        const script_file = try cwd.createFile(io, script_path, .{
-            .truncate = true,
-            .permissions = @fromBackingInt(@intCast(0o755)),
-        });
-        errdefer script_file.close(io);
-        try script_file.writeStreamingAll(io, script);
-        script_file.close(io);
-    }
-
     var tools = try testingTools(allocator, "tshark");
     defer tools.deinit();
     tools.dumpcap_can_capture = true;
-    const dumpcap = try allocator.dupe(u8, script_path);
+    // A script is not a valid Windows image. fake-tshark implements `-w -`.
+    const dumpcap = try fakeTsharkPath(allocator);
     allocator.free(tools.dumpcap);
     tools.dumpcap = dumpcap;
 

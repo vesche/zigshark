@@ -1417,24 +1417,15 @@ test "quit destroys a sleeping wormhole job" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/sleep-wormhole", .{tmp.sub_path[0..]});
-    defer allocator.free(path);
-    const script =
-        \\#!/bin/sh
-        \\printf started > "$0.started"
-        \\exec sleep 8
-    ;
-    try std.Io.Dir.cwd().writeFile(io, .{
-        .sub_path = path,
-        .data = script,
-        .flags = .{ .permissions = @fromBackingInt(@intCast(0o755)) },
-    });
+    const tool = try fakeTsharkPath(allocator);
+    defer allocator.free(tool);
+    const started = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/sleep-wormhole.started", .{tmp.sub_path[0..]});
+    defer allocator.free(started);
 
-    const job = try zigshark.features.transfer.Job.startArgv(allocator, io, &.{path});
+    // A shell script is not a valid Windows image. fake-tshark sleeps instead.
+    const job = try zigshark.features.transfer.Job.startArgv(allocator, io, &.{ tool, "--sleep-marker", started });
     var destroyed = false;
     errdefer if (!destroyed) job.destroy();
-    const started = try std.fmt.allocPrint(allocator, "{s}.started", .{path});
-    defer allocator.free(started);
     try waitForFile(io, started);
 
     const before = std.Io.Timestamp.now(io, .awake).nanoseconds;
