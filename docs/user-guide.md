@@ -82,7 +82,7 @@ Header menus: Analysis (field filter, go to frame, streams, conversations, captu
 | `:endpoints [tcp\|udp\|ip\|ipv6\|eth]` | Loudest addresses, sorted by bytes. Enter filters |
 | `:export packets\|packet\|json\|csv <path>` | Write the displayed packets. `y` confirms an overwrite |
 | `:export objects http\|smb <dir>` | Export objects with tshark |
-| `:decode-as [layer==selector,protocol]` | No arguments uses the selected packet |
+| `:decode-as [layer==selector,protocol]` | No arguments lists this packet's selectors, then protocols that layer accepts |
 | `:time-ref` | Set or clear time zero. `Ctrl-T` does the same |
 | `:search <text>` | Search the focused pane |
 | `:search-regex <pattern>` | `. * + ? [] ^ $`, not PCRE |

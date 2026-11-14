@@ -67,6 +67,16 @@ pub const PacketTable = struct {
         if (self.scroll_top > max_top) self.scroll_top = max_top;
     }
 
+    /// Keep the window inside the current rows. A free scroll may leave the
+    /// selection, but it cannot sit past the last row after a shorter list arrives.
+    fn bindViewport(self: *PacketTable, body_rows: usize) void {
+        self.viewport_rows = body_rows;
+        if (body_rows == 0) return;
+        const max_top = self.rows.len -| body_rows;
+        if (self.scroll_top > max_top) self.scroll_top = max_top;
+        if (!self.scroll_free) self.ensureVisible(body_rows);
+    }
+
     fn selectIndex(self: *PacketTable, idx: usize) void {
         if (self.rows.len == 0) return;
         const clamped = @min(idx, self.rows.len - 1);
@@ -183,6 +193,7 @@ pub const PacketTable = struct {
         const size = ctx.max.size();
         var surf = try vxfw.Surface.init(ctx.arena, self.widget(), size);
         if (size.width == 0 or size.height == 0) return surf;
+        text_util.fillBackground(&surf, .{ .fg = self.theme.fg, .bg = self.theme.bg });
 
         self.last_width = size.width;
         var column_buf: [12]Column = undefined;
@@ -198,8 +209,7 @@ pub const PacketTable = struct {
         _ = text_util.writeText(&surf, ctx, 0, 0, header_line, header_style, size.width);
 
         const body_h = size.height -| 1;
-        self.viewport_rows = body_h;
-        if (!self.scroll_free) self.ensureVisible(body_h);
+        self.bindViewport(body_h);
 
         var line: u16 = 1;
         var idx = self.scroll_top;
@@ -249,7 +259,7 @@ pub fn unselectedStyle(
         return style;
     }
     if (packet_colors) return theme_mod.protocolStyle(theme, protocol);
-    if (zebra) return .{ .fg = theme.fg, .bg = theme_mod.rgb(18, 18, 28) };
+    if (zebra) return .{ .fg = theme.fg, .bg = theme_mod.zebraBackground(theme) };
     return .{ .fg = theme.fg, .bg = theme.bg };
 }
 
@@ -504,7 +514,25 @@ test "the wheel can leave the selected row and a redraw keeps that offset" {
     while (i < 6) : (i += 1) try table.handleEvent(&ctx, down);
     try std.testing.expect(table.scroll_top > 8);
     try std.testing.expect(table.scroll_free);
-    table.viewport_rows = 8;
-    if (!table.scroll_free) table.ensureVisible(8);
+    table.bindViewport(8);
     try std.testing.expect(table.scroll_top > 8);
+}
+
+test "a shorter list cannot stay scrolled past the last row" {
+    var rows: [18]packet.PacketSummary = undefined;
+    for (&rows, 0..) |*row, index| {
+        row.* = .{ .frame = @intCast(index + 1), .columns = &.{}, .owns_columns = false };
+    }
+    var table: PacketTable = .{
+        .theme = theme_mod.dark(),
+        .rows = &rows,
+        .viewport_rows = 8,
+        .selected = 13,
+        .scroll_top = 12,
+        .scroll_free = true,
+    };
+    table.rows = rows[13..15];
+    table.selected = 0;
+    table.bindViewport(8);
+    try std.testing.expectEqual(@as(usize, 0), table.scroll_top);
 }

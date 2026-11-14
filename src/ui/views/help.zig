@@ -18,7 +18,7 @@ pub const text =
     \\:hierarchy        Protocol hierarchy. Enter filters that protocol
     \\:endpoints        Loudest addresses. Enter filters that address
     \\:export           packets, packet, json, csv, or objects http|smb
-    \\:decode-as        Selectors from this packet, then a protocol
+    \\:decode-as        Selectors from this packet, then a protocol that layer accepts
     \\:columns add      Add the selected field as a column
     \\:                 Command palette
     \\?                 This help

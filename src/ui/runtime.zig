@@ -35,6 +35,8 @@ pub fn runTui(init: std.process.Init, options: RunOptions) !void {
     defer allocator.destroy(model);
     try model.init(allocator, io, options);
     defer model.deinit();
+    model.terminal_vx = &fw.vx;
+    model.terminal_writer = fw.tty.writer();
 
     try fw.run(model.widget(), .{});
 }

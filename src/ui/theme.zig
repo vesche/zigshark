@@ -60,7 +60,7 @@ pub fn light() Theme {
         .header_fg = rgb(255, 255, 255),
         .header_bg = rgb(0, 90, 160),
         .status_fg = rgb(30, 30, 30),
-        .status_bg = rgb(220, 220, 220),
+        .status_bg = rgb(255, 255, 255),
         .filter_fg = rgb(255, 255, 255),
         .filter_bg = rgb(0, 100, 180),
         .filter_ok_fg = rgb(0, 120, 0),
@@ -76,11 +76,28 @@ pub fn resolve(dark_mode: bool) Theme {
     return if (dark_mode) dark() else light();
 }
 
+/// True when a background is light enough that dark-mode tints would read as black bars.
+pub fn isLightBackground(color: vaxis.Cell.Color) bool {
+    const channels = switch (color) {
+        .rgb => |channels| channels,
+        else => return false,
+    };
+    const luma = @as(u32, channels[0]) * 30 + @as(u32, channels[1]) * 59 + @as(u32, channels[2]) * 11;
+    return luma > 14_000;
+}
+
 /// Focused selection is the bright theme color. Unfocused selection is a warm
 /// neutral so it stays readable and does not match a protocol tint.
 pub fn selectionStyle(theme: Theme, focused: bool) vaxis.Style {
     if (focused) return .{ .fg = theme.selected_fg, .bg = theme.selected_bg };
+    if (isLightBackground(theme.bg)) return .{ .fg = theme.fg, .bg = rgb(226, 222, 214) };
     return .{ .fg = theme.fg, .bg = rgb(72, 64, 58) };
+}
+
+/// Alternating packet rows. Light themes stay near the page color.
+pub fn zebraBackground(theme: Theme) vaxis.Cell.Color {
+    if (isLightBackground(theme.bg)) return rgb(244, 244, 248);
+    return rgb(18, 18, 28);
 }
 
 pub fn parseToml(input: []const u8, base: Theme) Theme {
@@ -126,14 +143,19 @@ fn ciIndex(hay: []const u8, needle: []const u8) bool {
 
 pub fn protocolStyle(theme: Theme, protocol: []const u8) vaxis.Style {
     const lower = std.mem.trim(u8, protocol, " \t");
+    const on_light = isLightBackground(theme.bg);
     // Subtle row tinting similar to Wireshark coloring rules.
-    if (ciStarts(lower, "tcp")) return .{ .fg = theme.fg, .bg = rgb(20, 30, 50) };
-    if (ciStarts(lower, "udp")) return .{ .fg = theme.fg, .bg = rgb(20, 40, 30) };
-    if (ciIndex(lower, "tls") or ciIndex(lower, "ssl")) return .{ .fg = theme.fg, .bg = rgb(40, 20, 45) };
-    if (ciIndex(lower, "http")) return .{ .fg = theme.fg, .bg = rgb(45, 35, 15) };
-    if (ciStarts(lower, "arp")) return .{ .fg = theme.fg, .bg = rgb(45, 40, 10) };
-    if (ciIndex(lower, "dns") or ciIndex(lower, "ssdp")) return .{ .fg = theme.fg, .bg = rgb(15, 40, 40) };
+    if (ciStarts(lower, "tcp")) return rowTint(theme, on_light, rgb(20, 30, 50), rgb(232, 231, 255));
+    if (ciStarts(lower, "udp")) return rowTint(theme, on_light, rgb(20, 40, 30), rgb(218, 238, 255));
+    if (ciIndex(lower, "tls") or ciIndex(lower, "ssl")) return rowTint(theme, on_light, rgb(40, 20, 45), rgb(255, 230, 242));
+    if (ciIndex(lower, "http")) return rowTint(theme, on_light, rgb(45, 35, 15), rgb(255, 240, 220));
+    if (ciStarts(lower, "arp")) return rowTint(theme, on_light, rgb(45, 40, 10), rgb(255, 245, 210));
+    if (ciIndex(lower, "dns") or ciIndex(lower, "ssdp")) return rowTint(theme, on_light, rgb(15, 40, 40), rgb(220, 245, 245));
     return .{ .fg = theme.fg, .bg = theme.bg };
+}
+
+fn rowTint(theme: Theme, on_light: bool, dark_bg: vaxis.Cell.Color, light_bg: vaxis.Cell.Color) vaxis.Style {
+    return .{ .fg = theme.fg, .bg = if (on_light) light_bg else dark_bg };
 }
 
 test "theme resolve dark and light" {
@@ -159,4 +181,17 @@ test "protocol style tcp" {
     const t = dark();
     const s = protocolStyle(t, "TCP");
     try std.testing.expect(!s.bg.eql(t.bg));
+}
+
+test "light theme keeps inactive rows and protocol tints light" {
+    const theme = light();
+    const dim = selectionStyle(theme, false);
+    try std.testing.expect(isLightBackground(dim.bg));
+    try std.testing.expect(!dim.bg.eql(theme.bg));
+    try std.testing.expect(!dim.bg.eql(selectionStyle(dark(), false).bg));
+    try std.testing.expect(isLightBackground(protocolStyle(theme, "TCP").bg));
+    try std.testing.expect(isLightBackground(protocolStyle(theme, "TLS").bg));
+    try std.testing.expect(isLightBackground(zebraBackground(theme)));
+    try std.testing.expect(!protocolStyle(theme, "TCP").bg.eql(dim.bg));
+    try std.testing.expect(!zebraBackground(theme).eql(theme.bg));
 }

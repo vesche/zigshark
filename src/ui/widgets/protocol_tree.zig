@@ -477,6 +477,7 @@ pub const ProtocolTree = struct {
         const size = ctx.max.size();
         var surf = try vxfw.Surface.init(ctx.arena, self.widget(), size);
         const normal: vaxis.Style = .{ .fg = self.theme.fg, .bg = self.theme.bg };
+        text_util.fillBackground(&surf, normal);
         const sel = theme_mod.selectionStyle(self.theme, self.focused);
         const marker_fg = self.theme.accent;
         self.viewport_rows = size.height;

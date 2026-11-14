@@ -210,6 +210,26 @@ pub const Session = struct {
         try self.decode_as_args.append(self.allocator, try self.allocator.dupe(u8, value));
     }
 
+    /// Drop every rule for this layer and protocol. `true` when one was removed.
+    pub fn removeDecodeAs(self: *Session, layer: []const u8, protocol: []const u8) bool {
+        var index = self.decode_as_args.items.len;
+        var removed = false;
+        while (index > 0) {
+            index -= 1;
+            if (!decodeRuleMatches(self.decode_as_args.items[index], layer, protocol)) continue;
+            self.allocator.free(self.decode_as_args.orderedRemove(index));
+            removed = true;
+        }
+        return removed;
+    }
+
+    fn decodeRuleMatches(rule: []const u8, layer: []const u8, protocol: []const u8) bool {
+        if (!std.mem.startsWith(u8, rule, layer)) return false;
+        if (!std.mem.startsWith(u8, rule[layer.len..], "==")) return false;
+        const comma = std.mem.lastIndexOfScalar(u8, rule, ',') orelse return false;
+        return std.mem.eql(u8, rule[comma + 1 ..], protocol);
+    }
+
     pub fn setTimestampFormat(self: *Session, value: []const u8) !void {
         const copy = try self.allocator.dupe(u8, value);
         if (self.timestamp_format.len != 0) self.allocator.free(self.timestamp_format);

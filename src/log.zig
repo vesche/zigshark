@@ -65,7 +65,9 @@ pub fn log(
         }
     }
 
-    if (mirror_tty or level == .err) {
+    // The TUI owns the terminal. An error written here lands at the cursor and
+    // tears the frame apart. `--log-tty` is the only way onto stderr.
+    if (mirror_tty) {
         const stderr: std.Io.File = .stderr();
         _ = stderr.writeStreamingAll(io, line) catch {};
     }

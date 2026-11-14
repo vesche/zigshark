@@ -47,6 +47,10 @@ test "filters, decode-as, and timestamp replace previous values" {
     try session.addDecodeAs("tcp.port==80,http");
     try session.addDecodeAs("tcp.port==443,tls");
     try std.testing.expectEqual(@as(usize, 2), session.decode_as_args.items.len);
+    try std.testing.expect(session.removeDecodeAs("tcp.port", "http"));
+    try std.testing.expectEqual(@as(usize, 1), session.decode_as_args.items.len);
+    try std.testing.expectEqualStrings("tcp.port==443,tls", session.decode_as_args.items[0]);
+    try std.testing.expect(!session.removeDecodeAs("ethertype", "http"));
     try session.setTimestampFormat("ad");
     try session.setTimestampFormat("e");
     try std.testing.expectEqualStrings("e", session.timestamp_format);

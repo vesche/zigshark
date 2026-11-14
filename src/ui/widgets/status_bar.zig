@@ -93,15 +93,7 @@ pub const StatusBar = struct {
         const size = ctx.max.size();
         var surf = try vxfw.Surface.init(ctx.arena, self.widget(), size);
         const style: vaxis.Style = .{ .fg = self.theme.status_fg, .bg = self.theme.status_bg };
-        if (size.height > 0) {
-            var col: u16 = 0;
-            while (col < size.width) : (col += 1) {
-                surf.writeCell(col, 0, .{
-                    .char = .{ .grapheme = " ", .width = 1 },
-                    .style = style,
-                });
-            }
-        }
+        text_util.fillBackground(&surf, style);
         const text = try self.format(ctx.arena);
         _ = text_util.writeText(&surf, ctx, 0, 0, text, style, size.width);
         return surf;

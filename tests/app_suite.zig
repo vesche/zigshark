@@ -70,7 +70,10 @@ const expert_stat =
 ;
 const protocol_text = "Hypertext Transfer Protocol\tHTTP\thttp\tT\tT\tT\n" ++
     "Transport Layer Security\tTLS\ttls\tT\tT\tT\n" ++
-    "Domain Name System\tDNS\tdns\tT\tT\tT\n";
+    "Domain Name System\tDNS\tdns\tT\tT\tT\n" ++
+    "Internet Protocol Version 4\tIPv4\tip\tT\tT\tT\n" ++
+    "Internet Protocol Version 6\tIPv6\tipv6\tT\tT\tT\n" ++
+    "Address Resolution Protocol\tARP/RARP\tarp\tT\tT\tT\n";
 
 const Script = struct {
     allocator: std.mem.Allocator,
@@ -826,6 +829,36 @@ test "a later packet chunk keeps the selected frame" {
     try std.testing.expectEqual(@as(u32, 2), h.app.session.selectedFrame().?);
 }
 
+test "a replaced packet list drops a scroll offset from the longer list" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+
+    const headers = try h.allocator.alloc([]u8, 1);
+    headers[0] = try h.allocator.dupe(u8, "No.");
+    const first = try h.allocator.alloc(packet.PacketSummary, 18);
+    for (first, 0..) |*row, index| row.* = try ownedSummary(h.allocator, @intCast(index + 1));
+    try h.app.loader.pushEvent(.{ .packets_loaded = .{
+        .headers = headers,
+        .packets = first,
+    } });
+    try h.app.processLoaderEvents();
+    try std.testing.expect(h.app.session.select(13));
+    h.app.packet_table.scroll_top = 12;
+    h.app.packet_table.scroll_free = true;
+
+    const filtered = try h.allocator.alloc(packet.PacketSummary, 2);
+    filtered[0] = try ownedSummary(h.allocator, 14);
+    filtered[1] = try ownedSummary(h.allocator, 15);
+    try h.app.loader.pushEvent(.{ .packets_loaded = .{ .packets = filtered } });
+    try h.app.processLoaderEvents();
+
+    try std.testing.expectEqual(@as(usize, 2), h.app.session.packets.len);
+    try std.testing.expectEqual(@as(u32, 14), h.app.session.selectedFrame().?);
+    try std.testing.expect(!h.app.packet_table.scroll_free);
+    try std.testing.expectEqual(@as(usize, 0), h.app.packet_table.scroll_top);
+}
+
 test "applying the loaded filter does not request the list again" {
     var h: Harness = undefined;
     try h.setup();
@@ -1057,6 +1090,53 @@ test "decode-as offers the selected packet's port and a short protocol list" {
     try h.app.activatePick();
     try std.testing.expectEqual(@as(usize, 1), h.app.session.decode_as_args.items.len);
     try std.testing.expectEqualStrings("tcp.port==443,http", h.app.session.decode_as_args.items[0]);
+}
+
+test "decode-as for ethertype offers ethertype protocols and a rejected rule does not stick" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    const eth = try leaf(h.allocator, "eth.type", "Type: IPv4 (0x0800)", "0x00000800", 12, 2);
+    const children = try h.allocator.alloc(packet.DetailNode, 1);
+    children[0] = eth;
+    try installDetail(&h, children, "");
+    try h.app.runCommand("decode-as", "");
+    try std.testing.expect(std.mem.indexOf(u8, h.app.help_overlay.body, "ethertype==0x00000800") != null);
+    try h.app.activatePick();
+    try std.testing.expectEqualStrings("ip\nipv6\narp", h.app.help_overlay.body);
+
+    const catalog = "tshark: Protocol \"http\" isn't valid for layer type \"ethertype\"\n" ++
+        "tshark: Valid protocols for layer type \"ethertype\" are:\n" ++
+        "\t6lowpan (IPv6 over Low power Wireless Personal Area Networks)\n" ++
+        "\taarp (Appletalk Address Resolution Protocol)\n";
+    try h.setFrames(&.{1});
+    try h.app.session.addDecodeAs("ethertype==0x00000800,http");
+    try h.app.loader.pushEvent(.{ .error_msg = try h.allocator.dupe(u8, catalog) });
+    try h.app.processLoaderEvents();
+    try std.testing.expectEqual(@as(usize, 0), h.app.session.decode_as_args.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, h.app.msg_overlay.body, "\t") == null);
+    try std.testing.expect(std.mem.indexOf(u8, h.app.msg_overlay.body, "6lowpan") == null);
+    try std.testing.expect(std.mem.indexOf(u8, h.app.msg_overlay.body, "isn't valid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h.app.msg_overlay.body, "was not applied") != null);
+    try std.testing.expect(h.app.detail_requested_frame == null);
+    try std.testing.expect(h.app.loader.has_psml_argv);
+    for (h.app.loader.psml_argv.slice()) |arg| {
+        try std.testing.expect(std.mem.indexOf(u8, arg, "http") == null);
+    }
+
+    h.app.dismissOverlays();
+    try h.app.processLoaderEvents();
+    try std.testing.expect(!h.app.msg_overlay.visible);
+    try std.testing.expect(h.app.detail_requested_frame == null);
+
+    try h.app.loader.pushEvent(.{ .error_msg = try h.allocator.dupe(u8, catalog) });
+    try h.app.processLoaderEvents();
+    try std.testing.expect(h.app.detail_requested_frame == null);
+    try std.testing.expect(std.mem.indexOf(u8, h.app.msg_overlay.body, "\t") == null);
+    try std.testing.expect(std.mem.indexOf(u8, h.app.msg_overlay.body, "6lowpan") == null);
+    h.app.dismissOverlays();
+    try h.app.processLoaderEvents();
+    try std.testing.expect(!h.app.msg_overlay.visible);
 }
 
 test "io graph, dns, http, and compare apply a filter from the selected row" {
@@ -1485,4 +1565,67 @@ test "quit kills a running filter check" {
         return error.FilterCheckRanToCompletion;
     } else |_| {}
     try std.testing.expectEqual(@as(usize, 0), h.app.session.display_filter.len);
+}
+
+test "a missing recent file stays closed and a present one opens" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    try h.setFrames(&.{ 1, 4, 9 });
+    const original = try h.allocator.dupe(u8, h.app.capturePath().?);
+    defer h.allocator.free(original);
+
+    const present = try std.fs.path.join(h.allocator, &.{
+        ".zig-cache",
+        "tmp",
+        h.tmp.sub_path[0..],
+        "present.pcap",
+    });
+    defer h.allocator.free(present);
+    const created = try std.Io.Dir.cwd().createFile(h.io, present, .{});
+    created.close(h.io);
+
+    try h.app.config.addRecentFile("test.pcap");
+    try h.app.config.addRecentFile("also-missing.pcap");
+    try h.app.config.addRecentFile(present);
+
+    try h.app.runCommand("recent", "3");
+    try std.testing.expect(std.mem.indexOf(u8, h.app.msg_overlay.body, "Recent file not found: test.pcap") != null);
+    try std.testing.expect(!h.app.loader.has_psml_argv);
+    switch (h.app.session.source) {
+        .file => |path| try std.testing.expectEqualStrings(original, path),
+        else => return error.UnexpectedSource,
+    }
+    try std.testing.expectEqual(@as(usize, 3), h.app.session.packets.len);
+
+    try h.app.runCommand("recent", "1");
+    switch (h.app.session.source) {
+        .file => |path| try std.testing.expectEqualStrings(present, path),
+        else => return error.UnexpectedSource,
+    }
+    try std.testing.expect(h.app.loader.has_psml_argv);
+}
+
+test "a capture read error does not request the selected frame again" {
+    var h: Harness = undefined;
+    try h.setup();
+    defer h.teardown();
+    try h.setFrames(&.{ 1, 4, 9 });
+
+    try h.app.loader.pushEvent(.{
+        .error_msg = try h.allocator.dupe(u8, "tshark: The file \"test.pcap\" doesn't exist.\n"),
+    });
+    try h.app.processLoaderEvents();
+    try h.app.processLoaderEvents();
+
+    try std.testing.expect(h.app.detail_requested_frame == null);
+    try std.testing.expect(h.app.session.loading == .error_state);
+    try std.testing.expectEqualStrings(
+        "tshark: The file \"test.pcap\" doesn't exist.",
+        h.app.msg_overlay.body,
+    );
+    try std.testing.expect(!h.app.loader.has_psml_argv);
+
+    h.app.packet_table.onSelect.?(h.app.packet_table.userdata, 0);
+    try std.testing.expectEqual(@as(?u32, 1), h.app.detail_requested_frame);
 }

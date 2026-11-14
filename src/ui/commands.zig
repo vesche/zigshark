@@ -292,7 +292,8 @@ pub fn run(self: *AppModel, cmd: []const u8, args: []const u8) !void {
     } else if (std.mem.eql(u8, cmd, "recents")) {
         try self.showRecents();
     } else if (std.mem.eql(u8, cmd, "recent")) {
-        const number = std.fmt.parseInt(usize, args, 10) catch {
+        const trimmed = std.mem.trim(u8, args, " \t");
+        const number = std.fmt.parseInt(usize, trimmed, 10) catch {
             try self.showMessage("Usage: :recent <number>");
             return;
         };
@@ -302,6 +303,16 @@ pub fn run(self: *AppModel, cmd: []const u8, args: []const u8) !void {
         }
         const path = try self.allocator.dupe(u8, self.config.recent_files.items[number - 1]);
         defer self.allocator.free(path);
+        const cwd = std.Io.Dir.cwd();
+        cwd.access(self.io, path, .{}) catch |err| {
+            const message = switch (err) {
+                error.FileNotFound => try std.fmt.allocPrint(self.allocator, "Recent file not found: {s}", .{path}),
+                else => try std.fmt.allocPrint(self.allocator, "Could not open recent file {s}", .{path}),
+            };
+            defer self.allocator.free(message);
+            try self.showMessage(message);
+            return;
+        };
         try self.openCapture(path);
     } else if (std.mem.eql(u8, cmd, "filters")) {
         try self.runFiltersCommand(args);

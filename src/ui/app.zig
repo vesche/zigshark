@@ -13,6 +13,7 @@ const command_palette = @import("widgets/command_palette.zig");
 const filter_bar = @import("widgets/filter_bar.zig");
 const status_bar = @import("widgets/status_bar.zig");
 const header_bar = @import("widgets/header_bar.zig");
+const text_util = @import("widgets/text_util.zig");
 const help_view = @import("views/help.zig");
 const convs_view = @import("views/convs.zig");
 const convs_shark = @import("../shark/convs.zig");
@@ -102,6 +103,10 @@ pub const AppModel = struct {
     cli_opts: cli.Options,
 
     theme: theme_mod.Theme,
+    /// Set only while the TUI is running. Tests leave these null.
+    terminal_vx: ?*vaxis.Vaxis = null,
+    terminal_writer: ?*std.Io.Writer = null,
+    terminal_bg_sent: ?[3]u8 = null,
     focus: Focus = .packets,
     overlay: OverlayKind = .none,
     layout_stacked: bool = true,
@@ -245,6 +250,9 @@ pub const AppModel = struct {
 
         self.theme = theme_mod.resolve(self.config.dark_mode);
         self.theme = self.loadConfiguredTheme() catch self.theme;
+        self.terminal_vx = null;
+        self.terminal_writer = null;
+        self.terminal_bg_sent = null;
         self.focus = .packets;
         self.overlay = .none;
         self.layout_stacked = self.config.layout == .stacked;
@@ -1399,6 +1407,12 @@ pub const AppModel = struct {
                             _ = self.selectFrame(frame);
                             self.pending_global_frame = null;
                         }
+                        if (!appending) {
+                            // The previous offset indexes the old row set. Left alone, a
+                            // shorter filter paints only the column header.
+                            self.packet_table.scroll_free = false;
+                            self.packet_table.scroll_top = 0;
+                        }
                         self.session.loading = if (self.live_capture) .capturing else .loading_list;
                         self.syncFromSession();
                         ev.* = .done;
@@ -1422,8 +1436,11 @@ pub const AppModel = struct {
                 .error_msg => |msg| {
                     self.detail_requested_frame = null;
                     log_mod.err("loader", "{s}", .{msg});
-                    try self.session.setError(msg);
-                    try self.showMessage(msg);
+                    if (!try revertRejectedDecodeAs(self, msg)) {
+                        const line = firstErrorLine(msg);
+                        try self.session.setError(line);
+                        try self.showMessage(line);
+                    }
                 },
                 .capture_progress => {},
                 .done => if (self.live_capture) {
@@ -1438,7 +1455,11 @@ pub const AppModel = struct {
             }
             ev.deinit(self.allocator);
         }
-        if (!(self.live_capture and self.follow_tail)) try self.loadDetailForSelection();
+        // A failed read stays in error_state. Loading the selected frame from
+        // here would start tshark again on the next tick, and again after that.
+        if (self.session.loading != .error_state and !(self.live_capture and self.follow_tail)) {
+            try self.loadDetailForSelection();
+        }
     }
 
     pub fn capturePath(self: *const AppModel) ?[]const u8 {
@@ -1821,9 +1842,14 @@ pub const AppModel = struct {
         defer argv.deinit(self.allocator);
         var out = try self.runProcess(argv.slice());
         defer out.deinit(self.allocator);
-        const names = try stats_mod.listedProtocols(self.allocator, out.stdout, &decode_protocol_names);
+        const names = try stats_mod.listedProtocols(
+            self.allocator,
+            out.stdout,
+            protocolsForDecodeSelector(self.decode_selector),
+        );
         if (names.len == 0) {
-            try self.showMessage("tshark did not list a usable protocol");
+            self.dismissOverlays();
+            try self.showMessage("tshark did not list a usable protocol for this layer. :decode-as layer==selector,protocol still works.");
             return;
         }
         self.freeStringList(&self.decode_choices);
@@ -2472,6 +2498,7 @@ pub const AppModel = struct {
 
     pub fn applyTheme(self: *AppModel, theme: theme_mod.Theme) void {
         self.theme = theme;
+        self.syncTerminalBackground();
         self.packet_table.theme = theme;
         self.protocol_tree.theme = theme;
         self.hex.theme = theme;
@@ -2482,6 +2509,22 @@ pub const AppModel = struct {
         self.help_overlay.theme = theme;
         self.msg_overlay.theme = theme;
         self.dropdown.theme = theme;
+    }
+
+    /// The cell grid does not cover a window whose pixel size is not a multiple
+    /// of the cell size. That margin uses the terminal default background.
+    fn syncTerminalBackground(self: *AppModel) void {
+        const vx = self.terminal_vx orelse return;
+        const writer = self.terminal_writer orelse return;
+        const channels = switch (self.theme.bg) {
+            .rgb => |channels| channels,
+            else => return,
+        };
+        if (self.terminal_bg_sent) |sent| {
+            if (sent[0] == channels[0] and sent[1] == channels[1] and sent[2] == channels[2]) return;
+        }
+        vx.setTerminalBackgroundColor(writer, channels) catch return;
+        self.terminal_bg_sent = channels;
     }
 
     pub fn loadConfiguredTheme(self: *AppModel) !theme_mod.Theme {
@@ -3074,6 +3117,7 @@ pub const AppModel = struct {
     }
 
     pub fn draw(self: *AppModel, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        self.syncTerminalBackground();
         const size = ctx.max.size();
         self.packet_table.focused = self.focus == .packets;
         self.filter.focused = self.focus == .filter;
@@ -3194,12 +3238,9 @@ pub const AppModel = struct {
             idx += 1;
         }
 
-        return .{
-            .size = size,
-            .widget = self.widget(),
-            .buffer = &.{},
-            .children = self.children_buf[0..idx],
-        };
+        var surface = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), size, self.children_buf[0..idx]);
+        text_util.fillBackground(&surface, .{ .fg = self.theme.fg, .bg = self.theme.bg });
+        return surface;
     }
 
     fn drawStacked(
@@ -3373,7 +3414,57 @@ fn drawDivider(ctx: vxfw.DrawContext, width: u16, theme: theme_mod.Theme) std.me
     return surf;
 }
 
-const decode_protocol_names = [_][]const u8{ "http", "tls", "dns", "quic", "dhcp", "ntp", "ssh", "smb" };
+const tcp_decode_protocols = [_][]const u8{ "http", "tls", "dns", "ntp", "ssh" };
+const udp_decode_protocols = [_][]const u8{ "dns", "quic", "dhcp", "ntp" };
+const ethertype_decode_protocols = [_][]const u8{ "ip", "ipv6", "arp" };
+
+fn protocolsForDecodeSelector(selector: []const u8) []const []const u8 {
+    if (std.mem.startsWith(u8, selector, "udp.port")) return &udp_decode_protocols;
+    if (std.mem.startsWith(u8, selector, "ethertype")) return &ethertype_decode_protocols;
+    return &tcp_decode_protocols;
+}
+
+const RejectedDecode = struct {
+    layer: []const u8,
+    protocol: []const u8,
+};
+
+fn rejectedDecodeAs(msg: []const u8) ?RejectedDecode {
+    if (std.mem.indexOf(u8, msg, "isn't valid for layer type") == null) return null;
+    const protocol = quotedAfter(msg, "Protocol \"") orelse return null;
+    const layer = quotedAfter(msg, "layer type \"") orelse return null;
+    if (protocol.len == 0 or layer.len == 0) return null;
+    return .{ .layer = layer, .protocol = protocol };
+}
+
+fn quotedAfter(msg: []const u8, key: []const u8) ?[]const u8 {
+    const at = std.mem.indexOf(u8, msg, key) orelse return null;
+    const start = at + key.len;
+    const end = std.mem.indexOfScalar(u8, msg[start..], '"') orelse return null;
+    return msg[start .. start + end];
+}
+
+fn firstErrorLine(msg: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, msg, " \t\r\n");
+    const line = if (std.mem.indexOfAny(u8, trimmed, "\r\n")) |at| trimmed[0..at] else trimmed;
+    const text = std.mem.trim(u8, line, " \t\r");
+    if (text.len == 0) return "Capture read failed";
+    return text;
+}
+
+fn revertRejectedDecodeAs(self: *AppModel, msg: []const u8) !bool {
+    const spec = rejectedDecodeAs(msg) orelse return false;
+    if (!self.session.removeDecodeAs(spec.layer, spec.protocol)) return false;
+    const line = firstErrorLine(msg);
+    const note = try std.fmt.allocPrint(self.allocator, "{s}\nThat Decode As rule was not applied.", .{line});
+    defer self.allocator.free(note);
+    try self.showMessage(note);
+    self.msg_overlay.title = "Decode As";
+    self.clearDetail();
+    self.loader.clearDetailCache(self.io);
+    try self.loader.requestPsml(self.session);
+    return true;
+}
 
 fn collectDecodeSelectors(
     allocator: std.mem.Allocator,
